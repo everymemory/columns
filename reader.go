@@ -11,6 +11,15 @@ import (
 type Reader struct {
 	r      io.ReadSeeker
 	footer Footer
+
+	// Reusable buffers for the column currently being read. Nothing a caller
+	// gets back points into them once decoding finishes, so they are kept for
+	// the next column instead of being collected. A Reader holds the position
+	// of its ReadSeeker and is not safe to use from multiple goroutines, so
+	// these need no synchronisation.
+	bitmap []byte
+	data   []byte
+	raw    []byte
 }
 
 // NewReader reads the footer of a file written by Writer. The file must end
@@ -183,22 +192,23 @@ func (rd *Reader) readColumn(start int64, rg RowGroupMeta, ci int) (typed any, n
 	if _, err := rd.r.Seek(start, io.SeekStart); err != nil {
 		return nil, nil, fmt.Errorf("keine: cannot seek to column %d: %w", ci, err)
 	}
-	chunk, err := ReadChunk(bufio.NewReader(rd.r))
-	if err != nil {
+	var chunk ColumnChunk
+	if err := readChunkInto(bufio.NewReader(rd.r), &chunk, &rd.bitmap, &rd.data); err != nil {
 		return nil, nil, fmt.Errorf("keine: reading column %d (%s): %w", ci, schema.Name, err)
 	}
 
-	data, err := Decompress(chunk.Data, chunk.Compress)
+	raw, err := decompressInto(rd.raw[:0], chunk.Data, chunk.Compress)
 	if err != nil {
 		return nil, nil, fmt.Errorf("keine: decompressing column %d (%s): %w", ci, schema.Name, err)
 	}
+	rd.raw = raw
 
 	// Only the non-null values were encoded.
 	numValues := int(rg.NumRows)
 	if len(chunk.NullBitmap) > 0 {
 		numValues -= int(meta.NullCount)
 	}
-	typed, err = decodeTyped(chunk.Encoding, data, numValues, schema.Type)
+	typed, err = decodeTyped(chunk.Encoding, raw, numValues, schema.Type)
 	if err != nil {
 		return nil, nil, fmt.Errorf("keine: decoding column %d (%s): %w", ci, schema.Name, err)
 	}

@@ -159,7 +159,7 @@ from the same pseudo-random stream so neither sees easier data:
 
 | | bytes/row | write | read all | read 1 column | read typed |
 | --- | --- | --- | --- | --- | --- |
-| keine | 9.06 | 1032ms | 157ms | 28ms | 46ms |
+| keine | 9.06 | 1002ms | 134ms | 29ms | 33ms |
 | parquet zstd | 12.86 | 105ms | 16ms | 9ms | — |
 | parquet snappy | 21.32 | 87ms | 16ms | 8ms | — |
 | parquet none | 43.71 | 80ms | 14ms | 8ms | — |
@@ -173,7 +173,14 @@ assumptions.
 
 Read used to be behind partly because decoding into `[]any` boxes every value,
 costing an interface and a heap allocation each. The decoders now produce typed
-slices and box only at the end, which roughly halved the read time. The typed
-column reads three integer columns in 46ms where the boxed path takes longer for
-the same work; pyarrow still wins, handing back typed Arrow buffers from C++
-without crossing into Go's heap at all.
+slices and box only at the end, which roughly halved the read time. A Reader
+also reuses the scratch buffers a column passes through — the encoded chunk, the
+decompressed bytes — instead of allocating fresh ones per column. That is worth
+most on a column that decompresses far larger than it reads, where the transient
+bytes dwarf the values coming back: a Delta+Flate int64 column reads 2.2x faster
+through the typed path, while a low-cardinality dict column is barely touched,
+since its decoded values already own most of the memory.
+
+The typed column reads three integer columns in 33ms where the boxed path takes
+longer for the same work; pyarrow still wins, handing back typed Arrow buffers
+from C++ without crossing into Go's heap at all.

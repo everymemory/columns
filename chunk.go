@@ -42,26 +42,48 @@ func WriteChunk(w io.Writer, c ColumnChunk) error {
 // ReadChunk reads one chunk written by WriteChunk.
 func ReadChunk(r io.Reader) (ColumnChunk, error) {
 	var c ColumnChunk
-	var nullLen, dataLen uint32
-	if err := binary.Read(r, binary.LittleEndian, &c.Encoding); err != nil {
-		return c, fmt.Errorf("keine: cannot read chunk encoding: %w", err)
-	}
-	if err := binary.Read(r, binary.LittleEndian, &c.Compress); err != nil {
-		return c, fmt.Errorf("keine: cannot read chunk codec: %w", err)
-	}
-	if err := binary.Read(r, binary.LittleEndian, &nullLen); err != nil {
-		return c, fmt.Errorf("keine: cannot read bitmap length: %w", err)
-	}
-	c.NullBitmap = make([]byte, nullLen)
-	if _, err := io.ReadFull(r, c.NullBitmap); err != nil {
-		return c, fmt.Errorf("keine: cannot read null bitmap: %w", err)
-	}
-	if err := binary.Read(r, binary.LittleEndian, &dataLen); err != nil {
-		return c, fmt.Errorf("keine: cannot read data length: %w", err)
-	}
-	c.Data = make([]byte, dataLen)
-	if _, err := io.ReadFull(r, c.Data); err != nil {
-		return c, fmt.Errorf("keine: cannot read chunk data: %w", err)
+	var bitmap, data []byte
+	if err := readChunkInto(r, &c, &bitmap, &data); err != nil {
+		return c, err
 	}
 	return c, nil
+}
+
+// readChunkInto is ReadChunk writing into the buffers at bitmap and data, which
+// the caller reuses from one column to the next. Both stay live for as long as
+// the chunk is used, so they cannot be recycled mid-read.
+func readChunkInto(r io.Reader, c *ColumnChunk, bitmap, data *[]byte) error {
+	var nullLen, dataLen uint32
+	if err := binary.Read(r, binary.LittleEndian, &c.Encoding); err != nil {
+		return fmt.Errorf("keine: cannot read chunk encoding: %w", err)
+	}
+	if err := binary.Read(r, binary.LittleEndian, &c.Compress); err != nil {
+		return fmt.Errorf("keine: cannot read chunk codec: %w", err)
+	}
+	if err := binary.Read(r, binary.LittleEndian, &nullLen); err != nil {
+		return fmt.Errorf("keine: cannot read bitmap length: %w", err)
+	}
+	*bitmap = growTo(*bitmap, int(nullLen))
+	c.NullBitmap = (*bitmap)[:nullLen]
+	if _, err := io.ReadFull(r, c.NullBitmap); err != nil {
+		return fmt.Errorf("keine: cannot read null bitmap: %w", err)
+	}
+	if err := binary.Read(r, binary.LittleEndian, &dataLen); err != nil {
+		return fmt.Errorf("keine: cannot read data length: %w", err)
+	}
+	*data = growTo(*data, int(dataLen))
+	c.Data = (*data)[:dataLen]
+	if _, err := io.ReadFull(r, c.Data); err != nil {
+		return fmt.Errorf("keine: cannot read chunk data: %w", err)
+	}
+	return nil
+}
+
+// growTo returns a buffer holding at least n bytes, reusing b when it already
+// does.
+func growTo(b []byte, n int) []byte {
+	if cap(b) >= n {
+		return b
+	}
+	return make([]byte, n)
 }

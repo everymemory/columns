@@ -77,34 +77,65 @@ func compressStream(w io.Writer, data []byte, codec uint8) error {
 
 // Decompress is the inverse of Compress.
 func Decompress(data []byte, codec uint8) ([]byte, error) {
+	return decompressInto(nil, data, codec)
+}
+
+// decompressInto appends the decompressed form of data to dst and returns the
+// result, so a caller decoding many chunks can reuse one buffer. A reader
+// returns values that never point into that buffer, so recycling it is safe.
+func decompressInto(dst, data []byte, codec uint8) ([]byte, error) {
 	switch codec {
 	case CompressNone:
-		return data, nil
+		return append(dst, data...), nil
 	case CompressFlate:
 		r := flate.NewReader(bytes.NewReader(data))
 		defer r.Close()
-		return io.ReadAll(r)
+		return readAllInto(dst, r)
 	case CompressGzip:
 		r, err := gzip.NewReader(bytes.NewReader(data))
 		if err != nil {
 			return nil, err
 		}
 		defer r.Close()
-		return io.ReadAll(r)
+		return readAllInto(dst, r)
 	case CompressZlib:
 		r, err := zlib.NewReader(bytes.NewReader(data))
 		if err != nil {
 			return nil, err
 		}
 		defer r.Close()
-		return io.ReadAll(r)
+		return readAllInto(dst, r)
 	case CompressLzw:
 		r := lzw.NewReader(bytes.NewReader(data), lzwOrder, lzwWidth)
 		defer r.Close()
-		return io.ReadAll(r)
+		return readAllInto(dst, r)
 	case CompressZstd:
 		return nil, fmt.Errorf("keine: zstd compression is not available in this build")
 	default:
 		return nil, fmt.Errorf("keine: unknown compression codec %d", codec)
+	}
+}
+
+// readAllInto is io.ReadAll appending into dst, which it grows as needed and
+// hands back with its capacity intact.
+func readAllInto(dst []byte, r io.Reader) ([]byte, error) {
+	for {
+		if cap(dst) == len(dst) {
+			more := cap(dst)
+			if more == 0 {
+				more = 4096
+			}
+			bigger := make([]byte, len(dst), cap(dst)+more)
+			copy(bigger, dst)
+			dst = bigger
+		}
+		m, err := r.Read(dst[len(dst):cap(dst)])
+		dst = dst[:len(dst)+m]
+		if err != nil {
+			if err == io.EOF {
+				return dst, nil
+			}
+			return dst, err
+		}
 	}
 }
