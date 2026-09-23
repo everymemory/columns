@@ -70,6 +70,17 @@ func (rd *Reader) RowGroupCount() int {
 	return len(rd.footer.RowGroups)
 }
 
+// RowGroupMeta returns metadata for one row group: per-column byte length, null
+// count, value stats and the encoding and codec each chunk was written with. It
+// reads only the footer, so it is cheap to call before deciding which columns
+// to read.
+func (rd *Reader) RowGroupMeta(index int) (RowGroupMeta, error) {
+	if index < 0 || index >= len(rd.footer.RowGroups) {
+		return RowGroupMeta{}, fmt.Errorf("keine: row group %d out of range (have %d)", index, len(rd.footer.RowGroups))
+	}
+	return rd.footer.RowGroups[index], nil
+}
+
 // ReadRowGroup reads the requested columns of one row group. Columns not in
 // colIndexes are skipped using their recorded on-disk length. Values come back
 // typed according to the schema; rows that were null are nil.

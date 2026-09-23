@@ -74,12 +74,13 @@ func codecName(codec uint8) string {
 }
 
 // layoutCodecs are the codecs considered for each column. CompressZstd is
-// absent because this toolchain does not ship compress/zstd.
+// absent because this toolchain does not ship compress/zstd. Gzip and Zlib wrap
+// the same DEFLATE core as Flate with extra framing, so they are strictly
+// larger and never win the size contest; they stay implemented for reading and
+// for callers that ask for them by name.
 var layoutCodecs = []uint8{
 	CompressNone,
 	CompressFlate,
-	CompressGzip,
-	CompressZlib,
 	CompressLzw,
 }
 
@@ -104,10 +105,34 @@ func BenchmarkLayouts(col []any, schema ColumnSchema) []LayoutResult {
 	return results
 }
 
+// maxExperimentRows caps how many values ExperimentLayouts measures. Layout
+// choice depends on the shape of a column, not its length: cardinality,
+// monotonicity and value lengths all stabilise well below this many values, so
+// a sample costs a fraction of the encode and decode passes while picking the
+// same winner.
+const maxExperimentRows = 8192
+
+// experimentSample returns up to maxExperimentRows evenly spaced values from
+// col. Even spacing rather than a prefix keeps the sample representative when a
+// column is sorted or clustered.
+func experimentSample(col []any) []any {
+	if len(col) <= maxExperimentRows {
+		return col
+	}
+	stride := (len(col) + maxExperimentRows - 1) / maxExperimentRows
+	sample := make([]any, 0, maxExperimentRows)
+	for i := 0; i < len(col); i += stride {
+		sample = append(sample, col[i])
+	}
+	return sample
+}
+
 // ExperimentLayouts returns the BenchmarkLayouts entry with the smallest
-// CompressedSize, or Plain+None when no candidate works.
+// CompressedSize, or Plain+None when no candidate works. It measures a sample
+// of the column rather than every value, so the cost does not grow with the
+// row count.
 func ExperimentLayouts(col []any, schema ColumnSchema) LayoutResult {
-	results := BenchmarkLayouts(col, schema)
+	results := BenchmarkLayouts(experimentSample(col), schema)
 	if len(results) == 0 {
 		return LayoutResult{Name: encName(EncPlain) + "+" + codecName(CompressNone), Encoding: EncPlain, Compress: CompressNone}
 	}

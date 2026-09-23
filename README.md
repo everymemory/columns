@@ -76,9 +76,24 @@ combination. On 5000 rows of synthetic data:
 | 200 distinct strings | 137250 | Dict+Flate | 1397 |
 
 Gzip and zlib wrap the same DEFLATE algorithm as flate but add framing, so they
-lose the size contest to flate on every chunk. They are included because the
-format defines them, but a writer that wants to skip the wasted experiment time
-can drop them from `layoutCodecs` in `layout.go`.
+lose the size contest to flate on every chunk. They remain implemented and tagged
+— a file written with them reads back fine — but the writer does not consider
+them, because measuring them costs two encode and compress passes per column and
+cannot pay for itself.
+
+## Choosing a layout
+
+`ExperimentLayouts` is what the writer calls per column. Encoding and compression
+are measured against each other on the actual values, so a sorted id column lands
+on Delta and a low-cardinality string column lands on Dict without anyone
+hard-coding that.
+
+Which layout wins depends on the shape of a column — its cardinality, whether it
+is monotonic, how long its values are — and not on how many rows it has. So the
+experiment measures a bounded, evenly spaced sample rather than every value, and
+its cost stops scaling with the file. On a 200000-row, 5-column dataset the full
+experiment took 9.7s and the sampled one 0.21s, and every column chose the same
+encoding and codec, producing a byte-identical file.
 
 ## Usage
 
@@ -124,3 +139,26 @@ go test -bench=. ./...
 `BenchmarkSizes` reports every candidate's size, since the winner is only
 meaningful next to what it beat. `BenchmarkWriter` and `BenchmarkRead` cover the
 whole write and read paths, and `BenchmarkPartialRead` covers skipping columns.
+
+## Compared with parquet
+
+On 200000 rows in 5 columns, against pyarrow, both formats fed the same values
+from the same pseudo-random stream so neither sees easier data:
+
+| | bytes/row | write | read all | read 1 column |
+| --- | --- | --- | --- | --- |
+| keine | 9.06 | 1006ms | 214ms | 40ms |
+| parquet zstd | 12.86 | 105ms | 16ms | 9ms |
+| parquet snappy | 21.32 | 87ms | 16ms | 8ms |
+| parquet none | 43.71 | 80ms | 14ms | 8ms |
+
+keine is smaller, parquet is faster. The gap on write is not the columnar
+encoding or the codec: it is that keine measures layouts at write time. Before
+the experiment was sampled it cost 9.7s of the 10.3s write, and the remaining
+600ms is the actual format work. Parquet gets its choices compiled in, which is
+why it does not pay that cost and cannot adapt to a column that breaks its
+assumptions.
+
+Read is behind for a less interesting reason: keine decodes into `[]any`, so
+every value is an interface boxing and a heap allocation, where pyarrow hands
+back typed Arrow buffers in C++.
