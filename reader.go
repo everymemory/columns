@@ -85,16 +85,9 @@ func (rd *Reader) RowGroupMeta(index int) (RowGroupMeta, error) {
 // colIndexes are skipped using their recorded on-disk length. Values come back
 // typed according to the schema; rows that were null are nil.
 func (rd *Reader) ReadRowGroup(index int, colIndexes []int) ([][]any, error) {
-	if index < 0 || index >= len(rd.footer.RowGroups) {
-		return nil, fmt.Errorf("keine: row group %d out of range (have %d)", index, len(rd.footer.RowGroups))
-	}
-	rg := rd.footer.RowGroups[index]
-
-	starts := make([]int64, len(rg.Columns))
-	offset := rg.ByteOffset
-	for i, col := range rg.Columns {
-		starts[i] = offset
-		offset += col.ByteLength
+	rg, err := rd.RowGroupMeta(index)
+	if err != nil {
+		return nil, err
 	}
 
 	out := make([][]any, len(colIndexes))
@@ -102,51 +95,145 @@ func (rd *Reader) ReadRowGroup(index int, colIndexes []int) ([][]any, error) {
 		if ci < 0 || ci >= len(rg.Columns) {
 			return nil, fmt.Errorf("keine: column index %d out of range (have %d)", ci, len(rg.Columns))
 		}
-		meta := rg.Columns[ci]
-		schema := rd.footer.Schema[ci]
 
-		if _, err := rd.r.Seek(starts[ci], io.SeekStart); err != nil {
-			return nil, fmt.Errorf("keine: cannot seek to column %d: %w", ci, err)
-		}
-		chunk, err := ReadChunk(bufio.NewReader(rd.r))
+		typed, nulls, err := rd.readColumn(startOf(rg, ci), rg, ci)
 		if err != nil {
-			return nil, fmt.Errorf("keine: reading column %d (%s): %w", ci, schema.Name, err)
+			return nil, err
 		}
 
-		data, err := Decompress(chunk.Data, chunk.Compress)
+		vals, err := boxColumn(typed, rg.Columns[ci].Encoding, rd.footer.Schema[ci].Type)
 		if err != nil {
-			return nil, fmt.Errorf("keine: decompressing column %d (%s): %w", ci, schema.Name, err)
+			return nil, err
 		}
-
-		// Only the non-null values were encoded.
-		numValues := int(rg.NumRows)
-		if len(chunk.NullBitmap) > 0 {
-			numValues -= int(meta.NullCount)
-		}
-		vals, err := decodeWith(chunk.Encoding, data, numValues, schema.Type)
-		if err != nil {
-			return nil, fmt.Errorf("keine: decoding column %d (%s): %w", ci, schema.Name, err)
-		}
-
-		if len(chunk.NullBitmap) > 0 {
-			nulls := DecodeBitmap(chunk.NullBitmap, int(rg.NumRows))
-			expanded := make([]any, rg.NumRows)
-			j := 0
-			for i := 0; i < int(rg.NumRows); i++ {
-				if nulls[i] {
-					expanded[i] = nil
-					continue
-				}
-				expanded[i] = vals[j]
-				j++
-			}
-			vals = expanded
-		}
-
-		out[k] = vals
+		out[k] = expandNulls(vals, nulls, int(rg.NumRows))
 	}
 
 	return out, nil
+}
+
+// ReadColumn reads one column of one row group as a typed slice, so a TypeInt64
+// column comes back as []int64 and a TypeString column as []string rather than
+// []any, and no value is boxed in an interface. T must be the Go type the column
+// decodes to. The column must hold no nulls; ReadRowGroup covers those, since a
+// nil marker has nowhere to go in a []T of values.
+func ReadColumn[T any](rd *Reader, index, col int) ([]T, error) {
+	rg, err := rd.RowGroupMeta(index)
+	if err != nil {
+		return nil, err
+	}
+	if col < 0 || col >= len(rg.Columns) {
+		return nil, fmt.Errorf("keine: column index %d out of range (have %d)", col, len(rg.Columns))
+	}
+	if rg.Columns[col].NullCount > 0 {
+		return nil, fmt.Errorf("keine: column %d (%s) has %d null values; ReadRowGroup reads those",
+			col, rd.footer.Schema[col].Name, rg.Columns[col].NullCount)
+	}
+
+	typed, _, err := rd.readColumn(startOf(rg, col), rg, col)
+	if err != nil {
+		return nil, err
+	}
+
+	enc := rg.Columns[col].Encoding
+	typ := rd.footer.Schema[col].Type
+	if encProducesType(enc, typ) {
+		out, ok := asValues[T](typed)
+		if !ok {
+			return nil, fmt.Errorf("keine: column %d (%s) decodes to %T, not %T",
+				col, rd.footer.Schema[col].Name, typed, *new(T))
+		}
+		return out, nil
+	}
+
+	// The encoding produces a wider type than the column declares — Delta keeps
+	// int64 diffs for every integer width — so narrow to the declared type
+	// before converting.
+	vals, err := canonicalColumn(boxValues(typed), typ)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]T, len(vals))
+	for i, v := range vals {
+		t, ok := v.(T)
+		if !ok {
+			return nil, fmt.Errorf("keine: column %d (%s) narrows to %T, not %T",
+				col, rd.footer.Schema[col].Name, v, *new(T))
+		}
+		out[i] = t
+	}
+	return out, nil
+}
+
+// startOf is the byte offset of column col within its row group.
+func startOf(rg RowGroupMeta, col int) int64 {
+	offset := rg.ByteOffset
+	for _, c := range rg.Columns[:col] {
+		offset += c.ByteLength
+	}
+	return offset
+}
+
+// readColumn seeks to one column chunk, reads and decompresses it, and decodes
+// it into a slice of its declared Go type. nulls is the column's null bitmap,
+// nil when the column was written dense.
+func (rd *Reader) readColumn(start int64, rg RowGroupMeta, ci int) (typed any, nulls []bool, err error) {
+	schema := rd.footer.Schema[ci]
+	meta := rg.Columns[ci]
+
+	if _, err := rd.r.Seek(start, io.SeekStart); err != nil {
+		return nil, nil, fmt.Errorf("keine: cannot seek to column %d: %w", ci, err)
+	}
+	chunk, err := ReadChunk(bufio.NewReader(rd.r))
+	if err != nil {
+		return nil, nil, fmt.Errorf("keine: reading column %d (%s): %w", ci, schema.Name, err)
+	}
+
+	data, err := Decompress(chunk.Data, chunk.Compress)
+	if err != nil {
+		return nil, nil, fmt.Errorf("keine: decompressing column %d (%s): %w", ci, schema.Name, err)
+	}
+
+	// Only the non-null values were encoded.
+	numValues := int(rg.NumRows)
+	if len(chunk.NullBitmap) > 0 {
+		numValues -= int(meta.NullCount)
+	}
+	typed, err = decodeTyped(chunk.Encoding, data, numValues, schema.Type)
+	if err != nil {
+		return nil, nil, fmt.Errorf("keine: decoding column %d (%s): %w", ci, schema.Name, err)
+	}
+
+	if len(chunk.NullBitmap) > 0 {
+		nulls = DecodeBitmap(chunk.NullBitmap, int(rg.NumRows))
+	}
+	return typed, nulls, nil
+}
+
+// boxColumn converts a decoded column to []any, narrowing it to the declared
+// type when the encoding does not already produce it.
+func boxColumn(typed any, enc, typ uint8) ([]any, error) {
+	if !encProducesType(enc, typ) {
+		return canonicalColumn(boxValues(typed), typ)
+	}
+	return boxValues(typed), nil
+}
+
+// expandNulls re-inserts nil at every null position. Only the non-null values
+// were encoded, so vals is dense and nulls says where to spread it.
+func expandNulls(vals []any, nulls []bool, numRows int) []any {
+	if len(nulls) == 0 {
+		return vals
+	}
+	expanded := make([]any, numRows)
+	j := 0
+	for i := 0; i < numRows; i++ {
+		if nulls[i] {
+			continue
+		}
+		expanded[i] = vals[j]
+		j++
+	}
+	return expanded
 }
 
 func readUint32(r io.Reader) (uint32, error) {

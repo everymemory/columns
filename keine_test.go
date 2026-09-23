@@ -67,6 +67,23 @@ func buildSchema() []ColumnSchema {
 	return schema
 }
 
+// typeNames is used in failure messages, where a bare type tag is unhelpful.
+var typeNames = map[uint8]string{
+	TypeBool:    "bool",
+	TypeInt8:    "int8",
+	TypeInt16:   "int16",
+	TypeInt32:   "int32",
+	TypeInt64:   "int64",
+	TypeUint8:   "uint8",
+	TypeUint16:  "uint16",
+	TypeUint32:  "uint32",
+	TypeUint64:  "uint64",
+	TypeFloat32: "float32",
+	TypeFloat64: "float64",
+	TypeBytes:   "bytes",
+	TypeString:  "string",
+}
+
 func buildColumns(g int) [][]any {
 	cols := make([][]any, len(allTypes))
 	for c, typ := range allTypes {
@@ -366,6 +383,198 @@ func TestRowGroupMeta(t *testing.T) {
 	if _, err := r.RowGroupMeta(-1); err == nil {
 		t.Error("RowGroupMeta(-1) succeeded, want out of range")
 	}
+}
+
+// TestReadColumn reads every type back as its Go type rather than []any. The
+// caller picks T, so a column and its reader have to agree.
+func TestReadColumn(t *testing.T) {
+	schema := make([]ColumnSchema, len(allTypes))
+	for i, typ := range allTypes {
+		schema[i] = ColumnSchema{Name: fmt.Sprintf("t%d_%d", i, typ), Type: typ}
+	}
+	cols := make([][]any, len(allTypes))
+	for c, typ := range allTypes {
+		col := make([]any, rowsPerGroup)
+		for r := 0; r < rowsPerGroup; r++ {
+			col[r] = genValue(typ, 0, r)
+		}
+		cols[c] = col
+	}
+
+	var buf bytes.Buffer
+	w := NewWriter(&buf, schema)
+	if err := w.AddRowGroup(cols); err != nil {
+		t.Fatalf("AddRowGroup: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	r, err := NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+
+	cases := []struct {
+		typ  uint8
+		read func(*Reader, int) (any, error)
+	}{
+		{TypeBool, func(r *Reader, c int) (any, error) { return ReadColumn[bool](r, 0, c) }},
+		{TypeInt8, func(r *Reader, c int) (any, error) { return ReadColumn[int8](r, 0, c) }},
+		{TypeInt16, func(r *Reader, c int) (any, error) { return ReadColumn[int16](r, 0, c) }},
+		{TypeInt32, func(r *Reader, c int) (any, error) { return ReadColumn[int32](r, 0, c) }},
+		{TypeInt64, func(r *Reader, c int) (any, error) { return ReadColumn[int64](r, 0, c) }},
+		{TypeUint8, func(r *Reader, c int) (any, error) { return ReadColumn[uint8](r, 0, c) }},
+		{TypeUint16, func(r *Reader, c int) (any, error) { return ReadColumn[uint16](r, 0, c) }},
+		{TypeUint32, func(r *Reader, c int) (any, error) { return ReadColumn[uint32](r, 0, c) }},
+		{TypeUint64, func(r *Reader, c int) (any, error) { return ReadColumn[uint64](r, 0, c) }},
+		{TypeFloat32, func(r *Reader, c int) (any, error) { return ReadColumn[float32](r, 0, c) }},
+		{TypeFloat64, func(r *Reader, c int) (any, error) { return ReadColumn[float64](r, 0, c) }},
+		{TypeBytes, func(r *Reader, c int) (any, error) { return ReadColumn[[]byte](r, 0, c) }},
+		{TypeString, func(r *Reader, c int) (any, error) { return ReadColumn[string](r, 0, c) }},
+	}
+
+	for _, c := range cases {
+		i := -1
+		for j, typ := range allTypes {
+			if typ == c.typ {
+				i = j
+			}
+		}
+		got, err := c.read(r, i)
+		if err != nil {
+			t.Errorf("ReadColumn[%s] failed: %v", typeNames[c.typ], err)
+			continue
+		}
+		slice := reflect.ValueOf(got)
+		if slice.Len() != rowsPerGroup {
+			t.Errorf("ReadColumn[%s] returned %d values, want %d",
+				typeNames[c.typ], slice.Len(), rowsPerGroup)
+			continue
+		}
+		for k := 0; k < rowsPerGroup; k++ {
+			want := genValue(c.typ, 0, k)
+			if !reflect.DeepEqual(slice.Index(k).Interface(), want) {
+				t.Errorf("ReadColumn[%s][%d] = %v, want %v",
+					typeNames[c.typ], k, slice.Index(k).Interface(), want)
+			}
+		}
+	}
+
+	// Asking for a type the column does not hold is an error, not a wrong slice.
+	if _, err := ReadColumn[string](r, 0, 4); err == nil {
+		t.Error("ReadColumn[string] on an int64 column succeeded, want a type mismatch error")
+	}
+
+	if _, err := ReadColumn[int64](r, 1, 0); err == nil {
+		t.Error("ReadColumn on row group 1 succeeded, want out of range")
+	}
+	if _, err := ReadColumn[int64](r, -1, 0); err == nil {
+		t.Error("ReadColumn on row group -1 succeeded, want out of range")
+	}
+	if _, err := ReadColumn[int64](r, 0, len(allTypes)); err == nil {
+		t.Error("ReadColumn past the last column succeeded, want out of range")
+	}
+	if _, err := ReadColumn[int64](r, 0, -1); err == nil {
+		t.Error("ReadColumn on column -1 succeeded, want out of range")
+	}
+}
+
+// A column holding nulls has nowhere to put a nil in a []T, so ReadColumn
+// declines it and ReadRowGroup handles that case.
+func TestReadColumnNulls(t *testing.T) {
+	schema := []ColumnSchema{{Name: "n", Type: TypeInt64, Nullable: true}}
+	cols := [][]any{{int64(1), nil, int64(3)}}
+
+	var buf bytes.Buffer
+	w := NewWriter(&buf, schema)
+	if err := w.AddRowGroup(cols); err != nil {
+		t.Fatalf("AddRowGroup: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	r, err := NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	if _, err := ReadColumn[int64](r, 0, 0); err == nil {
+		t.Error("ReadColumn on a column with nulls succeeded, want an error")
+	}
+
+	got, err := r.ReadRowGroup(0, []int{0})
+	if err != nil {
+		t.Fatalf("ReadRowGroup: %v", err)
+	}
+	want := []any{int64(1), nil, int64(3)}
+	if !reflect.DeepEqual(got[0], want) {
+		t.Errorf("ReadRowGroup = %v, want %v", got[0], want)
+	}
+}
+
+// A dense column written beside a nullable one still decodes through the same
+// path, and a column with no nulls but a nullable schema reads typed too.
+func TestReadColumnNullableSchemaDense(t *testing.T) {
+	schema := []ColumnSchema{{Name: "n", Type: TypeInt64, Nullable: true}}
+	cols := [][]any{{int64(1), int64(2), int64(3)}}
+
+	var buf bytes.Buffer
+	w := NewWriter(&buf, schema)
+	if err := w.AddRowGroup(cols); err != nil {
+		t.Fatalf("AddRowGroup: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	r, err := NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	got, err := ReadColumn[int64](r, 0, 0)
+	if err != nil {
+		t.Fatalf("ReadColumn: %v", err)
+	}
+	if !reflect.DeepEqual(got, []int64{1, 2, 3}) {
+		t.Errorf("ReadColumn = %v, want [1 2 3]", got)
+	}
+}
+
+func TestTypedDecodeErrors(t *testing.T) {
+	if _, err := decodePlainTyped([]byte{0x01}, TypeBytes); err == nil {
+		t.Error("decodePlainTyped with a truncated byte length prefix: want error, got nil")
+	}
+	prefix := []byte{0xff, 0xff, 0xff, 0xff}
+	if _, err := decodePlainTyped(append(prefix, 1, 2), TypeBytes); err == nil {
+		t.Error("decodePlainTyped with a byte length beyond the data: want error, got nil")
+	}
+	if _, err := decodePlainTyped(nil, 0xFF); err == nil {
+		t.Error("decodePlainTyped with an unknown type: want error, got nil")
+	}
+	if _, err := decodeTyped(0xFF, nil, 0, TypeInt64); err == nil {
+		t.Error("decodeTyped with an unknown encoding: want error, got nil")
+	}
+	if got, ok := asValues[int64](nil); ok {
+		t.Errorf("asValues on a non-slice = %v, want not ok", got)
+	}
+	if encProducesType(0xFF, TypeInt64) {
+		t.Error("encProducesType of an unknown encoding = true, want false")
+	}
+	for _, enc := range []uint8{EncPlain, EncRLEBitpack, EncDelta, EncDict, EncOffsetBytes} {
+		if !encProducesType(enc, typeEncodingMatch[enc]) {
+			t.Errorf("encProducesType(%d) = false, want true for its own type", enc)
+		}
+	}
+}
+
+// typeEncodingMatch is the type each encoding produces values of directly.
+var typeEncodingMatch = map[uint8]uint8{
+	EncPlain:       TypeInt64,
+	EncRLEBitpack:  TypeBool,
+	EncDelta:       TypeInt64,
+	EncDict:        TypeString,
+	EncOffsetBytes: TypeBytes,
 }
 
 func TestBitmap(t *testing.T) {

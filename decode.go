@@ -11,43 +11,60 @@ import (
 // DecodePlain is the inverse of EncodePlain. typ is required because the bytes
 // alone do not say how many values they hold.
 func DecodePlain(b []byte, typ uint8) ([]any, error) {
+	typed, err := decodePlainTyped(b, typ)
+	if err != nil {
+		return nil, err
+	}
+	return boxValues(typed), nil
+}
+
+// decodePlainTyped decodes plain data into a slice of the Go type for typ —
+// []int64 for TypeInt64 and so on — rather than []any. DecodePlain boxes it, and
+// the typed reader uses it to skip the boxing altogether.
+func decodePlainTyped(b []byte, typ uint8) (any, error) {
 	switch typ {
 	case TypeBool:
-		out := make([]any, len(b))
+		out := make([]bool, len(b))
 		for i, c := range b {
 			out[i] = c != 0
 		}
 		return out, nil
 	case TypeInt8:
-		out := make([]any, len(b))
+		out := make([]int8, len(b))
 		for i, c := range b {
 			out[i] = int8(c)
 		}
 		return out, nil
 	case TypeInt16:
-		return decodeFixed(b, 2, func(s []byte) any { return int16(binary.LittleEndian.Uint16(s)) })
+		return decodeFixedT(b, 2, func(s []byte) int16 { return int16(binary.LittleEndian.Uint16(s)) })
 	case TypeInt32:
-		return decodeFixed(b, 4, func(s []byte) any { return int32(binary.LittleEndian.Uint32(s)) })
+		return decodeFixedT(b, 4, func(s []byte) int32 { return int32(binary.LittleEndian.Uint32(s)) })
 	case TypeInt64:
-		return decodeFixed(b, 8, func(s []byte) any { return int64(binary.LittleEndian.Uint64(s)) })
+		return decodeFixedT(b, 8, func(s []byte) int64 { return int64(binary.LittleEndian.Uint64(s)) })
 	case TypeUint8:
-		out := make([]any, len(b))
-		for i, c := range b {
-			out[i] = c
-		}
-		return out, nil
+		return append([]uint8(nil), b...), nil
 	case TypeUint16:
-		return decodeFixed(b, 2, func(s []byte) any { return binary.LittleEndian.Uint16(s) })
+		return decodeFixedT(b, 2, func(s []byte) uint16 { return binary.LittleEndian.Uint16(s) })
 	case TypeUint32:
-		return decodeFixed(b, 4, func(s []byte) any { return binary.LittleEndian.Uint32(s) })
+		return decodeFixedT(b, 4, func(s []byte) uint32 { return binary.LittleEndian.Uint32(s) })
 	case TypeUint64:
-		return decodeFixed(b, 8, func(s []byte) any { return binary.LittleEndian.Uint64(s) })
+		return decodeFixedT(b, 8, func(s []byte) uint64 { return binary.LittleEndian.Uint64(s) })
 	case TypeFloat32:
-		return decodeFixed(b, 4, func(s []byte) any { return math.Float32frombits(binary.LittleEndian.Uint32(s)) })
+		return decodeFixedT(b, 4, func(s []byte) float32 { return math.Float32frombits(binary.LittleEndian.Uint32(s)) })
 	case TypeFloat64:
-		return decodeFixed(b, 8, func(s []byte) any { return math.Float64frombits(binary.LittleEndian.Uint64(s)) })
+		return decodeFixedT(b, 8, func(s []byte) float64 { return math.Float64frombits(binary.LittleEndian.Uint64(s)) })
 	case TypeString, TypeBytes:
-		out := make([]any, 0, len(b)/8)
+		return decodePlainVarlen(b, typ)
+	default:
+		return nil, fmt.Errorf("keine: unknown type %d", typ)
+	}
+}
+
+// decodePlainVarlen decodes the length-prefixed plain form used by strings and
+// byte slices.
+func decodePlainVarlen(b []byte, typ uint8) (any, error) {
+	if typ == TypeString {
+		out := make([]string, 0, len(b)/8)
 		for len(b) > 0 {
 			if len(b) < 4 {
 				return nil, fmt.Errorf("keine: plain data truncated at value %d", len(out))
@@ -57,24 +74,33 @@ func DecodePlain(b []byte, typ uint8) ([]any, error) {
 			if uint64(len(b)) < uint64(n) {
 				return nil, fmt.Errorf("keine: plain data truncated at value %d", len(out))
 			}
-			if typ == TypeString {
-				out = append(out, string(b[:n]))
-			} else {
-				out = append(out, append([]byte(nil), b[:n]...))
-			}
+			out = append(out, string(b[:n]))
 			b = b[n:]
 		}
 		return out, nil
-	default:
-		return nil, fmt.Errorf("keine: unknown type %d", typ)
 	}
+
+	out := make([][]byte, 0, len(b)/8)
+	for len(b) > 0 {
+		if len(b) < 4 {
+			return nil, fmt.Errorf("keine: plain data truncated at value %d", len(out))
+		}
+		n := binary.LittleEndian.Uint32(b[:4])
+		b = b[4:]
+		if uint64(len(b)) < uint64(n) {
+			return nil, fmt.Errorf("keine: plain data truncated at value %d", len(out))
+		}
+		out = append(out, append([]byte(nil), b[:n]...))
+		b = b[n:]
+	}
+	return out, nil
 }
 
-func decodeFixed(b []byte, width int, convert func([]byte) any) ([]any, error) {
+func decodeFixedT[T any](b []byte, width int, convert func([]byte) T) ([]T, error) {
 	if len(b)%width != 0 {
 		return nil, fmt.Errorf("keine: plain data length %d is not a multiple of %d", len(b), width)
 	}
-	out := make([]any, len(b)/width)
+	out := make([]T, len(b)/width)
 	for i := range out {
 		out[i] = convert(b[i*width : (i+1)*width])
 	}
@@ -147,6 +173,15 @@ func DecodeOffsetBytes(b []byte) ([][]byte, error) {
 // the dictionary was keyed on; canonicalColumn converts them to the column's
 // declared type.
 func DecodeDict(b []byte) ([]any, error) {
+	entries, err := decodeDictTyped(b)
+	if err != nil {
+		return nil, err
+	}
+	return boxValues(entries), nil
+}
+
+// decodeDictTyped decodes a dictionary chunk into its strings.
+func decodeDictTyped(b []byte) ([]string, error) {
 	if len(b) < 12 {
 		return nil, fmt.Errorf("keine: dict data truncated")
 	}
@@ -167,7 +202,7 @@ func DecodeDict(b []byte) ([]any, error) {
 		return nil, fmt.Errorf("keine: dict size mismatch: header says %d, found %d", dictSize, len(entries))
 	}
 
-	out := make([]any, nvals)
+	out := make([]string, nvals)
 	for i := 0; i < nvals; i++ {
 		if int(indices[i]) >= len(entries) {
 			return nil, fmt.Errorf("keine: dict index %d out of range", indices[i])
@@ -197,51 +232,110 @@ func bitunpack(b []byte, n int, nbits uint) []uint32 {
 	return out
 }
 
-// decodeWith dispatches data to the decoder for enc, then converts the values
-// to the Go types implied by typ. n is the number of values in the chunk.
-func decodeWith(enc uint8, data []byte, n int, typ uint8) ([]any, error) {
-	var vals []any
+// decodeTyped dispatches a chunk to the decoder for enc and returns the values
+// as a slice of the Go type that decoder produces — []int64 from EncDelta,
+// []string from EncDict. n is the number of values in the chunk.
+func decodeTyped(enc uint8, data []byte, n int, typ uint8) (any, error) {
 	switch enc {
 	case EncPlain:
-		var err error
-		vals, err = DecodePlain(data, typ)
-		if err != nil {
-			return nil, err
-		}
+		return decodePlainTyped(data, typ)
 	case EncRLEBitpack:
-		bools := DecodeRLEBitpack(data, n)
-		vals = make([]any, len(bools))
-		for i, v := range bools {
-			vals[i] = v
-		}
+		return DecodeRLEBitpack(data, n), nil
 	case EncDelta:
-		ints, err := DecodeDelta(data)
-		if err != nil {
-			return nil, err
-		}
-		vals = make([]any, len(ints))
-		for i, v := range ints {
-			vals[i] = v
-		}
+		return DecodeDelta(data)
 	case EncDict:
-		var err error
-		vals, err = DecodeDict(data)
-		if err != nil {
-			return nil, err
-		}
+		return decodeDictTyped(data)
 	case EncOffsetBytes:
-		raw, err := DecodeOffsetBytes(data)
-		if err != nil {
-			return nil, err
-		}
-		vals = make([]any, len(raw))
-		for i, v := range raw {
-			vals[i] = v
-		}
+		return DecodeOffsetBytes(data)
 	default:
 		return nil, fmt.Errorf("keine: unknown encoding %d", enc)
 	}
-	return canonicalColumn(vals, typ)
+}
+
+// encProducesType reports whether the decoder for enc already yields typ's Go
+// type. Every encoder except Dict writes values in their declared form, so most
+// columns need no conversion after decoding.
+func encProducesType(enc, typ uint8) bool {
+	switch enc {
+	case EncPlain:
+		return true
+	case EncRLEBitpack:
+		return typ == TypeBool
+	case EncDelta:
+		return typ == TypeInt64
+	case EncDict:
+		return typ == TypeString
+	case EncOffsetBytes:
+		return typ == TypeBytes
+	default:
+		return false
+	}
+}
+
+// decodeWith dispatches data to the decoder for enc, then converts the values
+// to the Go types implied by typ. n is the number of values in the chunk.
+func decodeWith(enc uint8, data []byte, n int, typ uint8) ([]any, error) {
+	typed, err := decodeTyped(enc, data, n, typ)
+	if err != nil {
+		return nil, err
+	}
+	return boxColumn(typed, enc, typ)
+}
+
+// boxValues converts a typed slice — []int64, []string and so on — into []any.
+// It is what the []any reading path pays for a uniform return type.
+func boxValues(typed any) []any {
+	vals, _ := asValues[any](typed)
+	return vals
+}
+
+// asValues converts a typed slice into []T. The second result is false when the
+// slice's element type is not T, so asking for the wrong type is an error
+// rather than a silent mismatch.
+func asValues[T any](typed any) ([]T, bool) {
+	switch s := typed.(type) {
+	case []bool:
+		return convertSlice[bool, T](s)
+	case []int8:
+		return convertSlice[int8, T](s)
+	case []int16:
+		return convertSlice[int16, T](s)
+	case []int32:
+		return convertSlice[int32, T](s)
+	case []int64:
+		return convertSlice[int64, T](s)
+	case []uint8:
+		return convertSlice[uint8, T](s)
+	case []uint16:
+		return convertSlice[uint16, T](s)
+	case []uint32:
+		return convertSlice[uint32, T](s)
+	case []uint64:
+		return convertSlice[uint64, T](s)
+	case []float32:
+		return convertSlice[float32, T](s)
+	case []float64:
+		return convertSlice[float64, T](s)
+	case []string:
+		return convertSlice[string, T](s)
+	case [][]byte:
+		return convertSlice[[]byte, T](s)
+	}
+	return nil, false
+}
+
+func convertSlice[S any, T any](s []S) ([]T, bool) {
+	// A slice holds one element type, so the zero value settles whether T fits
+	// without checking every value.
+	var zero S
+	if _, ok := any(zero).(T); !ok {
+		return nil, false
+	}
+	out := make([]T, len(s))
+	for i, v := range s {
+		out[i] = any(v).(T)
+	}
+	return out, true
 }
 
 // canonicalColumn converts decoded values to the Go types implied by typ, so a

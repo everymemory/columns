@@ -819,6 +819,57 @@ func craftFile(chunk []byte, meta ColMeta, schema []ColumnSchema, numRows uint32
 	return f
 }
 
+// TestCanonicalReadErrors covers the read paths that narrow decoded values to
+// the declared type, which only a file whose chunk disagrees with its schema
+// can reach: a dictionary holding a value the column cannot hold.
+func TestCanonicalReadErrors(t *testing.T) {
+	dictData, err := EncodeDict([]any{"not a number"})
+	if err != nil {
+		t.Fatalf("EncodeDict: %v", err)
+	}
+	chunk := craftChunk(EncDict, CompressNone, nil, dictData)
+	meta := ColMeta{ByteLength: int64(len(chunk)), Encoding: EncDict, Compress: CompressNone}
+	schema := []ColumnSchema{{Name: "i", Type: TypeInt16}}
+	file := craftFile(chunk, meta, schema, 1)
+
+	r, err := NewReader(bytes.NewReader(file))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	if _, err := r.ReadRowGroup(0, []int{0}); err == nil {
+		t.Error("ReadRowGroup of a dict that will not coerce: want error, got nil")
+	}
+	if _, err := ReadColumn[int16](r, 0, 0); err == nil {
+		t.Error("ReadColumn of a dict that will not coerce: want error, got nil")
+	}
+
+	// The column narrows fine here, so the failure is the caller's type.
+	delta := craftChunk(EncDelta, CompressNone, nil, EncodeDelta([]int64{42}))
+	deltaMeta := ColMeta{ByteLength: int64(len(delta)), Encoding: EncDelta, Compress: CompressNone}
+	r2, err := NewReader(bytes.NewReader(craftFile(delta, deltaMeta, schema, 1)))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	if _, err := ReadColumn[string](r2, 0, 0); err == nil {
+		t.Error("ReadColumn[string] on an int16 column: want error, got nil")
+	}
+	if got, err := ReadColumn[int16](r2, 0, 0); err != nil || got[0] != 42 {
+		t.Errorf("ReadColumn[int16] = %v, err %v, want [42]", got, err)
+	}
+
+	// A chunk that cannot be decoded at all fails through ReadColumn the same way
+	// it fails through ReadRowGroup: three bytes is not an int16 pair.
+	bad := craftChunk(EncPlain, CompressNone, nil, []byte{1, 2, 3})
+	badMeta := ColMeta{ByteLength: int64(len(bad)), Encoding: EncPlain, Compress: CompressNone}
+	r3, err := NewReader(bytes.NewReader(craftFile(bad, badMeta, schema, 2)))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	if _, err := ReadColumn[int16](r3, 0, 0); err == nil {
+		t.Error("ReadColumn of a chunk that will not decode: want error, got nil")
+	}
+}
+
 func TestReaderErrors(t *testing.T) {
 	schema := []ColumnSchema{{Name: "i", Type: TypeInt16}}
 	chunk := craftChunk(EncPlain, CompressNone, nil, []byte{1, 0, 2, 0})

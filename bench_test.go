@@ -179,6 +179,45 @@ func BenchmarkRead(b *testing.B) {
 	}
 }
 
+// BenchmarkTypedRead reads a column into []int64 through ReadColumn, which skips
+// the interface boxing ReadRowGroup pays for. Set against BenchmarkRead on the
+// same column, it shows what that boxing costs.
+func BenchmarkTypedRead(b *testing.B) {
+	for _, c := range benchColumns {
+		if c.schema.Type != TypeInt64 {
+			continue
+		}
+		col := c.build(benchRows)
+		schema := []ColumnSchema{c.schema}
+
+		buf := &bytes.Buffer{}
+		w := NewWriter(buf, schema)
+		if err := w.AddRowGroup([][]any{col}); err != nil {
+			b.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			b.Fatal(err)
+		}
+		file := buf.Bytes()
+
+		r, err := NewReader(bytes.NewReader(file))
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		b.Run(c.name, func(b *testing.B) {
+			b.ReportMetric(float64(len(file)), "bytes")
+			b.SetBytes(int64(len(file)))
+
+			for i := 0; i < b.N; i++ {
+				if _, err := ReadColumn[int64](r, 0, 0); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 // BenchmarkPartialRead measures skipping the columns a query does not want,
 // which is what ColMeta.ByteLength exists for.
 func BenchmarkPartialRead(b *testing.B) {
