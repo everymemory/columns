@@ -618,18 +618,18 @@ func TestCanonicalValues(t *testing.T) {
 
 func TestEncodeWithErrors(t *testing.T) {
 	for _, c := range []struct {
-		enc uint8
-		col []any
-		typ uint8
+		enc   uint8
+		typed any
+		typ   uint8
 	}{
-		{EncPlain, []any{"x"}, TypeInt8},
-		{EncRLEBitpack, []any{"x"}, TypeBool},
-		{EncDelta, []any{"x"}, TypeInt64},
-		{EncOffsetBytes, []any{nil}, TypeBytes},
-		{99, []any{int8(1)}, TypeInt8},
+		{EncPlain, []any{nil}, TypeInt8},
+		{EncRLEBitpack, []string{"x"}, TypeBool},
+		{EncDelta, []string{"x"}, TypeInt64},
+		{EncOffsetBytes, []string{"x"}, TypeBytes},
+		{99, []int8{1}, TypeInt8},
 	} {
-		if _, err := encodeWith(c.enc, c.col, c.typ); err == nil {
-			t.Errorf("encodeWith(%d, %T, %d): want error, got nil", c.enc, c.col, c.typ)
+		if _, err := encodeWith(c.enc, c.typed, c.typ); err == nil {
+			t.Errorf("encodeWith(%d, %T, %d): want error, got nil", c.enc, c.typed, c.typ)
 		}
 	}
 }
@@ -692,15 +692,18 @@ func TestLayoutHelpers(t *testing.T) {
 	if _, ok := measureLayout([]any{int8(1)}, ColumnSchema{Name: "x", Type: TypeInt8}, EncPlain, CompressFlate); !ok {
 		t.Error("measureLayout with CompressFlate: want ok")
 	}
-	if _, ok := measureLayout([]any{struct{}{}}, ColumnSchema{Name: "x", Type: TypeBool}, EncPlain, CompressNone); ok {
-		t.Error("measureLayout of an unencodable column: want not ok")
+	if _, err := canonicalColumnTyped([]any{struct{}{}}, TypeBool); err == nil {
+		t.Error("canonicalColumnTyped of an uncoercible value: want error, got nil")
+	}
+	if _, ok := measureLayout([]string{"x"}, ColumnSchema{Name: "x", Type: TypeBool}, EncRLEBitpack, CompressNone); ok {
+		t.Error("measureLayout with a column of the wrong Go type: want not ok")
 	}
 
 	// Dictionary encoding accepts any value (it keys on the fmt form), but the
 	// decoded strings must convert back to the column type. Strings that do
 	// not parse as integers make the round trip fail, which is what the decode
 	// check in measureLayout exists to catch.
-	if _, ok := measureLayout([]any{"abc", "def"}, ColumnSchema{Name: "x", Type: TypeInt32}, EncDict, CompressNone); ok {
+	if _, ok := measureLayout([]string{"abc", "def"}, ColumnSchema{Name: "x", Type: TypeInt32}, EncDict, CompressNone); ok {
 		t.Error("measureLayout with values that cannot be decoded back: want not ok")
 	}
 }
@@ -764,28 +767,48 @@ func TestWriterErrors(t *testing.T) {
 }
 
 func TestFillStats(t *testing.T) {
-	var meta ColMeta
-	vals := []any{[]byte{1, 2, 3}, []byte{1}, []byte{1, 2, 3, 4, 5}}
-	if err := fillStats(&meta, vals, TypeBytes); err != nil {
-		t.Fatalf("fillStats: %v", err)
+	// Byte slices compare as raw bytes, so the widest value is also the
+	// longest one.
+	bb, err := canonicalColumnTyped([]any{
+		[]byte{1, 2, 3}, []byte{1}, []byte{1, 2, 3, 4, 5},
+	}, TypeBytes)
+	if err != nil {
+		t.Fatalf("canonicalColumnTyped: %v", err)
 	}
+	var meta ColMeta
+	fillStatsTyped(&meta, bb)
 	if !bytes.Equal(meta.MinVal, []byte{1}) || !bytes.Equal(meta.MaxVal, []byte{1, 2, 3, 4, 5}) {
-		t.Errorf("fillStats min = %v, max = %v", meta.MinVal, meta.MaxVal)
+		t.Errorf("fillStatsTyped min = %v, max = %v", meta.MinVal, meta.MaxVal)
 	}
 	if meta.MinLen != 1 || meta.MaxLen != 5 {
-		t.Errorf("fillStats MinLen = %d, MaxLen = %d, want 1 and 5", meta.MinLen, meta.MaxLen)
+		t.Errorf("fillStatsTyped MinLen = %d, MaxLen = %d, want 1 and 5", meta.MinLen, meta.MaxLen)
 	}
 
-	// An empty column leaves the statistics unset and is not an error.
+	// Strings compare as strings but are stored as bytes, and their lengths
+	// vary independently of their order: "a" is smallest, "ccc" largest, and
+	// "bb" is neither.
+	ss, err := canonicalColumnTyped([]any{"ccc", "a", "bb", "a"}, TypeString)
+	if err != nil {
+		t.Fatalf("canonicalColumnTyped: %v", err)
+	}
+	var strMeta ColMeta
+	fillStatsTyped(&strMeta, ss)
+	if !bytes.Equal(strMeta.MinVal, []byte("a")) || !bytes.Equal(strMeta.MaxVal, []byte("ccc")) {
+		t.Errorf("fillStatsTyped string min = %q, max = %q", strMeta.MinVal, strMeta.MaxVal)
+	}
+	if strMeta.MinLen != 1 || strMeta.MaxLen != 3 {
+		t.Errorf("fillStatsTyped string MinLen = %d, MaxLen = %d, want 1 and 3",
+			strMeta.MinLen, strMeta.MaxLen)
+	}
+
+	// An empty column leaves the statistics unset.
 	var empty ColMeta
-	if err := fillStats(&empty, nil, TypeBytes); err != nil {
-		t.Errorf("fillStats of no values: %v", err)
-	}
+	fillStatsTyped(&empty, []string(nil))
 	if empty.MinVal != nil || empty.MaxVal != nil || empty.MinLen != 0 || empty.MaxLen != 0 {
-		t.Errorf("fillStats of no values left statistics set: %+v", empty)
+		t.Errorf("fillStatsTyped of no values left statistics set: %+v", empty)
 	}
-	if _, err := valueBytes(nil, TypeBool); err == nil {
-		t.Error("valueBytes of nil: want error, got nil")
+	if _, err := canonicalColumnTyped([]any{nil}, TypeBool); err == nil {
+		t.Error("canonicalColumnTyped of nil: want error, got nil")
 	}
 }
 

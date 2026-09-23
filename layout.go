@@ -2,6 +2,7 @@ package keine
 
 import (
 	"fmt"
+	"reflect"
 	"sort"
 	"time"
 )
@@ -85,24 +86,17 @@ var layoutCodecs = []uint8{
 }
 
 // BenchmarkLayouts measures every candidate encoding and codec for col and
-// returns them sorted by CompressedSize, breaking ties by DecodeNs.
+// returns them sorted by CompressedSize, breaking ties by EncodedSize and then
+// by candidate order. The tiebreak never consults DecodeNs: that is measured
+// time, and consulting it would make two equally sized candidates win or lose
+// on noise, so the same column could pick a different layout on a different run
+// and the same input would not write the same file twice.
 func BenchmarkLayouts(col []any, schema ColumnSchema) []LayoutResult {
-	var results []LayoutResult
-	for _, enc := range layoutCandidates(schema.Type) {
-		for _, codec := range layoutCodecs {
-			r, ok := measureLayout(col, schema, enc, codec)
-			if ok {
-				results = append(results, r)
-			}
-		}
+	typed, err := canonicalColumnTyped(col, schema.Type)
+	if err != nil {
+		return nil
 	}
-	sort.SliceStable(results, func(i, j int) bool {
-		if results[i].CompressedSize != results[j].CompressedSize {
-			return results[i].CompressedSize < results[j].CompressedSize
-		}
-		return results[i].DecodeNs < results[j].DecodeNs
-	})
-	return results
+	return benchmarkLayoutsTyped(typed, schema)
 }
 
 // maxExperimentRows caps how many values ExperimentLayouts measures. Layout
@@ -116,15 +110,60 @@ const maxExperimentRows = 8192
 // col. Even spacing rather than a prefix keeps the sample representative when a
 // column is sorted or clustered.
 func experimentSample(col []any) []any {
-	if len(col) <= maxExperimentRows {
-		return col
+	return sampleTyped(col, maxExperimentRows)
+}
+
+// experimentSampleTyped is experimentSample for an already typed column.
+func experimentSampleTyped(typed any) any {
+	return sampleDispatch(typed, maxExperimentRows)
+}
+
+// sampleTyped strides through s, keeping up to max evenly spaced values.
+func sampleTyped[T any](s []T, max int) []T {
+	if len(s) <= max {
+		return s
 	}
-	stride := (len(col) + maxExperimentRows - 1) / maxExperimentRows
-	sample := make([]any, 0, maxExperimentRows)
-	for i := 0; i < len(col); i += stride {
-		sample = append(sample, col[i])
+	stride := (len(s) + max - 1) / max
+	out := make([]T, 0, max)
+	for i := 0; i < len(s); i += stride {
+		out = append(out, s[i])
 	}
-	return sample
+	return out
+}
+
+// sampleDispatch is sampleTyped without a statically known element type, since
+// a canonical column arrives as an any holding a []T.
+func sampleDispatch(typed any, max int) any {
+	switch s := typed.(type) {
+	case []bool:
+		return sampleTyped(s, max)
+	case []int8:
+		return sampleTyped(s, max)
+	case []int16:
+		return sampleTyped(s, max)
+	case []int32:
+		return sampleTyped(s, max)
+	case []int64:
+		return sampleTyped(s, max)
+	case []uint8:
+		return sampleTyped(s, max)
+	case []uint16:
+		return sampleTyped(s, max)
+	case []uint32:
+		return sampleTyped(s, max)
+	case []uint64:
+		return sampleTyped(s, max)
+	case []float32:
+		return sampleTyped(s, max)
+	case []float64:
+		return sampleTyped(s, max)
+	case []string:
+		return sampleTyped(s, max)
+	case [][]byte:
+		return sampleTyped(s, max)
+	default:
+		return typed
+	}
 }
 
 // ExperimentLayouts returns the BenchmarkLayouts entry with the smallest
@@ -132,14 +171,44 @@ func experimentSample(col []any) []any {
 // of the column rather than every value, so the cost does not grow with the
 // row count.
 func ExperimentLayouts(col []any, schema ColumnSchema) LayoutResult {
-	results := BenchmarkLayouts(experimentSample(col), schema)
+	typed, err := canonicalColumnTyped(col, schema.Type)
+	if err != nil {
+		return LayoutResult{Name: encName(EncPlain) + "+" + codecName(CompressNone), Encoding: EncPlain, Compress: CompressNone}
+	}
+	return experimentLayoutsTyped(typed, schema)
+}
+
+// experimentLayoutsTyped is ExperimentLayouts for an already canonical column,
+// so a writer that has already coerced the values measures them once more
+// rather than twice.
+func experimentLayoutsTyped(typed any, schema ColumnSchema) LayoutResult {
+	results := benchmarkLayoutsTyped(experimentSampleTyped(typed), schema)
 	if len(results) == 0 {
 		return LayoutResult{Name: encName(EncPlain) + "+" + codecName(CompressNone), Encoding: EncPlain, Compress: CompressNone}
 	}
 	return results[0]
 }
 
-func measureLayout(col []any, schema ColumnSchema, enc, codec uint8) (LayoutResult, bool) {
+func benchmarkLayoutsTyped(col any, schema ColumnSchema) []LayoutResult {
+	var results []LayoutResult
+	for _, enc := range layoutCandidates(schema.Type) {
+		for _, codec := range layoutCodecs {
+			r, ok := measureLayout(col, schema, enc, codec)
+			if ok {
+				results = append(results, r)
+			}
+		}
+	}
+	sort.SliceStable(results, func(i, j int) bool {
+		if results[i].CompressedSize != results[j].CompressedSize {
+			return results[i].CompressedSize < results[j].CompressedSize
+		}
+		return results[i].EncodedSize < results[j].EncodedSize
+	})
+	return results
+}
+
+func measureLayout(col any, schema ColumnSchema, enc, codec uint8) (LayoutResult, bool) {
 	encodeStart := time.Now().UnixNano()
 	encoded, err := encodeWith(enc, col, schema.Type)
 	if err != nil {
@@ -153,7 +222,7 @@ func measureLayout(col []any, schema ColumnSchema, enc, codec uint8) (LayoutResu
 
 	// Decompress accepts the same codecs as Compress.
 	raw, _ := Decompress(compressed, codec)
-	if _, err := decodeWith(enc, raw, len(col), schema.Type); err != nil {
+	if _, err := decodeWith(enc, raw, sliceLen(col), schema.Type); err != nil {
 		return LayoutResult{}, false
 	}
 	decodeEnd := time.Now().UnixNano()
@@ -167,4 +236,9 @@ func measureLayout(col []any, schema ColumnSchema, enc, codec uint8) (LayoutResu
 		Encoding:       enc,
 		Compress:       codec,
 	}, true
+}
+
+// sliceLen is the element count of a typed column arriving as an any.
+func sliceLen(typed any) int {
+	return reflect.ValueOf(typed).Len()
 }

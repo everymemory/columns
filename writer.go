@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 )
 
 // magic is written at the start of a file and again after the footer length.
@@ -86,14 +87,18 @@ func (w *Writer) AddRowGroup(columns [][]any) error {
 				meta.NullCount++
 			}
 		}
-		if err := fillStats(&meta, dense, schema.Type); err != nil {
+		// Coerce the column once: the statistics, the layout experiment and the
+		// final encode all consume the same typed slice.
+		typed, err := canonicalColumnTyped(dense, schema.Type)
+		if err != nil {
 			return fmt.Errorf("keine: collecting stats for column %d (%s): %w", i, schema.Name, err)
 		}
+		fillStatsTyped(&meta, typed)
 
-		best := ExperimentLayouts(dense, schema)
-		// Every value in dense has been canonicalized by fillStats, and the
-		// winning layout round tripped successfully inside ExperimentLayouts.
-		encoded, _ := encodeWith(best.Encoding, dense, schema.Type)
+		best := experimentLayoutsTyped(typed, schema)
+		// Every value in dense has been canonicalized above, and the winning
+		// layout round tripped successfully inside the experiment.
+		encoded, _ := encodeWith(best.Encoding, typed, schema.Type)
 		// best.Compress is one of the codecs Compress implements.
 		compressed, _ := Compress(encoded, best.Compress)
 
@@ -130,53 +135,135 @@ func (cw *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// fillStats records the min/max value bytes and value lengths over vals.
-func fillStats(meta *ColMeta, vals []any, typ uint8) error {
-	seen := false
-	for _, v := range vals {
-		b, err := valueBytes(v, typ)
-		if err != nil {
-			return err
+// fillStatsTyped folds the byte form of every value into meta. Fixed width
+// values are encoded into an eight byte scratch, so no value allocates. typed
+// is a canonical column, so every case it can be is one of the thirteen below
+// and no default is needed.
+func fillStatsTyped(meta *ColMeta, typed any) {
+	switch s := typed.(type) {
+	case []bool:
+		var b [1]byte
+		for _, v := range s {
+			if v {
+				b[0] = 1
+			} else {
+				b[0] = 0
+			}
+			statBytes(meta, b[:])
 		}
-		if !seen {
-			meta.MinVal = append([]byte(nil), b...)
-			meta.MaxVal = append([]byte(nil), b...)
-			meta.MinLen = uint32(len(b))
-			meta.MaxLen = uint32(len(b))
-			seen = true
-			continue
+	case []int8:
+		var b [1]byte
+		for _, v := range s {
+			b[0] = byte(v)
+			statBytes(meta, b[:])
 		}
-		if bytes.Compare(b, meta.MinVal) < 0 {
-			meta.MinVal = append(meta.MinVal[:0], b...)
+	case []int16:
+		var b [2]byte
+		for _, v := range s {
+			binary.LittleEndian.PutUint16(b[:], uint16(v))
+			statBytes(meta, b[:])
 		}
-		if bytes.Compare(b, meta.MaxVal) > 0 {
-			meta.MaxVal = append(meta.MaxVal[:0], b...)
+	case []int32:
+		var b [4]byte
+		for _, v := range s {
+			binary.LittleEndian.PutUint32(b[:], uint32(v))
+			statBytes(meta, b[:])
 		}
-		if uint32(len(b)) < meta.MinLen {
-			meta.MinLen = uint32(len(b))
+	case []int64:
+		var b [8]byte
+		for _, v := range s {
+			binary.LittleEndian.PutUint64(b[:], uint64(v))
+			statBytes(meta, b[:])
 		}
-		if uint32(len(b)) > meta.MaxLen {
-			meta.MaxLen = uint32(len(b))
+	case []uint8:
+		var b [1]byte
+		for _, v := range s {
+			b[0] = v
+			statBytes(meta, b[:])
+		}
+	case []uint16:
+		var b [2]byte
+		for _, v := range s {
+			binary.LittleEndian.PutUint16(b[:], v)
+			statBytes(meta, b[:])
+		}
+	case []uint32:
+		var b [4]byte
+		for _, v := range s {
+			binary.LittleEndian.PutUint32(b[:], v)
+			statBytes(meta, b[:])
+		}
+	case []uint64:
+		var b [8]byte
+		for _, v := range s {
+			binary.LittleEndian.PutUint64(b[:], v)
+			statBytes(meta, b[:])
+		}
+	case []float32:
+		var b [4]byte
+		for _, v := range s {
+			binary.LittleEndian.PutUint32(b[:], math.Float32bits(v))
+			statBytes(meta, b[:])
+		}
+	case []float64:
+		var b [8]byte
+		for _, v := range s {
+			binary.LittleEndian.PutUint64(b[:], math.Float64bits(v))
+			statBytes(meta, b[:])
+		}
+	case []string:
+		var lo, hi string
+		for i, v := range s {
+			if i == 0 {
+				lo, hi = v, v
+				meta.MinLen = uint32(len(v))
+				meta.MaxLen = uint32(len(v))
+				continue
+			}
+			if v < lo {
+				lo = v
+			}
+			if v > hi {
+				hi = v
+			}
+			if uint32(len(v)) < meta.MinLen {
+				meta.MinLen = uint32(len(v))
+			}
+			if uint32(len(v)) > meta.MaxLen {
+				meta.MaxLen = uint32(len(v))
+			}
+		}
+		meta.MinVal = append(meta.MinVal, lo...)
+		meta.MaxVal = append(meta.MaxVal, hi...)
+	case [][]byte:
+		for _, v := range s {
+			statBytes(meta, v)
 		}
 	}
-	return nil
 }
 
-// valueBytes returns a comparable byte form of v for min/max statistics.
-// Fixed width values use their plain encoding; strings and byte slices use
-// their raw bytes so the length prefix does not affect ordering.
-func valueBytes(v any, typ uint8) ([]byte, error) {
-	cv, err := canonicalValue(v, typ)
-	if err != nil {
-		return nil, err
+// statBytes folds b into meta's min and max. MinLen and MaxLen track value
+// length separately from min and max, since a column's longest value is not
+// necessarily its largest.
+func statBytes(meta *ColMeta, b []byte) {
+	if len(meta.MinVal) == 0 {
+		meta.MinVal = append(meta.MinVal, b...)
+		meta.MaxVal = append(meta.MaxVal, b...)
+		meta.MinLen = uint32(len(b))
+		meta.MaxLen = uint32(len(b))
+		return
 	}
-	switch s := cv.(type) {
-	case string:
-		return []byte(s), nil
-	case []byte:
-		return s, nil
-	default:
-		return EncodePlain([]any{cv})
+	if bytes.Compare(b, meta.MinVal) < 0 {
+		meta.MinVal = append(meta.MinVal[:0], b...)
+	}
+	if bytes.Compare(b, meta.MaxVal) > 0 {
+		meta.MaxVal = append(meta.MaxVal[:0], b...)
+	}
+	if uint32(len(b)) < meta.MinLen {
+		meta.MinLen = uint32(len(b))
+	}
+	if uint32(len(b)) > meta.MaxLen {
+		meta.MaxLen = uint32(len(b))
 	}
 }
 

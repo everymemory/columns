@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"math/bits"
 	"reflect"
 )
@@ -12,6 +13,106 @@ import (
 // little-endian; strings and byte slices get a uint32 length prefix followed by
 // their raw bytes.
 func EncodePlain(vals any) ([]byte, error) {
+	switch s := vals.(type) {
+	case []bool:
+		buf := make([]byte, len(s))
+		for i, v := range s {
+			if v {
+				buf[i] = 1
+			}
+		}
+		return buf, nil
+	case []int8:
+		buf := make([]byte, len(s))
+		for i, v := range s {
+			buf[i] = byte(v)
+		}
+		return buf, nil
+	case []int16:
+		buf := make([]byte, 2*len(s))
+		for i, v := range s {
+			binary.LittleEndian.PutUint16(buf[i*2:], uint16(v))
+		}
+		return buf, nil
+	case []int32:
+		buf := make([]byte, 4*len(s))
+		for i, v := range s {
+			binary.LittleEndian.PutUint32(buf[i*4:], uint32(v))
+		}
+		return buf, nil
+	case []int64:
+		buf := make([]byte, 8*len(s))
+		for i, v := range s {
+			binary.LittleEndian.PutUint64(buf[i*8:], uint64(v))
+		}
+		return buf, nil
+	case []uint8:
+		buf := make([]byte, len(s))
+		copy(buf, s)
+		return buf, nil
+	case []uint16:
+		buf := make([]byte, 2*len(s))
+		for i, v := range s {
+			binary.LittleEndian.PutUint16(buf[i*2:], v)
+		}
+		return buf, nil
+	case []uint32:
+		buf := make([]byte, 4*len(s))
+		for i, v := range s {
+			binary.LittleEndian.PutUint32(buf[i*4:], v)
+		}
+		return buf, nil
+	case []uint64:
+		buf := make([]byte, 8*len(s))
+		for i, v := range s {
+			binary.LittleEndian.PutUint64(buf[i*8:], v)
+		}
+		return buf, nil
+	case []float32:
+		buf := make([]byte, 4*len(s))
+		for i, v := range s {
+			binary.LittleEndian.PutUint32(buf[i*4:], math.Float32bits(v))
+		}
+		return buf, nil
+	case []float64:
+		buf := make([]byte, 8*len(s))
+		for i, v := range s {
+			binary.LittleEndian.PutUint64(buf[i*8:], math.Float64bits(v))
+		}
+		return buf, nil
+	case []string:
+		total := 0
+		for _, v := range s {
+			total += 4 + len(v)
+		}
+		buf := make([]byte, 0, total)
+		var prefix [4]byte
+		for _, v := range s {
+			binary.LittleEndian.PutUint32(prefix[:], uint32(len(v)))
+			buf = append(buf, prefix[:]...)
+			buf = append(buf, v...)
+		}
+		return buf, nil
+	case [][]byte:
+		total := 0
+		for _, v := range s {
+			total += 4 + len(v)
+		}
+		buf := make([]byte, 0, total)
+		var prefix [4]byte
+		for _, v := range s {
+			binary.LittleEndian.PutUint32(prefix[:], uint32(len(v)))
+			buf = append(buf, prefix[:]...)
+			buf = append(buf, v...)
+		}
+		return buf, nil
+	}
+	return encodePlainReflect(vals)
+}
+
+// encodePlainReflect handles slices EncodePlain has no case for, chiefly []any
+// and slices whose elements are not one of the thirteen column types.
+func encodePlainReflect(vals any) ([]byte, error) {
 	rv := reflect.ValueOf(vals)
 	if rv.Kind() != reflect.Slice {
 		return nil, fmt.Errorf("keine: plain encode expects a slice, got %T", vals)
@@ -104,14 +205,9 @@ func EncodeOffsetBytes(vals [][]byte) []byte {
 // then stores the uint32 index of every value bitpacked at ceil(log2(dictSize))
 // bits, followed by the dictionary entries in OFFSET_BYTES layout.
 func EncodeDict(vals any) ([]byte, error) {
-	rv := reflect.ValueOf(vals)
-	if rv.Kind() != reflect.Slice {
-		return nil, fmt.Errorf("keine: dict encode expects a slice, got %T", vals)
-	}
-	n := rv.Len()
-	keys := make([]string, n)
-	for i := 0; i < n; i++ {
-		keys[i] = fmt.Sprintf("%v", rv.Index(i).Interface())
+	keys, n, err := dictKeys(vals)
+	if err != nil {
+		return nil, err
 	}
 
 	order := make([]string, 0, n)
@@ -145,6 +241,32 @@ func EncodeDict(vals any) ([]byte, error) {
 	return buf, nil
 }
 
+// dictKeys returns the dictionary key of every element of vals. Strings key on
+// themselves and byte slices on their fmt form, which is what the reader parses
+// back; anything else falls back to the fmt form of the value, so a column of
+// any type can still be dictionary encoded through []any.
+func dictKeys(vals any) ([]string, int, error) {
+	if s, ok := vals.([]string); ok {
+		return s, len(s), nil
+	}
+	if s, ok := vals.([][]byte); ok {
+		keys := make([]string, len(s))
+		for i, v := range s {
+			keys[i] = fmt.Sprintf("%v", v)
+		}
+		return keys, len(s), nil
+	}
+	rv := reflect.ValueOf(vals)
+	if rv.Kind() != reflect.Slice {
+		return nil, 0, fmt.Errorf("keine: dict encode expects a slice, got %T", vals)
+	}
+	keys := make([]string, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		keys[i] = fmt.Sprintf("%v", rv.Index(i).Interface())
+	}
+	return keys, rv.Len(), nil
+}
+
 // bitpackIndices packs indices using nbits per value, most significant bit
 // first, padded to a byte boundary.
 func bitpackIndices(indices []uint32, nbits uint) []byte {
@@ -164,49 +286,87 @@ func bitpackIndices(indices []uint32, nbits uint) []byte {
 	return out
 }
 
-// encodeWith dispatches col to the encoder for enc, first coercing the values
-// to the Go types implied by typ.
-func encodeWith(enc uint8, col []any, typ uint8) ([]byte, error) {
+// encodeWith dispatches typed, a column already coerced to the Go type typ
+// implies, to the encoder for enc.
+func encodeWith(enc uint8, typed any, typ uint8) ([]byte, error) {
 	switch enc {
 	case EncPlain:
-		canon, err := canonicalColumn(col, typ)
-		if err != nil {
-			return nil, err
-		}
-		return EncodePlain(canon)
+		return EncodePlain(typed)
 	case EncRLEBitpack:
-		bools := make([]bool, len(col))
-		for i, v := range col {
-			b, err := coerceBool(v)
-			if err != nil {
-				return nil, err
-			}
-			bools[i] = b
+		bools, ok := typed.([]bool)
+		if !ok {
+			return nil, fmt.Errorf("keine: rle bitpack encodes bool columns, got %T", typed)
 		}
 		return EncodeRLEBitpack(bools), nil
 	case EncDelta:
-		ints := make([]int64, len(col))
-		for i, v := range col {
-			n, err := coerceInt(v, 64)
-			if err != nil {
-				return nil, err
-			}
-			ints[i] = n
+		ints, err := toInt64s(typed)
+		if err != nil {
+			return nil, err
 		}
 		return EncodeDelta(ints), nil
 	case EncDict:
-		return EncodeDict(col)
+		return EncodeDict(typed)
 	case EncOffsetBytes:
-		raw := make([][]byte, len(col))
-		for i, v := range col {
-			b, err := coerceBytes(v)
-			if err != nil {
-				return nil, err
-			}
-			raw[i] = b
+		raw, ok := typed.([][]byte)
+		if !ok {
+			return nil, fmt.Errorf("keine: offset bytes encodes bytes columns, got %T", typed)
 		}
 		return EncodeOffsetBytes(raw), nil
 	default:
 		return nil, fmt.Errorf("keine: unknown encoding %d", enc)
+	}
+}
+
+// toInt64s widens an integer column to []int64, which is what Delta stores. It
+// is a bit cast rather than a range check because Delta already carries int64
+// differences for every integer width and the reader narrows back.
+func toInt64s(typed any) ([]int64, error) {
+	switch s := typed.(type) {
+	case []int8:
+		out := make([]int64, len(s))
+		for i, v := range s {
+			out[i] = int64(v)
+		}
+		return out, nil
+	case []int16:
+		out := make([]int64, len(s))
+		for i, v := range s {
+			out[i] = int64(v)
+		}
+		return out, nil
+	case []int32:
+		out := make([]int64, len(s))
+		for i, v := range s {
+			out[i] = int64(v)
+		}
+		return out, nil
+	case []int64:
+		return s, nil
+	case []uint8:
+		out := make([]int64, len(s))
+		for i, v := range s {
+			out[i] = int64(v)
+		}
+		return out, nil
+	case []uint16:
+		out := make([]int64, len(s))
+		for i, v := range s {
+			out[i] = int64(v)
+		}
+		return out, nil
+	case []uint32:
+		out := make([]int64, len(s))
+		for i, v := range s {
+			out[i] = int64(v)
+		}
+		return out, nil
+	case []uint64:
+		out := make([]int64, len(s))
+		for i, v := range s {
+			out[i] = int64(v)
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("keine: delta encodes integer columns, got %T", typed)
 	}
 }

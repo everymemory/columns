@@ -341,13 +341,101 @@ func convertSlice[S any, T any](s []S) ([]T, bool) {
 // canonicalColumn converts decoded values to the Go types implied by typ, so a
 // round trip gives back values equal to the ones written.
 func canonicalColumn(vals []any, typ uint8) ([]any, error) {
-	out := make([]any, len(vals))
+	typed, err := canonicalColumnTyped(vals, typ)
+	if err != nil {
+		return nil, err
+	}
+	return boxValues(typed), nil
+}
+
+// canonicalColumnTyped is canonicalColumn returning a slice of the Go type typ
+// implies rather than []any. The encoders and the statistics pass consume it
+// directly, so a column is coerced once and never boxed on the way to disk.
+func canonicalColumnTyped(vals []any, typ uint8) (any, error) {
+	switch typ {
+	case TypeBool:
+		return canonicalTyped(vals, func(v any) (bool, error) { return coerceBool(v) })
+	case TypeInt8:
+		return canonicalTyped(vals, func(v any) (int8, error) {
+			n, err := coerceInt(v, 8)
+			if err != nil {
+				return 0, err
+			}
+			return int8(n), nil
+		})
+	case TypeInt16:
+		return canonicalTyped(vals, func(v any) (int16, error) {
+			n, err := coerceInt(v, 16)
+			if err != nil {
+				return 0, err
+			}
+			return int16(n), nil
+		})
+	case TypeInt32:
+		return canonicalTyped(vals, func(v any) (int32, error) {
+			n, err := coerceInt(v, 32)
+			if err != nil {
+				return 0, err
+			}
+			return int32(n), nil
+		})
+	case TypeInt64:
+		return canonicalTyped(vals, func(v any) (int64, error) { return coerceInt(v, 64) })
+	case TypeUint8:
+		return canonicalTyped(vals, func(v any) (uint8, error) {
+			n, err := coerceUint(v, 8)
+			if err != nil {
+				return 0, err
+			}
+			return uint8(n), nil
+		})
+	case TypeUint16:
+		return canonicalTyped(vals, func(v any) (uint16, error) {
+			n, err := coerceUint(v, 16)
+			if err != nil {
+				return 0, err
+			}
+			return uint16(n), nil
+		})
+	case TypeUint32:
+		return canonicalTyped(vals, func(v any) (uint32, error) {
+			n, err := coerceUint(v, 32)
+			if err != nil {
+				return 0, err
+			}
+			return uint32(n), nil
+		})
+	case TypeUint64:
+		return canonicalTyped(vals, func(v any) (uint64, error) { return coerceUint(v, 64) })
+	case TypeFloat32:
+		return canonicalTyped(vals, func(v any) (float32, error) {
+			f, err := coerceFloat(v, 32)
+			if err != nil {
+				return 0, err
+			}
+			return float32(f), nil
+		})
+	case TypeFloat64:
+		return canonicalTyped(vals, func(v any) (float64, error) { return coerceFloat(v, 64) })
+	case TypeString:
+		return canonicalTyped(vals, func(v any) (string, error) { return coerceString(v) })
+	case TypeBytes:
+		return canonicalTyped(vals, func(v any) ([]byte, error) { return coerceBytes(v) })
+	default:
+		return nil, fmt.Errorf("keine: unknown type %d", typ)
+	}
+}
+
+// canonicalTyped coerces vals elementwise through coerce and collects the
+// results into a []T.
+func canonicalTyped[T any](vals []any, coerce func(any) (T, error)) ([]T, error) {
+	out := make([]T, len(vals))
 	for i, v := range vals {
-		cv, err := canonicalValue(v, typ)
+		x, err := coerce(v)
 		if err != nil {
 			return nil, err
 		}
-		out[i] = cv
+		out[i] = x
 	}
 	return out, nil
 }
