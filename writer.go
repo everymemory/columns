@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"runtime"
+	"sync"
 )
 
 // magic is written at the start of a file and again after the footer length.
@@ -62,6 +64,11 @@ func (w *Writer) AddRowGroup(columns [][]any) error {
 		Columns:    make([]ColMeta, len(columns)),
 	}
 
+	// Null handling and coercion read the caller's slices and are cheap, so they
+	// stay serial. Each column's typed slice and statistics feed the work below.
+	typed := make([]any, len(columns))
+	metas := make([]ColMeta, len(columns))
+	bitmasks := make([][]byte, len(columns))
 	for i, col := range columns {
 		schema := w.schema[i]
 
@@ -89,38 +96,77 @@ func (w *Writer) AddRowGroup(columns [][]any) error {
 		}
 		// Coerce the column once: the statistics, the layout experiment and the
 		// final encode all consume the same typed slice.
-		typed, err := canonicalColumnTyped(dense, schema.Type)
+		t, err := canonicalColumnTyped(dense, schema.Type)
 		if err != nil {
 			return fmt.Errorf("keine: collecting stats for column %d (%s): %w", i, schema.Name, err)
 		}
-		fillStatsTyped(&meta, typed)
+		fillStatsTyped(&meta, t)
 
-		best := experimentLayoutsTyped(typed, schema)
-		// Every value in dense has been canonicalized above, and the winning
-		// layout round tripped successfully inside the experiment.
-		encoded, _ := encodeWith(best.Encoding, typed, schema.Type)
-		// best.Compress is one of the codecs Compress implements.
-		compressed, _ := Compress(encoded, best.Compress)
+		typed[i] = t
+		metas[i] = meta
+		bitmasks[i] = EncodeBitmap(nulls)
+	}
+
+	// Choosing a layout, encoding and compressing are independent per column and
+	// are where the write time actually goes — the compressor is the largest item
+	// on the profile — so they run across columns at once. A column's result is
+	// written in order afterwards, which keeps the bytes identical to a serial
+	// write: no encoder sees another column's data.
+	chunks := encodeColumns(typed, w.schema)
+
+	for i := range columns {
+		meta := metas[i]
+		chunk := chunks[i]
+		chunk.NullBitmap = bitmasks[i]
 
 		cw := &countingWriter{w: w.w}
-		if err := WriteChunk(cw, ColumnChunk{
-			Encoding:   best.Encoding,
-			Compress:   best.Compress,
-			NullBitmap: EncodeBitmap(nulls),
-			Data:       compressed,
-		}); err != nil {
-			return fmt.Errorf("keine: writing column %d (%s): %w", i, schema.Name, err)
+		if err := WriteChunk(cw, chunk); err != nil {
+			return fmt.Errorf("keine: writing column %d (%s): %w", i, w.schema[i].Name, err)
 		}
 		w.offset += cw.count
 
 		meta.ByteLength = cw.count
-		meta.Encoding = best.Encoding
-		meta.Compress = best.Compress
-		rg.Columns[i] = meta
+		meta.Encoding = chunk.Encoding
+		meta.Compress = chunk.Compress
+		metas[i] = meta
 	}
+	copy(rg.Columns, metas)
 
 	w.rowGroups = append(w.rowGroups, rg)
 	return nil
+}
+
+// encodeColumns picks a layout for each column and encodes and compresses it,
+// returning one chunk per column. Encoding one column touches no other, so the
+// work is spread across cores; a table wider than the machine has cores still
+// runs no more encoders at once than there are.
+func encodeColumns(typed []any, schema []ColumnSchema) []ColumnChunk {
+	chunks := make([]ColumnChunk, len(typed))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, runtime.NumCPU())
+	for i := range typed {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			best := experimentLayoutsTyped(typed[i], schema[i])
+			// Every value in the column has been canonicalized already, and the
+			// winning layout round tripped successfully inside the experiment, so
+			// encoding it again cannot fail.
+			encoded, _ := encodeWith(best.Encoding, typed[i], schema[i].Type)
+			// best.Compress is one of the codecs Compress implements.
+			compressed, _ := Compress(encoded, best.Compress)
+			chunks[i] = ColumnChunk{
+				Encoding: best.Encoding,
+				Compress: best.Compress,
+				Data:     compressed,
+			}
+		}(i)
+	}
+	wg.Wait()
+	return chunks
 }
 
 // countingWriter tallies the bytes written through it.

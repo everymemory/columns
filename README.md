@@ -159,39 +159,36 @@ from the same pseudo-random stream so neither sees easier data:
 
 | | bytes/row | write | read all | read 1 column | read typed |
 | --- | --- | --- | --- | --- | --- |
-| keine | 9.06 | 633ms | 87ms | 8ms | 33ms |
+| keine | 9.06 | 260ms | 35ms | 8ms | 33ms |
 | parquet zstd | 12.86 | 102ms | 17ms | 9ms | — |
 | parquet snappy | 21.32 | 96ms | 18ms | 8ms | — |
 | parquet none | 43.71 | 81ms | 13ms | 8ms | — |
 
-keine is smaller, parquet is still faster. The write gap has two parts. Roughly
-170ms of it is the layout experiment — the cost of measuring encodings instead
-of guessing — and the remaining ~460ms is encoding and compression, dominated
-by `compress/flate`: on the write profile `flate.deflate` is the single biggest
-item. keine pays it deliberately, because it uses no third-party code and the
-standard library ships no zstd.
+keine is smaller than parquet at every compression level, and reading one column
+is level with it. Writing is still slower, and what is left of the gap sits
+mostly in one place: `compress/flate` at its default level.
 
-Parquet still wins on write because it does not measure anything: its layout
-choices are compiled in. keine pays its 170ms to adapt to a column that breaks
-those assumptions, which is the trade the format is making deliberately.
+Encoding and compressing a column touches no other, so the writer runs them
+across columns at once and writes each result in order, which keeps the bytes
+identical to a serial write. The reader splits the same way: chunk bytes come
+through one shared file handle serially, and decompression and decoding run
+across columns. That is what closed most of the read gap. The work that remains
+is flate, and flate's cost is not symmetric: a column of pseudo-random float64
+values compresses 3.80x at level 6 in 109ms, and 3.75x at level 3 in 28ms. The
+standard library ships no zstd, so there is no faster codec to reach for, only a
+slower setting to stop using.
 
-Reading one column is now level with parquet. Reading all five is behind, and
-the profile says why: flate decompression is 43% of that read and GC is another
-25%. The decoding itself is no longer the cost it was — boxing every value into
-an interface used to allocate a copy of each one, and a column now shares one
-backing array instead, so a 10000-value int64 column reads with 10 allocations
-rather than 10010 and takes about half the time. Strings got the same
-treatment: a dictionary column converts each distinct entry once and shares
-those headers across every value that repeats it, and a plain string column's
-values are slices of one buffer rather than a copy each. That took the
-comparison file's read from 134ms to 87ms and its allocations from 403000 to
-3500 while the output bytes stayed identical.
+Parquet also pays nothing to choose a layout: its encodings are compiled in.
+keine measures them per column, which costs about 40ms of this write and is why
+it can be smaller than a format with a better compressor.
 
-The remaining read gap is decompression, not decoding: keine decompresses five
-columns through Go's flate, and parquet hands back typed Arrow buffers from C++
-without crossing into Go's heap at all.
-
-The typed column reads three integer columns in 33ms where the boxed path takes
-longer for the same work. `ReadColumn` is the path to use when the schema is
-known and a query touches few columns, since it skips the interface boxing
-`ReadRowGroup` pays for a uniform return type.
+Reading all five columns is still behind, and the profile says why: flate
+decompression is 43% of that read and GC is another 25%. The decoding itself is
+no longer the cost it was — boxing every value into an interface used to
+allocate a copy of each one, and a column now shares one backing array instead,
+so a 10000-value int64 column reads with 10 allocations rather than 10010 and
+takes about half the time. Strings got the same treatment: a dictionary column
+converts each distinct entry once and shares those headers across every value
+that repeats it, and a plain string column's values are slices of one buffer
+rather than a copy each. That took the comparison file's read from 134ms to 35ms
+and its allocations from 403000 to 3500 while the output bytes stayed identical.

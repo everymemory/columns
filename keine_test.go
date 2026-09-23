@@ -480,6 +480,64 @@ func TestReadColumn(t *testing.T) {
 	}
 }
 
+// ReadColumn reads through the same chunk reading and decoding paths as
+// ReadRowGroup, so a file whose chunk cannot be decoded has to fail there too.
+func TestReadColumnCorrupt(t *testing.T) {
+	schema := []ColumnSchema{{Name: "i", Type: TypeInt16}}
+
+	zstdChunk := craftChunk(EncPlain, CompressZstd, nil, []byte{1, 0})
+	zstdFile := craftFile(zstdChunk, ColMeta{
+		ByteLength: int64(len(zstdChunk)),
+		Encoding:   EncPlain,
+		Compress:   CompressZstd,
+	}, schema, 1)
+	r, err := NewReader(bytes.NewReader(zstdFile))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	if _, err := ReadColumn[int16](r, 0, 0); err == nil {
+		t.Error("ReadColumn of a chunk claiming zstd succeeded, want an error")
+	}
+
+	// Two bytes for one value and a third left over is not a valid int16 column.
+	oddChunk := craftChunk(EncPlain, CompressNone, nil, []byte{1, 2, 3})
+	oddFile := craftFile(oddChunk, ColMeta{
+		ByteLength: int64(len(oddChunk)),
+		Encoding:   EncPlain,
+		Compress:   CompressNone,
+	}, schema, 1)
+	r, err = NewReader(bytes.NewReader(oddFile))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	if _, err := ReadColumn[int16](r, 0, 0); err == nil {
+		t.Error("ReadColumn of undecodable data succeeded, want an error")
+	}
+}
+
+// ReadColumn seeks before it reads, so a seek that fails has to surface there too.
+func TestReadColumnSeekFail(t *testing.T) {
+	schema := []ColumnSchema{{Name: "i", Type: TypeInt64}}
+	cols := [][]any{{int64(1), int64(2)}}
+
+	var buf bytes.Buffer
+	w := NewWriter(&buf, schema)
+	if err := w.AddRowGroup(cols); err != nil {
+		t.Fatalf("AddRowGroup: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	r, err := NewReader(&flakyReadSeeker{r: bytes.NewReader(buf.Bytes()), failSeek: 4})
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	if _, err := ReadColumn[int64](r, 0, 0); err == nil {
+		t.Error("ReadColumn with a failing seek succeeded, want an error")
+	}
+}
+
 // A column holding nulls has nowhere to put a nil in a []T, so ReadColumn
 // declines it and ReadRowGroup handles that case.
 func TestReadColumnNulls(t *testing.T) {

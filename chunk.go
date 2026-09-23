@@ -14,6 +14,22 @@ type ColumnChunk struct {
 	Data       []byte
 }
 
+// detach returns a copy of c whose slices own their bytes. ReadChunkInto fills a
+// chunk's slices into caller-supplied scratch space, which a later read reuses;
+// a chunk that outlives the read that produced it — one handed to another
+// goroutine, or one kept while another column is read — has to be detached
+// first or its data will be clobbered underneath it.
+func (c ColumnChunk) detach() ColumnChunk {
+	out := ColumnChunk{Encoding: c.Encoding, Compress: c.Compress}
+	if c.NullBitmap != nil {
+		out.NullBitmap = append([]byte(nil), c.NullBitmap...)
+	}
+	if c.Data != nil {
+		out.Data = append([]byte(nil), c.Data...)
+	}
+	return out
+}
+
 // WriteChunk writes c to w as: encoding byte, compress byte, null bitmap
 // (uint32 length plus bytes), then data (uint32 length plus bytes). Integers
 // are little-endian.

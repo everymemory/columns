@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"runtime"
+	"sync"
 )
 
 // Reader reads a keine file written by Writer.
@@ -100,24 +102,101 @@ func (rd *Reader) ReadRowGroup(index int, colIndexes []int) ([][]any, error) {
 	}
 
 	out := make([][]any, len(colIndexes))
-	for k, ci := range colIndexes {
+	for _, ci := range colIndexes {
 		if ci < 0 || ci >= len(rg.Columns) {
 			return nil, fmt.Errorf("keine: column index %d out of range (have %d)", ci, len(rg.Columns))
 		}
+	}
 
-		typed, nulls, err := rd.readColumn(startOf(rg, ci), rg, ci)
+	// Reading a chunk uses the shared ReadSeeker, so the byte reads stay serial.
+	// The decompression and decoding afterwards are independent per column and
+	// are where the time goes, so those run across columns at once. Every result
+	// lands in its own slot, so no goroutine touches another's output.
+	jobs := make([]readJob, len(colIndexes))
+	for k, ci := range colIndexes {
+		start := startOf(rg, ci)
+		chunk, err := rd.readChunk(start, rg, ci)
 		if err != nil {
 			return nil, err
 		}
+		// The chunk's slices point into this Reader's scratch buffers, which the
+		// next column's read reuses, so detach them before they can be clobbered.
+		jobs[k] = readJob{chunk: chunk.detach(), rg: rg, ci: ci}
+	}
 
-		vals, err := boxColumn(typed, rg.Columns[ci].Encoding, rd.footer.Schema[ci].Type)
-		if err != nil {
-			return nil, err
+	results := make([]readResult, len(jobs))
+	decodeColumns(rd.footer.Schema, jobs, results)
+	for k, res := range results {
+		if res.err != nil {
+			return nil, res.err
 		}
-		out[k] = expandNulls(vals, nulls, int(rg.NumRows))
+		out[k] = res.vals
 	}
 
 	return out, nil
+}
+
+// readJob is one column's chunk once it is in memory, with everything its
+// decoder needs from the footer.
+type readJob struct {
+	chunk ColumnChunk
+	rg    RowGroupMeta
+	ci    int
+}
+
+// readResult is where a readJob's decoded values land.
+type readResult struct {
+	vals []any
+	err  error
+}
+
+// decodeColumns decompresses and decodes each job outside the results slice,
+// which lets the caller keep reading chunks while the previous ones are still
+// being worked on. The buffers a column passes through are per goroutine, since
+// the Reader's own scratch space serves one column at a time.
+func decodeColumns(schema []ColumnSchema, jobs []readJob, results []readResult) {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, runtime.NumCPU())
+	for i := range jobs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			j := jobs[i]
+			sch := schema[j.ci]
+			meta := j.rg.Columns[j.ci]
+
+			raw, err := decompressInto(nil, j.chunk.Data, j.chunk.Compress)
+			if err != nil {
+				results[i].err = fmt.Errorf("keine: decompressing column %d (%s): %w", j.ci, sch.Name, err)
+				return
+			}
+
+			// Only the non-null values were encoded.
+			numValues := int(j.rg.NumRows)
+			if len(j.chunk.NullBitmap) > 0 {
+				numValues -= int(meta.NullCount)
+			}
+			typed, err := decodeTyped(j.chunk.Encoding, raw, numValues, sch.Type)
+			if err != nil {
+				results[i].err = fmt.Errorf("keine: decoding column %d (%s): %w", j.ci, sch.Name, err)
+				return
+			}
+
+			vals, err := boxColumn(typed, j.chunk.Encoding, sch.Type)
+			if err != nil {
+				results[i].err = err
+				return
+			}
+			if len(j.chunk.NullBitmap) > 0 {
+				vals = expandNulls(vals, DecodeBitmap(j.chunk.NullBitmap, int(j.rg.NumRows)), int(j.rg.NumRows))
+			}
+			results[i].vals = vals
+		}(i)
+	}
+	wg.Wait()
 }
 
 // ReadColumn reads one column of one row group as a typed slice, so a TypeInt64
@@ -186,37 +265,46 @@ func startOf(rg RowGroupMeta, col int) int64 {
 // it into a slice of its declared Go type. nulls is the column's null bitmap,
 // nil when the column was written dense.
 func (rd *Reader) readColumn(start int64, rg RowGroupMeta, ci int) (typed any, nulls []bool, err error) {
-	schema := rd.footer.Schema[ci]
-	meta := rg.Columns[ci]
-
-	if _, err := rd.r.Seek(start, io.SeekStart); err != nil {
-		return nil, nil, fmt.Errorf("keine: cannot seek to column %d: %w", ci, err)
-	}
-	var chunk ColumnChunk
-	if err := readChunkInto(bufio.NewReader(rd.r), &chunk, &rd.bitmap, &rd.data); err != nil {
-		return nil, nil, fmt.Errorf("keine: reading column %d (%s): %w", ci, schema.Name, err)
+	chunk, err := rd.readChunk(start, rg, ci)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	raw, err := decompressInto(rd.raw[:0], chunk.Data, chunk.Compress)
 	if err != nil {
-		return nil, nil, fmt.Errorf("keine: decompressing column %d (%s): %w", ci, schema.Name, err)
+		return nil, nil, fmt.Errorf("keine: decompressing column %d (%s): %w", ci, rd.footer.Schema[ci].Name, err)
 	}
 	rd.raw = raw
 
 	// Only the non-null values were encoded.
 	numValues := int(rg.NumRows)
 	if len(chunk.NullBitmap) > 0 {
-		numValues -= int(meta.NullCount)
+		numValues -= int(rg.Columns[ci].NullCount)
 	}
-	typed, err = decodeTyped(chunk.Encoding, raw, numValues, schema.Type)
+	typed, err = decodeTyped(chunk.Encoding, raw, numValues, rd.footer.Schema[ci].Type)
 	if err != nil {
-		return nil, nil, fmt.Errorf("keine: decoding column %d (%s): %w", ci, schema.Name, err)
+		return nil, nil, fmt.Errorf("keine: decoding column %d (%s): %w", ci, rd.footer.Schema[ci].Name, err)
 	}
 
 	if len(chunk.NullBitmap) > 0 {
 		nulls = DecodeBitmap(chunk.NullBitmap, int(rg.NumRows))
 	}
 	return typed, nulls, nil
+}
+
+// readChunk seeks to one column chunk and reads its bytes into the Reader's
+// scratch buffers. It is the part of reading a column that has to be serial,
+// since one ReadSeeker serves them all.
+func (rd *Reader) readChunk(start int64, rg RowGroupMeta, ci int) (ColumnChunk, error) {
+	schema := rd.footer.Schema[ci]
+	if _, err := rd.r.Seek(start, io.SeekStart); err != nil {
+		return ColumnChunk{}, fmt.Errorf("keine: cannot seek to column %d: %w", ci, err)
+	}
+	var chunk ColumnChunk
+	if err := readChunkInto(bufio.NewReader(rd.r), &chunk, &rd.bitmap, &rd.data); err != nil {
+		return ColumnChunk{}, fmt.Errorf("keine: reading column %d (%s): %w", ci, schema.Name, err)
+	}
+	return chunk, nil
 }
 
 // boxColumn converts a decoded column to []any, narrowing it to the declared
@@ -229,11 +317,9 @@ func boxColumn(typed any, enc, typ uint8) ([]any, error) {
 }
 
 // expandNulls re-inserts nil at every null position. Only the non-null values
-// were encoded, so vals is dense and nulls says where to spread it.
+// were encoded, so vals is dense and nulls says where to spread it. nulls is the
+// decoded bitmap, so it has a slot for every row in the group.
 func expandNulls(vals []any, nulls []bool, numRows int) []any {
-	if len(nulls) == 0 {
-		return vals
-	}
 	expanded := make([]any, numRows)
 	j := 0
 	for i := 0; i < numRows; i++ {
