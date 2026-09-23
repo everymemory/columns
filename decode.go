@@ -6,6 +6,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"unsafe"
 )
 
 // DecodePlain is the inverse of EncodePlain. typ is required because the bytes
@@ -61,39 +62,65 @@ func decodePlainTyped(b []byte, typ uint8) (any, error) {
 }
 
 // decodePlainVarlen decodes the length-prefixed plain form used by strings and
-// byte slices.
+// byte slices. It takes the values' total length up front so it can size both
+// the result and its backing buffer in one pass: strings are slices of that
+// buffer rather than a copy each, which is what keeps a high cardinality string
+// column from allocating once per value. Byte slices still get their own copy
+// each, because they are mutable and a caller writing one would otherwise
+// clobber its neighbours.
 func decodePlainVarlen(b []byte, typ uint8) (any, error) {
+	nvals, total, ok := varlenStats(b)
+	if !ok {
+		return nil, fmt.Errorf("keine: plain data truncated at value %d", nvals)
+	}
+
 	if typ == TypeString {
-		out := make([]string, 0, len(b)/8)
-		for len(b) > 0 {
-			if len(b) < 4 {
-				return nil, fmt.Errorf("keine: plain data truncated at value %d", len(out))
-			}
-			n := binary.LittleEndian.Uint32(b[:4])
+		// One buffer holds every value's bytes and each string points into it.
+		// Strings are immutable, so sharing the buffer cannot corrupt a value,
+		// and N distinct strings cost two allocations instead of N+1.
+		text := make([]byte, total)
+		out := make([]string, nvals)
+		var off int
+		for i := 0; i < nvals; i++ {
+			n := int(binary.LittleEndian.Uint32(b[:4]))
 			b = b[4:]
-			if uint64(len(b)) < uint64(n) {
-				return nil, fmt.Errorf("keine: plain data truncated at value %d", len(out))
-			}
-			out = append(out, string(b[:n]))
+			copy(text[off:off+n], b[:n])
+			out[i] = unsafe.String(&text[off], n)
+			off += n
 			b = b[n:]
 		}
 		return out, nil
 	}
 
-	out := make([][]byte, 0, len(b)/8)
+	out := make([][]byte, nvals)
+	for i := 0; i < nvals; i++ {
+		n := int(binary.LittleEndian.Uint32(b[:4]))
+		b = b[4:]
+		out[i] = append([]byte(nil), b[:n]...)
+		b = b[n:]
+	}
+	return out, nil
+}
+
+// varlenStats is the length prefix pass over a plain varlen chunk: the number
+// of values and how many bytes they occupy in total. Both are needed to size
+// the result and its backing buffer before any value is placed. When the chunk
+// is truncated, nvals is the index of the value it happened at.
+func varlenStats(b []byte) (nvals, total int, ok bool) {
 	for len(b) > 0 {
 		if len(b) < 4 {
-			return nil, fmt.Errorf("keine: plain data truncated at value %d", len(out))
+			return nvals, 0, false
 		}
 		n := binary.LittleEndian.Uint32(b[:4])
 		b = b[4:]
 		if uint64(len(b)) < uint64(n) {
-			return nil, fmt.Errorf("keine: plain data truncated at value %d", len(out))
+			return nvals, 0, false
 		}
-		out = append(out, append([]byte(nil), b[:n]...))
+		nvals++
+		total += int(n)
 		b = b[n:]
 	}
-	return out, nil
+	return nvals, total, true
 }
 
 func decodeFixedT[T any](b []byte, width int, convert func([]byte) T) ([]T, error) {
@@ -202,12 +229,21 @@ func decodeDictTyped(b []byte) ([]string, error) {
 		return nil, fmt.Errorf("keine: dict size mismatch: header says %d, found %d", dictSize, len(entries))
 	}
 
+	// Converting an entry to a string copies its bytes, and a dictionary column
+	// repeats each entry many times over. Converting the distinct entries once
+	// and then sharing those headers turns one allocation per value into one per
+	// distinct value.
+	dict := make([]string, len(entries))
+	for i, e := range entries {
+		dict[i] = string(e)
+	}
+
 	out := make([]string, nvals)
 	for i := 0; i < nvals; i++ {
-		if int(indices[i]) >= len(entries) {
+		if int(indices[i]) >= len(dict) {
 			return nil, fmt.Errorf("keine: dict index %d out of range", indices[i])
 		}
-		out[i] = string(entries[indices[i]])
+		out[i] = dict[indices[i]]
 	}
 	return out, nil
 }
@@ -282,11 +318,76 @@ func decodeWith(enc uint8, data []byte, n int, typ uint8) ([]any, error) {
 	return boxColumn(typed, enc, typ)
 }
 
-// boxValues converts a typed slice — []int64, []string and so on — into []any.
-// It is what the []any reading path pays for a uniform return type.
+// boxValues converts a typed slice — []int64, []string and so on — into []any
+// without copying a single value. Each interface header points at its element
+// where it already sits in the source slice, so a 10000-value column costs one
+// allocation instead of one per value: converting a value type to an interface
+// allocates a box for it, and a column of those is a column of boxes.
+//
+// Keeping interior pointers into s is safe because the decoders build a fresh
+// slice for every column and the caller takes ownership of it, so nothing
+// reuses that backing array. A type the format does not use has no values to
+// box, and the decoders only ever hand it one of the thirteen.
 func boxValues(typed any) []any {
-	vals, _ := asValues[any](typed)
-	return vals
+	switch s := typed.(type) {
+	case []bool:
+		return boxSlice(s)
+	case []int8:
+		return boxSlice(s)
+	case []int16:
+		return boxSlice(s)
+	case []int32:
+		return boxSlice(s)
+	case []int64:
+		return boxSlice(s)
+	case []uint8:
+		return boxSlice(s)
+	case []uint16:
+		return boxSlice(s)
+	case []uint32:
+		return boxSlice(s)
+	case []uint64:
+		return boxSlice(s)
+	case []float32:
+		return boxSlice(s)
+	case []float64:
+		return boxSlice(s)
+	case []string:
+		return boxSlice(s)
+	case [][]byte:
+		return boxSlice(s)
+	}
+	return nil
+}
+
+// boxSlice is boxValues for one element type.
+func boxSlice[T any](s []T) []any {
+	out := make([]any, len(s))
+	if len(s) == 0 {
+		return out
+	}
+
+	// Converting the zero value once yields the exact type pointer this element
+	// type needs, which every interface in the column then shares. Converting a
+	// real element would do the same and cost the same one allocation.
+	var zero T
+	sample := any(zero)
+	tag := (*efaceHeader)(unsafe.Pointer(&sample)).typ
+
+	hdrs := unsafe.Slice((*efaceHeader)(unsafe.Pointer(unsafe.SliceData(out))), len(out))
+	for i := range s {
+		hdrs[i].typ = tag
+		hdrs[i].data = unsafe.Pointer(&s[i])
+	}
+	return out
+}
+
+// efaceHeader is the layout of an empty interface, which is what a []any holds.
+// It is runtime.iface's empty counterpart, with a type pointer in place of an
+// itab.
+type efaceHeader struct {
+	typ  unsafe.Pointer
+	data unsafe.Pointer
 }
 
 // asValues converts a typed slice into []T. The second result is false when the

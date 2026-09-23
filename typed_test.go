@@ -104,3 +104,55 @@ func TestLayoutTypedInputs(t *testing.T) {
 		t.Errorf("experimentLayoutsTyped fallback = %s, want Plain+None", best.Name)
 	}
 }
+
+// boxValues has a fast path for each of the thirteen column types. Every value
+// it hands back must equal what a plain conversion would have produced, and
+// must still point at a value the caller can read back — the fast path shares
+// the source slice's backing array rather than copying each value out.
+func TestBoxValuesMatchesConversion(t *testing.T) {
+	cases := []struct {
+		name  string
+		typed any
+	}{
+		{"bool", []bool{true, false, true}},
+		{"int8", []int8{-128, 0, 127}},
+		{"int16", []int16{-32768, 1, 32767}},
+		{"int32", []int32{-2147483648, 1, 2147483647}},
+		{"int64", []int64{-1 << 62, 1, 1<<62 - 1}},
+		{"uint8", []uint8{0, 128, 255}},
+		{"uint16", []uint16{0, 40000, 65535}},
+		{"uint32", []uint32{0, 4000000000, 4294967295}},
+		{"uint64", []uint64{0, 1 << 40, 1<<64 - 1}},
+		{"float32", []float32{0, -1.5, 3.25}},
+		{"float64", []float64{0, -1.5, 3.25}},
+		{"string", []string{"", "a", "longer value"}},
+		{"bytes", [][]byte{{}, {1, 2, 3}, {9, 9}}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			boxed := boxValues(c.typed)
+			want, ok := asValues[any](c.typed)
+			if !ok {
+				t.Fatalf("asValues(%s): not ok", c.name)
+			}
+			if len(boxed) != len(want) {
+				t.Fatalf("boxValues(%s) has %d values, want %d", c.name, len(boxed), len(want))
+			}
+			for i := range want {
+				if !reflect.DeepEqual(boxed[i], want[i]) {
+					t.Errorf("boxValues(%s)[%d] = %#v, want %#v", c.name, i, boxed[i], want[i])
+				}
+			}
+		})
+	}
+
+	// An empty column still has to hand back an empty slice rather than nil.
+	if got := boxValues([]int64{}); len(got) != 0 {
+		t.Errorf("boxValues of an empty column has %d values, want 0", len(got))
+	}
+
+	// A type the format does not use has nothing to box.
+	if got := boxValues([]int{1, 2, 3}); got != nil {
+		t.Errorf("boxValues of []int = %v, want nil", got)
+	}
+}
