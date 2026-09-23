@@ -159,34 +159,39 @@ from the same pseudo-random stream so neither sees easier data:
 
 | | bytes/row | write | read all | read 1 column | read typed |
 | --- | --- | --- | --- | --- | --- |
-| keine | 9.06 | 658ms | 134ms | 29ms | 33ms |
-| parquet zstd | 12.86 | 105ms | 16ms | 9ms | — |
-| parquet snappy | 21.32 | 87ms | 16ms | 8ms | — |
-| parquet none | 43.71 | 80ms | 14ms | 8ms | — |
+| keine | 9.06 | 633ms | 87ms | 8ms | 33ms |
+| parquet zstd | 12.86 | 102ms | 17ms | 9ms | — |
+| parquet snappy | 21.32 | 96ms | 18ms | 8ms | — |
+| parquet none | 43.71 | 81ms | 13ms | 8ms | — |
 
 keine is smaller, parquet is still faster. The write gap has two parts. Roughly
-190ms of it is the layout experiment — the cost of measuring encodings instead
-of guessing — and the remaining ~470ms is encoding and compression, which was
-inflated by doing the work through reflection. Each value used to pass through
-`reflect` and `fmt` on its way to disk; a column is now coerced once to the Go
-type its schema implies, and every encoder consumes that typed slice directly.
-That cut the write from 1002ms to 658ms without changing a single output byte,
-which a golden file pins.
+170ms of it is the layout experiment — the cost of measuring encodings instead
+of guessing — and the remaining ~460ms is encoding and compression, dominated
+by `compress/flate`: on the write profile `flate.deflate` is the single biggest
+item. keine pays it deliberately, because it uses no third-party code and the
+standard library ships no zstd.
 
 Parquet still wins on write because it does not measure anything: its layout
-choices are compiled in. keine pays its 190ms to adapt to a column that breaks
+choices are compiled in. keine pays its 170ms to adapt to a column that breaks
 those assumptions, which is the trade the format is making deliberately.
 
-Read used to be behind partly because decoding into `[]any` boxes every value,
-costing an interface and a heap allocation each. The decoders now produce typed
-slices and box only at the end, which roughly halved the read time. A Reader
-also reuses the scratch buffers a column passes through — the encoded chunk, the
-decompressed bytes — instead of allocating fresh ones per column. That is worth
-most on a column that decompresses far larger than it reads, where the transient
-bytes dwarf the values coming back: a Delta+Flate int64 column reads 2.2x faster
-through the typed path, while a low-cardinality dict column is barely touched,
-since its decoded values already own most of the memory.
+Reading one column is now level with parquet. Reading all five is behind, and
+the profile says why: flate decompression is 43% of that read and GC is another
+25%. The decoding itself is no longer the cost it was — boxing every value into
+an interface used to allocate a copy of each one, and a column now shares one
+backing array instead, so a 10000-value int64 column reads with 10 allocations
+rather than 10010 and takes about half the time. Strings got the same
+treatment: a dictionary column converts each distinct entry once and shares
+those headers across every value that repeats it, and a plain string column's
+values are slices of one buffer rather than a copy each. That took the
+comparison file's read from 134ms to 87ms and its allocations from 403000 to
+3500 while the output bytes stayed identical.
+
+The remaining read gap is decompression, not decoding: keine decompresses five
+columns through Go's flate, and parquet hands back typed Arrow buffers from C++
+without crossing into Go's heap at all.
 
 The typed column reads three integer columns in 33ms where the boxed path takes
-longer for the same work; pyarrow still wins, handing back typed Arrow buffers
-from C++ without crossing into Go's heap at all.
+longer for the same work. `ReadColumn` is the path to use when the schema is
+known and a query touches few columns, since it skips the interface boxing
+`ReadRowGroup` pays for a uniform return type.
