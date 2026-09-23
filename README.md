@@ -159,17 +159,23 @@ from the same pseudo-random stream so neither sees easier data:
 
 | | bytes/row | write | read all | read 1 column | read typed |
 | --- | --- | --- | --- | --- | --- |
-| keine | 9.06 | 1002ms | 134ms | 29ms | 33ms |
+| keine | 9.06 | 658ms | 134ms | 29ms | 33ms |
 | parquet zstd | 12.86 | 105ms | 16ms | 9ms | — |
 | parquet snappy | 21.32 | 87ms | 16ms | 8ms | — |
 | parquet none | 43.71 | 80ms | 14ms | 8ms | — |
 
-keine is smaller, parquet is faster. The gap on write is not the columnar
-encoding or the codec: it is that keine measures layouts at write time. Before
-the experiment was sampled it cost 9.7s of the 10.3s write, and the remaining
-600ms is the actual format work. Parquet gets its choices compiled in, which is
-why it does not pay that cost and cannot adapt to a column that breaks its
-assumptions.
+keine is smaller, parquet is still faster. The write gap has two parts. Roughly
+190ms of it is the layout experiment — the cost of measuring encodings instead
+of guessing — and the remaining ~470ms is encoding and compression, which was
+inflated by doing the work through reflection. Each value used to pass through
+`reflect` and `fmt` on its way to disk; a column is now coerced once to the Go
+type its schema implies, and every encoder consumes that typed slice directly.
+That cut the write from 1002ms to 658ms without changing a single output byte,
+which a golden file pins.
+
+Parquet still wins on write because it does not measure anything: its layout
+choices are compiled in. keine pays its 190ms to adapt to a column that breaks
+those assumptions, which is the trade the format is making deliberately.
 
 Read used to be behind partly because decoding into `[]any` boxes every value,
 costing an interface and a heap allocation each. The decoders now produce typed
