@@ -30,8 +30,9 @@ A column chunk is:
 encoding            1 byte
 compress            1 byte
 null bitmap length  uint32
-null bitmap
+raw data length     uint32
 data length         uint32
+null bitmap
 data
 ```
 
@@ -41,11 +42,15 @@ is encoded with `encoding/gob`. Because the footer comes last and carries its
 own length, a reader can open a file with one seek to the end and then jump
 straight to any column of any row group.
 
+The chunk carries its own decompressed length as well as its stored length, so a
+reader sizes its buffer once instead of growing it into shape. That field is
+redundant with the footer's byte length only when the codec is none.
+
 ## Types and encodings
 
 Thirteen type tags: bool, int8-64, uint8-64, float32, float64, bytes, string.
 
-Five encodings:
+Six encodings:
 
 | Encoding | Layout |
 | --- | --- |
@@ -54,6 +59,20 @@ Five encodings:
 | Delta | First value verbatim, then differences from the previous value, as int64. |
 | Dict | Bit-packed indices into a dictionary of distinct values. |
 | OffsetBytes | An offset table over concatenated raw bytes. For strings and byte slices. |
+| Affix | The prefix and suffix every value shares, then length-prefixed middles. For strings and byte slices. |
+
+Affix is what a high cardinality string column lands on when its values come
+from one domain — email addresses, file paths, URLs. The shared part is stored
+once rather than per value, and what is left is that much shorter for the codec
+that follows. The prefix and suffix are allowed to meet in the column's shortest
+value but not to overlap in it, so a value is always its prefix, middle and
+suffix back to back.
+
+Dictionary entries are the encoded form of a value — the little-endian bytes for
+a fixed width type, the raw bytes for a string or byte slice — rather than its
+text, so a float column can be a dictionary without a formatting round trip and
+a dict column decodes as one plain read of the declared type. `DecodeDict`
+returns `[][]byte`, and the typed read path narrows from there.
 
 Nulls are handled before any of these apply. A nullable column's chunk carries a
 bitmap with one bit per row; only the non-null values are encoded, and the
@@ -74,6 +93,7 @@ combination. On 5000 rows of synthetic data:
 | boolean with runs | 5000 | RLEBitpack+Flate | 21 |
 | arithmetic int64 | 40000 | Delta+Flate | 82 |
 | 200 distinct strings | 137250 | Dict+Flate | 1397 |
+| 200 shared-domain strings | 4490 | Affix+Flate | 384 |
 
 Gzip and zlib wrap the same DEFLATE algorithm as flate but add framing, so they
 lose the size contest to flate on every chunk. They remain implemented and tagged
@@ -94,6 +114,13 @@ experiment measures a bounded, evenly spaced sample rather than every value, and
 its cost stops scaling with the file. On a 200000-row, 5-column dataset the full
 experiment took 9.7s and the sampled one 0.21s, and every column chose the same
 encoding and codec, producing a byte-identical file.
+
+The sample is not infallible. A column of 200000 floats with 10000 distinct
+values looks like 8192 distinct values to an 8192-row sample, so dictionary
+encoding looks useless and plain wins on the sample. Measured on the whole
+column, dictionary would have taken the column from 446KB to 80KB. A full
+cardinality pass over every column costs more than the ~0.15 bytes/row it would
+save, so the sample stands and the floor is known rather than chased.
 
 ## Usage
 
@@ -159,13 +186,14 @@ from the same pseudo-random stream so neither sees easier data:
 
 | | bytes/row | write | read all | read 1 column | read typed |
 | --- | --- | --- | --- | --- | --- |
-| keine | 9.86 | 130ms | 40ms | 10ms | 32ms |
-| parquet zstd | 12.86 | 102ms | 17ms | 9ms | — |
-| parquet snappy | 21.32 | 96ms | 18ms | 8ms | — |
-| parquet none | 43.71 | 81ms | 13ms | 8ms | — |
+| keine | 9.07 | 132ms | 32ms | 10ms | 32ms |
+| parquet zstd | 12.86 | 104ms | 16ms | 9ms | — |
+| parquet snappy | 21.32 | 94ms | 16ms | 8ms | — |
+| parquet none | 43.71 | 80ms | 14ms | 8ms | — |
 
-keine is smaller than parquet at every compression level and within a quarter of
-its write speed, and reading one column is level with it.
+keine is smaller than parquet at every compression level and within about a
+quarter of its write speed, and reading one column is level with it. Reading all
+five is where it still loses.
 
 Encoding and compressing a column touches no other, so the writer runs them
 across columns at once and writes each result in order, which keeps the bytes
@@ -181,11 +209,12 @@ float64 column compresses 2.81x at level 6 in 200ms and 2.69x at level 3 in 35ms
 and the near-distinct string column compresses 5.62x in 82ms and 5.44x in 43ms.
 The last three levels buy four hundredths of a ratio for six times the time.
 Writing at level 3 costs about nine percent of the file size and halves the write,
-which is why the table above is 9.86 bytes/row rather than 9.06.
+which is why the table above is 9.07 bytes/row rather than 9.06.
 
 Parquet pays nothing to choose a layout: its encodings are compiled in. keine
-measures them per column, which costs about 40ms of this write and is why it can
-be smaller than a format with a better compressor.
+measures them per column, on a sample, and that measurement is inside the write
+time above — about 38ms of the 132ms. It is what buys the size advantage over a
+format with a better compressor.
 
 Reading all five columns is still behind, and the profile says why: flate
 decompression is 43% of that read and GC is another 25%. The decoding itself is
@@ -195,8 +224,14 @@ a copy of each one, and a column now shares one backing array instead, so a
 about half the time. Strings got the same treatment: a dictionary column converts
 each distinct entry once and shares those headers across every value that repeats
 it, and a plain string column's values are slices of one buffer rather than a copy
-each. That took the comparison file's read from 134ms to 40ms and its allocations
+each. That took the comparison file's read from 134ms to 32ms and its allocations
 from 403000 to 3500.
+
+What is left is DEFLATE itself, and it costs unevenly. The same 1.6MB decompresses
+in 0.43ms for a column of near-monotonic deltas and in 10ms for a column of
+low-entropy floats — a 25x spread from entropy alone, independent of buffer
+management. Since the two slow columns are the whole remaining gap, no amount of
+buffer pooling closes it; a faster codec would.
 
 The typed column reads three integer columns in 32ms where the boxed path takes
 longer for the same work. `ReadColumn` is the path to use when the schema is
