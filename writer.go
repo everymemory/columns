@@ -159,9 +159,10 @@ func encodeColumns(typed []any, schema []ColumnSchema) []ColumnChunk {
 			// best.Compress is one of the codecs Compress implements.
 			compressed, _ := Compress(encoded, best.Compress)
 			chunks[i] = ColumnChunk{
-				Encoding: best.Encoding,
-				Compress: best.Compress,
-				Data:     compressed,
+				Encoding:  best.Encoding,
+				Compress:  best.Compress,
+				RawLength: uint32(len(encoded)),
+				Data:      compressed,
 			}
 		}(i)
 	}

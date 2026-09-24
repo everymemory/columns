@@ -201,9 +201,95 @@ func EncodeOffsetBytes(vals [][]byte) []byte {
 	return buf
 }
 
-// EncodeDict builds a dictionary keyed on the fmt.Sprintf form of each value,
-// then stores the uint32 index of every value bitpacked at ceil(log2(dictSize))
-// bits, followed by the dictionary entries in OFFSET_BYTES layout.
+// EncodeAffix writes the bytes every value in the column has at its start and at
+// its end, then each value with those bytes gone: a length-prefixed stream of
+// what is left between them. Identifiers sharing a domain, a path or a key are
+// the usual case — the shared part is stored once rather than per value, and
+// the middles are that much shorter for whatever codec follows, which is what
+// makes a high cardinality string column cheap to read as well as to store.
+func EncodeAffix(vals any) ([]byte, error) {
+	switch s := vals.(type) {
+	case []string:
+		pre, suf := columnAffix(s)
+		return writeAffix(s, pre, suf), nil
+	case [][]byte:
+		pre, suf := columnAffix(s)
+		return writeAffix(s, pre, suf), nil
+	default:
+		return nil, fmt.Errorf("keine: affix encodes string and bytes columns, got %T", vals)
+	}
+}
+
+// columnAffix is the longest prefix and suffix shared by every value. The two
+// are allowed to meet in the column's shortest value but not to overlap in it,
+// so a value is always its prefix, its middle and its suffix back to back.
+func columnAffix[T ~string | ~[]byte](s []T) (pre, suf T) {
+	if len(s) == 0 {
+		return
+	}
+	pre, suf = s[0], s[0]
+	min := len(s[0])
+	for _, v := range s[1:] {
+		pre = pre[:sharedPrefix(pre, v)]
+		suf = suf[len(suf)-sharedSuffix(suf, v):]
+		if len(v) < min {
+			min = len(v)
+		}
+	}
+	if len(pre)+len(suf) > min {
+		suf = suf[len(suf)-(min-len(pre)):]
+	}
+	return pre, suf
+}
+
+// writeAffix lays out the prefix, the suffix, then one length-prefixed middle
+// per value.
+func writeAffix[T ~string | ~[]byte](s []T, pre, suf T) []byte {
+	buf := make([]byte, 0, 8+len(pre)+len(suf)+len(s)*(4+(len(pre)+len(suf))/2))
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(pre)))
+	buf = append(buf, pre...)
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(suf)))
+	buf = append(buf, suf...)
+	var n [4]byte
+	for _, v := range s {
+		mid := v[len(pre) : len(v)-len(suf)]
+		binary.LittleEndian.PutUint32(n[:], uint32(len(mid)))
+		buf = append(buf, n[:]...)
+		buf = append(buf, mid...)
+	}
+	return buf
+}
+
+func sharedPrefix[T ~string | ~[]byte](a, b T) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	return n
+}
+
+func sharedSuffix[T ~string | ~[]byte](a, b T) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 1; i <= n; i++ {
+		if a[len(a)-i] != b[len(b)-i] {
+			return i - 1
+		}
+	}
+	return n
+}
+
+// EncodeDict builds a dictionary of the distinct values in vals, keyed on each
+// value's encoded form, then stores the uint32 index of every value bitpacked at
+// ceil(log2(dictSize)) bits, followed by the dictionary entries in OFFSET_BYTES
+// layout.
 func EncodeDict(vals any) ([]byte, error) {
 	keys, n, err := dictKeys(vals)
 	if err != nil {
@@ -242,9 +328,10 @@ func EncodeDict(vals any) ([]byte, error) {
 }
 
 // dictKeys returns the dictionary key of every element of vals. Strings key on
-// themselves and byte slices on their fmt form, which is what the reader parses
-// back; anything else falls back to the fmt form of the value, so a column of
-// any type can still be dictionary encoded through []any.
+// themselves and byte slices on their bytes; the fixed width types key on their
+// little-endian form, which is what the reader decodes back. Encoding a whole
+// column once into a flat buffer and slicing the keys out of it keeps them at
+// one allocation for the buffer rather than a formatted string per value.
 func dictKeys(vals any) ([]string, int, error) {
 	if s, ok := vals.([]string); ok {
 		return s, len(s), nil
@@ -252,19 +339,79 @@ func dictKeys(vals any) ([]string, int, error) {
 	if s, ok := vals.([][]byte); ok {
 		keys := make([]string, len(s))
 		for i, v := range s {
-			keys[i] = fmt.Sprintf("%v", v)
+			keys[i] = string(v)
 		}
 		return keys, len(s), nil
 	}
+	switch s := vals.(type) {
+	case []bool:
+		return dictFlat(s, 1, func(v bool, b []byte) {
+			if v {
+				b[0] = 1
+			}
+		})
+	case []int8:
+		return dictFlat(s, 1, func(v int8, b []byte) { b[0] = byte(v) })
+	case []int16:
+		return dictFlat(s, 2, func(v int16, b []byte) { binary.LittleEndian.PutUint16(b, uint16(v)) })
+	case []int32:
+		return dictFlat(s, 4, func(v int32, b []byte) { binary.LittleEndian.PutUint32(b, uint32(v)) })
+	case []int64:
+		return dictFlat(s, 8, func(v int64, b []byte) { binary.LittleEndian.PutUint64(b, uint64(v)) })
+	case []uint8:
+		return dictFlat(s, 1, func(v uint8, b []byte) { b[0] = v })
+	case []uint16:
+		return dictFlat(s, 2, func(v uint16, b []byte) { binary.LittleEndian.PutUint16(b, v) })
+	case []uint32:
+		return dictFlat(s, 4, func(v uint32, b []byte) { binary.LittleEndian.PutUint32(b, v) })
+	case []uint64:
+		return dictFlat(s, 8, func(v uint64, b []byte) { binary.LittleEndian.PutUint64(b, v) })
+	case []float32:
+		return dictFlat(s, 4, func(v float32, b []byte) { binary.LittleEndian.PutUint32(b, math.Float32bits(v)) })
+	case []float64:
+		return dictFlat(s, 8, func(v float64, b []byte) { binary.LittleEndian.PutUint64(b, math.Float64bits(v)) })
+	}
+
+	// A slice of interfaces has no one encoded form, so its elements key on
+	// themselves: strings and byte slices as their bytes, anything else as the
+	// text the reader parses back.
 	rv := reflect.ValueOf(vals)
 	if rv.Kind() != reflect.Slice {
 		return nil, 0, fmt.Errorf("keine: dict encode expects a slice, got %T", vals)
 	}
 	keys := make([]string, rv.Len())
 	for i := 0; i < rv.Len(); i++ {
-		keys[i] = fmt.Sprintf("%v", rv.Index(i).Interface())
+		v := rv.Index(i)
+		if v.Kind() == reflect.Interface {
+			v = v.Elem()
+		}
+		switch v.Kind() {
+		case reflect.String:
+			keys[i] = v.String()
+		case reflect.Slice:
+			if v.Type().Elem().Kind() != reflect.Uint8 {
+				return nil, 0, fmt.Errorf("keine: dict cannot encode %v", v.Type())
+			}
+			keys[i] = string(v.Bytes())
+		default:
+			return nil, 0, fmt.Errorf("keine: dict cannot encode %v", v.Type())
+		}
 	}
 	return keys, rv.Len(), nil
+}
+
+// dictFlat lays s out in its plain form and returns one key per value, each a
+// slice of that buffer.
+func dictFlat[T any](s []T, width int, put func(v T, b []byte)) ([]string, int, error) {
+	flat := make([]byte, width*len(s))
+	for i, v := range s {
+		put(v, flat[i*width:(i+1)*width])
+	}
+	keys := make([]string, len(s))
+	for i := range keys {
+		keys[i] = string(flat[i*width : (i+1)*width])
+	}
+	return keys, len(s), nil
 }
 
 // bitpackIndices packs indices using nbits per value, most significant bit
@@ -306,6 +453,8 @@ func encodeWith(enc uint8, typed any, typ uint8) ([]byte, error) {
 		return EncodeDelta(ints), nil
 	case EncDict:
 		return EncodeDict(typed)
+	case EncAffix:
+		return EncodeAffix(typed)
 	case EncOffsetBytes:
 		raw, ok := typed.([][]byte)
 		if !ok {

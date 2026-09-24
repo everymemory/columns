@@ -1,7 +1,6 @@
 package keine
 
 import (
-	"bufio"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -14,20 +13,23 @@ type Reader struct {
 	r      io.ReadSeeker
 	footer Footer
 
-	// Reusable buffers for the column currently being read. Nothing a caller
-	// gets back points into them once decoding finishes, so they are kept for
-	// the next column instead of being collected. A Reader holds the position
-	// of its ReadSeeker and is not safe to use from multiple goroutines, so
-	// these need no synchronisation.
-	bitmap []byte
-	data   []byte
-	raw    []byte
+	// rgbuf holds the chunks of the row group being read, one region per column.
+	// raw is the decompressed bytes of the column being decoded on the typed
+	// path. Nothing a caller gets back points into either once decoding finishes,
+	// so both are kept for the next read instead of being collected. A Reader
+	// holds the position of its ReadSeeker and is not safe to use from multiple
+	// goroutines, so they need no synchronisation.
+	rgbuf    []byte
+	raw      []byte
+	chunkbuf []byte
+	buffers  sync.Pool
 }
 
 // NewReader reads the footer of a file written by Writer. The file must end
 // with the footer, its length as a little-endian uint32, and the magic.
 func NewReader(r io.ReadSeeker) (*Reader, error) {
 	rd := &Reader{r: r}
+	rd.buffers.New = func() any { return []byte(nil) }
 
 	end, err := r.Seek(0, io.SeekEnd)
 	if err != nil {
@@ -108,24 +110,33 @@ func (rd *Reader) ReadRowGroup(index int, colIndexes []int) ([][]any, error) {
 		}
 	}
 
-	// Reading a chunk uses the shared ReadSeeker, so the byte reads stay serial.
-	// The decompression and decoding afterwards are independent per column and
-	// are where the time goes, so those run across columns at once. Every result
-	// lands in its own slot, so no goroutine touches another's output.
+	// One buffer holds every requested chunk, each in its own region, so a chunk
+	// handed to a decode goroutine needs no copy: nothing a later column reads
+	// overlaps it. The buffer stays with the Reader for the next row group.
+	total := int64(0)
+	for _, ci := range colIndexes {
+		total += rg.Columns[ci].ByteLength
+	}
+	if int64(cap(rd.rgbuf)) < total {
+		rd.rgbuf = make([]byte, total)
+	} else {
+		rd.rgbuf = rd.rgbuf[:total]
+	}
+
 	jobs := make([]readJob, len(colIndexes))
+	off := 0
 	for k, ci := range colIndexes {
-		start := startOf(rg, ci)
-		chunk, err := rd.readChunk(start, rg, ci)
+		region := rd.rgbuf[off : off+int(rg.Columns[ci].ByteLength)]
+		chunk, err := rd.readChunk(startOf(rg, ci), region)
 		if err != nil {
 			return nil, err
 		}
-		// The chunk's slices point into this Reader's scratch buffers, which the
-		// next column's read reuses, so detach them before they can be clobbered.
-		jobs[k] = readJob{chunk: chunk.detach(), rg: rg, ci: ci}
+		jobs[k] = readJob{chunk: chunk, rg: rg, ci: ci}
+		off += int(rg.Columns[ci].ByteLength)
 	}
 
 	results := make([]readResult, len(jobs))
-	decodeColumns(rd.footer.Schema, jobs, results)
+	rd.decodeColumns(jobs, results)
 	for k, res := range results {
 		if res.err != nil {
 			return nil, res.err
@@ -152,9 +163,13 @@ type readResult struct {
 
 // decodeColumns decompresses and decodes each job outside the results slice,
 // which lets the caller keep reading chunks while the previous ones are still
-// being worked on. The buffers a column passes through are per goroutine, since
-// the Reader's own scratch space serves one column at a time.
-func decodeColumns(schema []ColumnSchema, jobs []readJob, results []readResult) {
+// being worked on. The decompressed bytes are the largest thing a read
+// allocates, so every goroutine returns its buffer to the pool it took it from.
+// The pool lives on the Reader, so it keeps one buffer per column across row
+// groups and grows to the widest one; after the first row group the decompress
+// allocates nothing.
+func (rd *Reader) decodeColumns(jobs []readJob, results []readResult) {
+	schema := rd.footer.Schema
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, runtime.NumCPU())
 	for i := range jobs {
@@ -168,7 +183,8 @@ func decodeColumns(schema []ColumnSchema, jobs []readJob, results []readResult) 
 			sch := schema[j.ci]
 			meta := j.rg.Columns[j.ci]
 
-			raw, err := decompressInto(nil, j.chunk.Data, j.chunk.Compress)
+			buf := sizedBuffer(j.chunk.RawLength, rd.buffers.Get().([]byte))
+			raw, err := decompressInto(buf[:0], j.chunk.Data, j.chunk.Compress)
 			if err != nil {
 				results[i].err = fmt.Errorf("keine: decompressing column %d (%s): %w", j.ci, sch.Name, err)
 				return
@@ -193,6 +209,10 @@ func decodeColumns(schema []ColumnSchema, jobs []readJob, results []readResult) 
 			if len(j.chunk.NullBitmap) > 0 {
 				vals = expandNulls(vals, DecodeBitmap(j.chunk.NullBitmap, int(j.rg.NumRows)), int(j.rg.NumRows))
 			}
+			// Nothing the caller gets back points into raw: strings and byte
+			// slices are copied out of it as they are decoded. Put it back
+			// afterwards rather than before, since decoding reads it.
+			rd.buffers.Put(raw)
 			results[i].vals = vals
 		}(i)
 	}
@@ -252,6 +272,16 @@ func ReadColumn[T any](rd *Reader, index, col int) ([]T, error) {
 	return out, nil
 }
 
+// sizedBuffer returns an empty buffer of at least want bytes, reusing have when
+// it is already that wide. A chunk carries its decompressed length, so the
+// buffer a decode uses is allocated once instead of grown a piece at a time.
+func sizedBuffer(want uint32, have []byte) []byte {
+	if int(want) <= cap(have) {
+		return have[:0]
+	}
+	return make([]byte, 0, want)
+}
+
 // startOf is the byte offset of column col within its row group.
 func startOf(rg RowGroupMeta, col int) int64 {
 	offset := rg.ByteOffset
@@ -263,14 +293,21 @@ func startOf(rg RowGroupMeta, col int) int64 {
 
 // readColumn seeks to one column chunk, reads and decompresses it, and decodes
 // it into a slice of its declared Go type. nulls is the column's null bitmap,
-// nil when the column was written dense.
+// nil when the column was written dense. This is the single column path, so its
+// chunk buffer is the Reader's own and the decode that follows is serial.
 func (rd *Reader) readColumn(start int64, rg RowGroupMeta, ci int) (typed any, nulls []bool, err error) {
-	chunk, err := rd.readChunk(start, rg, ci)
+	size := rg.Columns[ci].ByteLength
+	if int64(cap(rd.chunkbuf)) < size {
+		rd.chunkbuf = make([]byte, size)
+	} else {
+		rd.chunkbuf = rd.chunkbuf[:size]
+	}
+	chunk, err := rd.readChunk(start, rd.chunkbuf)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("keine: reading column %d (%s): %w", ci, rd.footer.Schema[ci].Name, err)
 	}
 
-	raw, err := decompressInto(rd.raw[:0], chunk.Data, chunk.Compress)
+	raw, err := decompressInto(sizedBuffer(chunk.RawLength, rd.raw), chunk.Data, chunk.Compress)
 	if err != nil {
 		return nil, nil, fmt.Errorf("keine: decompressing column %d (%s): %w", ci, rd.footer.Schema[ci].Name, err)
 	}
@@ -292,17 +329,20 @@ func (rd *Reader) readColumn(start int64, rg RowGroupMeta, ci int) (typed any, n
 	return typed, nulls, nil
 }
 
-// readChunk seeks to one column chunk and reads its bytes into the Reader's
-// scratch buffers. It is the part of reading a column that has to be serial,
-// since one ReadSeeker serves them all.
-func (rd *Reader) readChunk(start int64, rg RowGroupMeta, ci int) (ColumnChunk, error) {
-	schema := rd.footer.Schema[ci]
+// readChunk seeks to one column chunk, reads its recorded byte length into
+// region, and parses it. Reading the bytes and parsing them are split like this
+// because every column reads into its own region of one buffer, which is what
+// keeps a chunk alive while another goroutine decodes it.
+func (rd *Reader) readChunk(start int64, region []byte) (ColumnChunk, error) {
 	if _, err := rd.r.Seek(start, io.SeekStart); err != nil {
-		return ColumnChunk{}, fmt.Errorf("keine: cannot seek to column %d: %w", ci, err)
+		return ColumnChunk{}, fmt.Errorf("keine: cannot seek to column: %w", err)
+	}
+	if _, err := io.ReadFull(rd.r, region); err != nil {
+		return ColumnChunk{}, fmt.Errorf("keine: cannot read column bytes: %w", err)
 	}
 	var chunk ColumnChunk
-	if err := readChunkInto(bufio.NewReader(rd.r), &chunk, &rd.bitmap, &rd.data); err != nil {
-		return ColumnChunk{}, fmt.Errorf("keine: reading column %d (%s): %w", ci, schema.Name, err)
+	if err := parseChunk(region, &chunk); err != nil {
+		return ColumnChunk{}, fmt.Errorf("keine: %w", err)
 	}
 	return chunk, nil
 }

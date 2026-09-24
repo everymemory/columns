@@ -633,6 +633,7 @@ var typeEncodingMatch = map[uint8]uint8{
 	EncDelta:       TypeInt64,
 	EncDict:        TypeString,
 	EncOffsetBytes: TypeBytes,
+	EncAffix:       TypeString,
 }
 
 func TestBitmap(t *testing.T) {

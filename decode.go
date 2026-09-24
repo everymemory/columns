@@ -85,7 +85,7 @@ func decodePlainVarlen(b []byte, typ uint8) (any, error) {
 			n := int(binary.LittleEndian.Uint32(b[:4]))
 			b = b[4:]
 			copy(text[off:off+n], b[:n])
-			out[i] = unsafe.String(&text[off], n)
+			out[i] = stringAt(text, off, n)
 			off += n
 			b = b[n:]
 		}
@@ -106,6 +106,16 @@ func decodePlainVarlen(b []byte, typ uint8) (any, error) {
 // of values and how many bytes they occupy in total. Both are needed to size
 // the result and its backing buffer before any value is placed. When the chunk
 // is truncated, nvals is the index of the value it happened at.
+// stringAt is the string at b[off:off+n] without copying it. A zero length
+// string is empty and taking the address of an empty slice's first element
+// panics, so that case does not go near it.
+func stringAt(b []byte, off, n int) string {
+	if n == 0 {
+		return ""
+	}
+	return unsafe.String(&b[off], n)
+}
+
 func varlenStats(b []byte) (nvals, total int, ok bool) {
 	for len(b) > 0 {
 		if len(b) < 4 {
@@ -196,19 +206,87 @@ func DecodeOffsetBytes(b []byte) ([][]byte, error) {
 	return out, nil
 }
 
-// DecodeDict is the inverse of EncodeDict. Values come back as the string form
-// the dictionary was keyed on; canonicalColumn converts them to the column's
-// declared type.
-func DecodeDict(b []byte) ([]any, error) {
-	entries, err := decodeDictTyped(b)
+// DecodeAffix is the inverse of EncodeAffix. Each value is its prefix, its
+// middle and its suffix, and the middles are a length-prefixed stream, so the
+// result and the buffer behind it are sized before the first value is read. As
+// in the plain path, strings are slices of that buffer and byte slices each get
+// their own copy, because a caller writing one would otherwise clobber its
+// neighbours.
+func DecodeAffix(b []byte, typ uint8) (any, error) {
+	if len(b) < 8 {
+		return nil, fmt.Errorf("keine: affix data is %d bytes, too small for a header", len(b))
+	}
+	preLen := binary.LittleEndian.Uint32(b[:4])
+	b = b[4:]
+	if uint64(len(b)) < uint64(preLen)+4 {
+		return nil, fmt.Errorf("keine: affix header wants %d bytes of prefix, data is %d", preLen, len(b))
+	}
+	pre := b[:preLen]
+	b = b[preLen:]
+	sufLen := binary.LittleEndian.Uint32(b[:4])
+	b = b[4:]
+	if uint64(len(b)) < uint64(sufLen) {
+		return nil, fmt.Errorf("keine: affix header wants %d bytes of suffix, data is %d", sufLen, len(b))
+	}
+	suf := b[:sufLen]
+	b = b[sufLen:]
+
+	nvals, total, ok := varlenStats(b)
+	if !ok {
+		return nil, fmt.Errorf("keine: affix middles truncated at value %d", nvals)
+	}
+
+	if typ == TypeString {
+		size := nvals*(len(pre)+len(suf)) + total
+		text := make([]byte, size)
+		out := make([]string, nvals)
+		off := 0
+		for i := 0; i < nvals; i++ {
+			n := int(binary.LittleEndian.Uint32(b[:4]))
+			b = b[4:]
+			region := text[off : off+len(pre)+n+len(suf)]
+			copy(region, pre)
+			copy(region[len(pre):], b[:n])
+			copy(region[len(pre)+n:], suf)
+			out[i] = stringAt(region, 0, len(region))
+			off += len(region)
+			b = b[n:]
+		}
+		return out, nil
+	}
+
+	out := make([][]byte, nvals)
+	for i := 0; i < nvals; i++ {
+		n := int(binary.LittleEndian.Uint32(b[:4]))
+		b = b[4:]
+		v := make([]byte, 0, len(pre)+n+len(suf))
+		v = append(v, pre...)
+		v = append(v, b[:n]...)
+		v = append(v, suf...)
+		out[i] = v
+		b = b[n:]
+	}
+	return out, nil
+}
+
+// DecodeDict is the inverse of EncodeDict. A dictionary carries its entries but
+// not the type of the values they encode, so the values come back as the bytes
+// they were keyed on; a reader that knows the column's type decodes them through
+// the typed path instead.
+func DecodeDict(b []byte) ([][]byte, error) {
+	vals, err := decodeDictTyped(b, TypeBytes)
 	if err != nil {
 		return nil, err
 	}
-	return boxValues(entries), nil
+	return vals.([][]byte), nil
 }
 
-// decodeDictTyped decodes a dictionary chunk into its strings.
-func decodeDictTyped(b []byte) ([]string, error) {
+// decodeDictTyped decodes a dictionary chunk into the values of typ. Entries are
+// the encoded form of a value — little-endian for the fixed width types, raw
+// bytes for strings and byte slices — so a fixed width type's entries are laid
+// out in value order and decoded as one plain column, and the strings a string
+// column converts are the distinct entries rather than one per value.
+func decodeDictTyped(b []byte, typ uint8) (any, error) {
 	if len(b) < 12 {
 		return nil, fmt.Errorf("keine: dict data truncated")
 	}
@@ -229,23 +307,68 @@ func decodeDictTyped(b []byte) ([]string, error) {
 		return nil, fmt.Errorf("keine: dict size mismatch: header says %d, found %d", dictSize, len(entries))
 	}
 
-	// Converting an entry to a string copies its bytes, and a dictionary column
-	// repeats each entry many times over. Converting the distinct entries once
-	// and then sharing those headers turns one allocation per value into one per
-	// distinct value.
-	dict := make([]string, len(entries))
-	for i, e := range entries {
-		dict[i] = string(e)
-	}
-
-	out := make([]string, nvals)
-	for i := 0; i < nvals; i++ {
-		if int(indices[i]) >= len(dict) {
-			return nil, fmt.Errorf("keine: dict index %d out of range", indices[i])
+	if fixedWidth(typ) == 0 {
+		// Strings and byte slices key on their own bytes, so the entries are the
+		// values already. A string column converts each distinct entry once and
+		// shares the headers across every value that repeats it.
+		if typ == TypeString {
+			dict := make([]string, len(entries))
+			for i, e := range entries {
+				dict[i] = string(e)
+			}
+			return indexDict(dict, indices)
 		}
-		out[i] = dict[indices[i]]
+		return indexDict(entries, indices)
+	}
+	return fixedDictEntries(entries, indices, typ)
+}
+
+// indexDict maps each index to its entry.
+func indexDict[T any](dict []T, indices []uint32) ([]T, error) {
+	out := make([]T, len(indices))
+	for i, idx := range indices {
+		if int(idx) >= len(dict) {
+			return nil, fmt.Errorf("keine: dict index %d out of range", idx)
+		}
+		out[i] = dict[idx]
 	}
 	return out, nil
+}
+
+// fixedDictEntries decodes a fixed width type's entries in value order, so the
+// chunk decodes as one plain column of the declared type. An entry that is not
+// exactly that wide is a file disagreeing with its own schema, and reading it
+// stops rather than letting a short entry shift every value after it.
+func fixedDictEntries(entries [][]byte, indices []uint32, typ uint8) (any, error) {
+	width := fixedWidth(typ)
+	flat := make([]byte, 0, len(indices)*width)
+	for _, idx := range indices {
+		if int(idx) >= len(entries) {
+			return nil, fmt.Errorf("keine: dict index %d out of range", idx)
+		}
+		e := entries[idx]
+		if len(e) != width {
+			return nil, fmt.Errorf("keine: dict entry is %d bytes, a value of type %d is %d", len(e), typ, width)
+		}
+		flat = append(flat, e...)
+	}
+	return decodePlainTyped(flat, typ)
+}
+
+// fixedWidth is the encoded width of a fixed width type, and zero for the types
+// whose values carry their own length.
+func fixedWidth(typ uint8) int {
+	switch typ {
+	case TypeBool, TypeInt8, TypeUint8:
+		return 1
+	case TypeInt16, TypeUint16:
+		return 2
+	case TypeInt32, TypeUint32, TypeFloat32:
+		return 4
+	case TypeInt64, TypeUint64, TypeFloat64:
+		return 8
+	}
+	return 0
 }
 
 // bitunpack is the inverse of bitpackIndices.
@@ -280,7 +403,9 @@ func decodeTyped(enc uint8, data []byte, n int, typ uint8) (any, error) {
 	case EncDelta:
 		return DecodeDelta(data)
 	case EncDict:
-		return decodeDictTyped(data)
+		return decodeDictTyped(data, typ)
+	case EncAffix:
+		return DecodeAffix(data, typ)
 	case EncOffsetBytes:
 		return DecodeOffsetBytes(data)
 	default:
@@ -300,7 +425,9 @@ func encProducesType(enc, typ uint8) bool {
 	case EncDelta:
 		return typ == TypeInt64
 	case EncDict:
-		return typ == TypeString
+		return true
+	case EncAffix:
+		return typ == TypeString || typ == TypeBytes
 	case EncOffsetBytes:
 		return typ == TypeBytes
 	default:

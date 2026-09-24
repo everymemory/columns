@@ -59,7 +59,7 @@ func TestWriteChunkErrors(t *testing.T) {
 		NullBitmap: []byte{1},
 		Data:       []byte{1, 2, 3, 4},
 	}
-	for n := 0; n < 6; n++ {
+	for n := 0; n < 7; n++ {
 		if err := WriteChunk(&failAfter{n: n}, chunk); err == nil {
 			t.Errorf("WriteChunk with a writer failing after %d writes: want error, got nil", n)
 		}
@@ -69,8 +69,9 @@ func TestWriteChunkErrors(t *testing.T) {
 func TestReadChunkTruncated(t *testing.T) {
 	full := []byte{byte(EncPlain), byte(CompressNone)}
 	full = binary.LittleEndian.AppendUint32(full, 2)
-	full = append(full, 0x01, 0x02)
 	full = binary.LittleEndian.AppendUint32(full, 4)
+	full = binary.LittleEndian.AppendUint32(full, 4)
+	full = append(full, 0x01, 0x02)
 	full = append(full, 0xAA, 0xBB, 0xCC, 0xDD)
 
 	for cut := 0; cut < len(full); cut++ {
@@ -340,11 +341,118 @@ func TestDictSingleEntry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodeDict: %v", err)
 	}
-	if !reflect.DeepEqual(got, []any{"x", "x", "x"}) {
+	if !reflect.DeepEqual(got, [][]byte{{'x'}, {'x'}, {'x'}}) {
 		t.Errorf("DecodeDict = %v", got)
 	}
 	if _, err := EncodeDict("not a slice"); err == nil {
 		t.Error("EncodeDict of a non-slice: want error, got nil")
+	}
+	if _, err := EncodeDict([]any{1, "x"}); err == nil {
+		t.Error("EncodeDict of mixed kinds: want error, got nil")
+	}
+	if _, err := EncodeDict([]any{[]int32{1}}); err == nil {
+		t.Error("EncodeDict of a slice of slices: want error, got nil")
+	}
+	if _, err := EncodeDict([]any{[]byte("x"), []byte("y")}); err != nil {
+		t.Errorf("EncodeDict of any holding byte slices: %v", err)
+	}
+}
+
+// TestDictTypedRoundTrip covers the dictionary over every fixed width type,
+// where the entries are the values' little-endian form rather than their text,
+// and over the two variable length types, where they are the values' bytes.
+func TestDictTypedRoundTrip(t *testing.T) {
+	cases := []struct {
+		name string
+		typ  uint8
+		vals any
+	}{
+		{"bool", TypeBool, []bool{true, false, true, false, true}},
+		{"int8", TypeInt8, []int8{1, 2, 3, 1, 2, 3}},
+		{"int16", TypeInt16, []int16{1, 2, 3, 1, 2, 3}},
+		{"int32", TypeInt32, []int32{1, 2, 3, 1, 2, 3}},
+		{"int64", TypeInt64, []int64{1, 2, 3, 1, 2, 3}},
+		{"uint8", TypeUint8, []uint8{1, 2, 3, 1, 2, 3}},
+		{"uint16", TypeUint16, []uint16{1, 2, 3, 1, 2, 3}},
+		{"uint32", TypeUint32, []uint32{1, 2, 3, 1, 2, 3}},
+		{"uint64", TypeUint64, []uint64{1, 2, 3, 1, 2, 3}},
+		{"float32", TypeFloat32, []float32{1.5, 2.5, 1.5, 2.5}},
+		{"float64", TypeFloat64, []float64{1.5, 2.5, 1.5, 2.5}},
+		{"string", TypeString, []string{"a", "b", "a", "b"}},
+		{"bytes", TypeBytes, [][]byte{{1}, {2}, {1}, {2}}},
+	}
+	for _, c := range cases {
+		encoded, err := EncodeDict(c.vals)
+		if err != nil {
+			t.Fatalf("%s: EncodeDict: %v", c.name, err)
+		}
+		got, err := decodeDictTyped(encoded, c.typ)
+		if err != nil {
+			t.Fatalf("%s: decodeDictTyped: %v", c.name, err)
+		}
+		if !reflect.DeepEqual(got, c.vals) {
+			t.Errorf("%s: round trip = %v, want %v", c.name, got, c.vals)
+		}
+	}
+
+	// The same chunk read as part of a file comes back through the reader's
+	// narrowing path, and ReadColumn reads it into the declared type rather than
+	// failing on it.
+	int32vals := []int32{10, 20, 10, 20}
+	data, err := EncodeDict(int32vals)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := craftChunk(EncDict, CompressNone, nil, data)
+	meta := ColMeta{ByteLength: int64(len(chunk)), Encoding: EncDict, Compress: CompressNone}
+	schema := []ColumnSchema{{Name: "i", Type: TypeInt32}}
+	file := craftFile(chunk, meta, schema, uint32(len(int32vals)))
+	r, err := NewReader(bytes.NewReader(file))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cols, err := r.ReadRowGroup(0, []int{0})
+	if err != nil {
+		t.Fatalf("ReadRowGroup: %v", err)
+	}
+	want := make([]any, len(int32vals))
+	for i, v := range int32vals {
+		want[i] = v
+	}
+	if !reflect.DeepEqual(cols[0], want) {
+		t.Errorf("ReadRowGroup of a dict int32 column = %v, want %v", cols[0], want)
+	}
+	got, err := ReadColumn[int32](r, 0, 0)
+	if err != nil {
+		t.Fatalf("ReadColumn[int32]: %v", err)
+	}
+	if !reflect.DeepEqual(got, int32vals) {
+		t.Errorf("ReadColumn[int32] = %v, want %v", got, int32vals)
+	}
+}
+
+// TestDictTypedErrors covers the dictionary reads a file disagreeing with its
+// own schema reaches on a fixed width column: an index with no entry, and an
+// entry that is not the width the type declares.
+func TestDictTypedErrors(t *testing.T) {
+	// One entry, two indices, the second pointing past it.
+	var b []byte
+	b = binary.LittleEndian.AppendUint32(b, 2)
+	b = binary.LittleEndian.AppendUint32(b, 1)
+	b = binary.LittleEndian.AppendUint32(b, 1)
+	b = append(b, 0x80)                   // indices: 1, 0
+	b = append(b, 1, 0, 0, 0, 0, 0, 0, 0) // one eight byte entry
+	if _, err := decodeDictTyped(b, TypeInt64); err == nil {
+		t.Error("decodeDictTyped with an out of range index: want error, got nil")
+	}
+
+	// An entry that is not the width of the type every other value has.
+	entries, err := EncodeDict([]int16{1, 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeDictTyped(entries, TypeInt64); err == nil {
+		t.Error("decodeDictTyped with entries of the wrong width: want error, got nil")
 	}
 }
 
@@ -812,13 +920,15 @@ func TestFillStats(t *testing.T) {
 	}
 }
 
-// craftChunk assembles the on-disk bytes of one column chunk.
+// craftChunk assembles the on-disk bytes of one column chunk. Its data is
+// stored uncompressed, so the raw length is the data length.
 func craftChunk(enc, codec uint8, bitmap, data []byte) []byte {
 	var b []byte
 	b = append(b, enc, codec)
 	b = binary.LittleEndian.AppendUint32(b, uint32(len(bitmap)))
-	b = append(b, bitmap...)
 	b = binary.LittleEndian.AppendUint32(b, uint32(len(data)))
+	b = binary.LittleEndian.AppendUint32(b, uint32(len(data)))
+	b = append(b, bitmap...)
 	b = append(b, data...)
 	return b
 }
@@ -890,6 +1000,193 @@ func TestCanonicalReadErrors(t *testing.T) {
 	}
 	if _, err := ReadColumn[int16](r3, 0, 0); err == nil {
 		t.Error("ReadColumn of a chunk that will not decode: want error, got nil")
+	}
+}
+
+// TestAffixRoundTrip covers the shapes affix has to get right: a shared prefix,
+// a shared suffix, both at once, a prefix and suffix that would overlap in the
+// column's shortest value, and the degenerate cases where there is nothing to
+// share or nothing to write.
+func TestAffixRoundTrip(t *testing.T) {
+	cases := []struct {
+		name string
+		vals []string
+	}{
+		{"empty column", nil},
+		{"one value", []string{"solo"}},
+		{"all identical", []string{"same", "same", "same"}},
+		{"all empty", []string{"", "", ""}},
+		{"prefix only", []string{"user-1", "user-22", "user-333"}},
+		{"suffix only", []string{"1@example.com", "22@example.com", "333@example.com"}},
+		{"prefix and suffix", []string{"u1@a", "u22@a", "u333@a"}},
+		{"affixes overlap", []string{"ab", "aab", "aaab"}},
+		{"nothing shared", []string{"abc", "def", "ghi"}},
+	}
+	for _, c := range cases {
+		encoded, err := EncodeAffix(c.vals)
+		if err != nil {
+			t.Fatalf("%s: EncodeAffix: %v", c.name, err)
+		}
+		got, err := DecodeAffix(encoded, TypeString)
+		if err != nil {
+			t.Fatalf("%s: DecodeAffix: %v", c.name, err)
+		}
+		out, _ := got.([]string)
+		if len(out) != len(c.vals) {
+			t.Fatalf("%s: round trip has %d values, want %d", c.name, len(out), len(c.vals))
+		}
+		for i := range out {
+			if out[i] != c.vals[i] {
+				t.Errorf("%s: value %d = %q, want %q", c.name, i, out[i], c.vals[i])
+			}
+		}
+
+		// A byte column goes through the same encoder and comes back as copies
+		// rather than shared headers.
+		bytes := make([][]byte, len(c.vals))
+		for i, v := range c.vals {
+			bytes[i] = []byte(v)
+		}
+		encoded, err = EncodeAffix(bytes)
+		if err != nil {
+			t.Fatalf("%s: EncodeAffix([][]byte): %v", c.name, err)
+		}
+		got, err = DecodeAffix(encoded, TypeBytes)
+		if err != nil {
+			t.Fatalf("%s: DecodeAffix([][]byte): %v", c.name, err)
+		}
+		bout, _ := got.([][]byte)
+		if !reflect.DeepEqual(bout, bytes) {
+			t.Errorf("%s: byte round trip = %v, want %v", c.name, bout, bytes)
+		}
+	}
+
+	// Affix's shortest value has to keep the prefix and suffix from overlapping,
+	// or the values it writes back are not the ones it read.
+	short, _ := EncodeAffix([]string{"ab", "aaab"})
+	long, _ := DecodeAffix(short, TypeString)
+	if got, _ := long.([]string); !reflect.DeepEqual(got, []string{"ab", "aaab"}) {
+		t.Errorf("affix with a short value = %v, want [ab aaab]", got)
+	}
+
+	if _, err := EncodeAffix([]int64{1}); err == nil {
+		t.Error("EncodeAffix of an int64 column: want error, got nil")
+	}
+}
+
+// TestAffixTruncated covers the header and middle reads a short chunk reaches.
+// A cut inside the middle stream may still land on a value boundary, in which
+// case the chunk decodes as fewer values, so that is what is asked of it.
+func TestAffixTruncated(t *testing.T) {
+	vals := []string{"u1@x", "u2@x"}
+	full, err := EncodeAffix(vals)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for cut := 0; cut < len(full); cut++ {
+		got, err := DecodeAffix(full[:cut], TypeString)
+		if err == nil {
+			out, _ := got.([]string)
+			if len(out) > len(vals) {
+				t.Errorf("DecodeAffix of %d bytes returned %d values, more than it holds", cut, len(out))
+			}
+			for i := range out {
+				if out[i] != vals[i] {
+					t.Errorf("DecodeAffix of %d bytes: value %d = %q, want %q", cut, i, out[i], vals[i])
+				}
+			}
+		}
+	}
+	if _, err := DecodeAffix(full, TypeString); err != nil {
+		t.Errorf("DecodeAffix of a complete chunk: %v", err)
+	}
+
+	// A length that runs past the data.
+	if _, err := DecodeAffix(binary.LittleEndian.AppendUint32([]byte{0, 0}, 40), TypeString); err == nil {
+		t.Error("DecodeAffix with a prefix longer than the data: want error, got nil")
+	}
+}
+
+// Empty strings are a column the writer and reader both have to handle: a
+// decoder that points a string at its buffer takes the address of a zero length
+// slice for one, which used to panic.
+func TestEmptyStringColumn(t *testing.T) {
+	for _, vals := range [][]string{
+		{""},
+		{"", "", ""},
+		{"", "a", ""},
+		{"a", "", "b"},
+	} {
+		schema := []ColumnSchema{{Name: "s", Type: TypeString}}
+		var buf bytes.Buffer
+		w := NewWriter(&buf, schema)
+		if err := w.AddRowGroup([][]any{toAnySlice(vals)}); err != nil {
+			t.Fatalf("AddRowGroup(%v): %v", vals, err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		r, err := NewReader(bytes.NewReader(buf.Bytes()))
+		if err != nil {
+			t.Fatalf("NewReader: %v", err)
+		}
+		got, err := r.ReadRowGroup(0, []int{0})
+		if err != nil {
+			t.Fatalf("ReadRowGroup(%v): %v", vals, err)
+		}
+		want := make([]any, len(vals))
+		for i, v := range vals {
+			want[i] = v
+		}
+		if !reflect.DeepEqual(got[0], want) {
+			t.Errorf("round trip of %v = %v", vals, got[0])
+		}
+	}
+}
+
+func toAnySlice[T any](s []T) []any {
+	out := make([]any, len(s))
+	for i, v := range s {
+		out[i] = v
+	}
+	return out
+}
+
+// TestNarrowingReadErrors covers the reads that fail when a chunk's encoding
+// produces values its column's declared type cannot hold. Delta widens every
+// integer column to int64, so a column that declares itself bytes has no place
+// to put an int64: the reader has to refuse the file rather than panic.
+func TestNarrowingReadErrors(t *testing.T) {
+	bytesSchema := []ColumnSchema{{Name: "b", Type: TypeBytes}}
+	chunk := craftChunk(EncDelta, CompressNone, nil, EncodeDelta([]int64{42, 43}))
+	meta := ColMeta{ByteLength: int64(len(chunk)), Encoding: EncDelta, Compress: CompressNone}
+	file := craftFile(chunk, meta, bytesSchema, 2)
+
+	r, err := NewReader(bytes.NewReader(file))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ReadRowGroup(0, []int{0}); err == nil {
+		t.Error("ReadRowGroup of a delta on a bytes column: want error, got nil")
+	}
+	if _, err := ReadColumn[[]byte](r, 0, 0); err == nil {
+		t.Error("ReadColumn of a delta on a bytes column: want error, got nil")
+	}
+
+	// The same delta on the integer column it belongs to reads back exactly, so
+	// the failure is the declared type rather than the encoding.
+	intSchema := []ColumnSchema{{Name: "i", Type: TypeInt8}}
+	intFile := craftFile(chunk, meta, intSchema, 2)
+	r2, err := NewReader(bytes.NewReader(intFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r2.ReadRowGroup(0, []int{0}); err != nil {
+		t.Errorf("ReadRowGroup of a delta on an int8 column: %v", err)
+	}
+	got, err := ReadColumn[int8](r2, 0, 0)
+	if err != nil || !reflect.DeepEqual(got, []int8{42, 43}) {
+		t.Errorf("ReadColumn[int8] = %v, err %v, want [42 43]", got, err)
 	}
 }
 
@@ -997,5 +1294,57 @@ func TestReaderErrors(t *testing.T) {
 	}
 	if _, err := r.ReadRowGroup(0, []int{0}); err == nil {
 		t.Error("ReadRowGroup with a seek failure: want error, got nil")
+	}
+}
+
+// TestChunkTruncation covers the chunk reads that a file disagreeing with its
+// own metadata reaches: a recorded byte length too small for the chunk it
+// describes, and one too large for the file behind it.
+func TestChunkTruncation(t *testing.T) {
+	schema := []ColumnSchema{{Name: "i", Type: TypeInt16}}
+	data := []byte{1, 0, 2, 0}
+
+	cases := []struct {
+		name       string
+		chunk      []byte
+		byteLength int64
+	}{
+		{"shorter than a chunk header", craftChunk(EncPlain, CompressNone, nil, data), 3},
+		{"missing null bitmap bytes", craftChunk(EncPlain, CompressNone, make([]byte, 8), data), 20},
+		{"missing data bytes", craftChunk(EncPlain, CompressNone, nil, data), 16},
+		{"longer than the file", craftChunk(EncPlain, CompressNone, nil, data), 4096},
+	}
+	for _, c := range cases {
+		file := craftFile(c.chunk, ColMeta{
+			ByteLength: c.byteLength,
+			Encoding:   EncPlain,
+			Compress:   CompressNone,
+		}, schema, 2)
+		r, err := NewReader(bytes.NewReader(file))
+		if err != nil {
+			t.Fatalf("%s: NewReader: %v", c.name, err)
+		}
+		if _, err := r.ReadRowGroup(0, []int{0}); err == nil {
+			t.Errorf("%s: ReadRowGroup: want error, got nil", c.name)
+		}
+	}
+}
+
+// A chunk read that fails mid-way has to surface rather than returning a
+// half-filled region.
+func TestReadRowGroupReadFail(t *testing.T) {
+	schema := []ColumnSchema{{Name: "i", Type: TypeInt16}}
+	chunk := craftChunk(EncPlain, CompressNone, nil, []byte{1, 0, 2, 0})
+	meta := ColMeta{ByteLength: int64(len(chunk)), Encoding: EncPlain, Compress: CompressNone}
+	file := craftFile(chunk, meta, schema, 2)
+
+	// The footer costs three reads — the length, the trailing magic and the
+	// footer itself — so the fourth is the first byte of the chunk.
+	r, err := NewReader(&flakyReadSeeker{r: bytes.NewReader(file), failRead: 4})
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	if _, err := r.ReadRowGroup(0, []int{0}); err == nil {
+		t.Error("ReadRowGroup with a failing read: want error, got nil")
 	}
 }

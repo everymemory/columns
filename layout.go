@@ -28,11 +28,11 @@ func layoutCandidates(typ uint8) []uint8 {
 		TypeUint8, TypeUint16, TypeUint32, TypeUint64:
 		return []uint8{EncPlain, EncDelta, EncDict}
 	case TypeFloat32, TypeFloat64:
-		return []uint8{EncPlain}
+		return []uint8{EncPlain, EncDict}
 	case TypeBytes:
-		return []uint8{EncOffsetBytes, EncDict}
+		return []uint8{EncOffsetBytes, EncDict, EncAffix}
 	case TypeString:
-		return []uint8{EncPlain, EncOffsetBytes, EncDict}
+		return []uint8{EncPlain, EncOffsetBytes, EncDict, EncAffix}
 	default:
 		return nil
 	}
@@ -50,6 +50,8 @@ func encName(enc uint8) string {
 		return "Dict"
 	case EncOffsetBytes:
 		return "OffsetBytes"
+	case EncAffix:
+		return "Affix"
 	default:
 		return fmt.Sprintf("Enc%d", enc)
 	}
