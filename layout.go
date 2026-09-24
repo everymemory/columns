@@ -184,11 +184,11 @@ func ExperimentLayouts(col []any, schema ColumnSchema) LayoutResult {
 // so a writer that has already coerced the values measures them once more
 // rather than twice.
 func experimentLayoutsTyped(typed any, schema ColumnSchema) LayoutResult {
-	results := benchmarkLayoutsTyped(experimentSampleTyped(typed), schema)
-	if len(results) == 0 {
+	best, ok := rankLayouts(experimentSampleTyped(typed), schema)
+	if !ok {
 		return LayoutResult{Name: encName(EncPlain) + "+" + codecName(CompressNone), Encoding: EncPlain, Compress: CompressNone}
 	}
-	return results[0]
+	return best
 }
 
 func benchmarkLayoutsTyped(col any, schema ColumnSchema) []LayoutResult {
@@ -210,12 +210,73 @@ func benchmarkLayoutsTyped(col any, schema ColumnSchema) []LayoutResult {
 	return results
 }
 
+// rankLayouts picks the layout ExperimentLayouts reports, the candidate encoding
+// and codec that compress this column smallest. Every codec consumes the same
+// encoded bytes, so each encoding is done once rather than once per codec, and
+// only the winner is round tripped, since that is the one the writer encodes
+// again without checking. Compression is measured at flateLevel, the level the
+// file is written at, so the choice this makes and the size it reports are the
+// ones a full benchmark would have reached.
+func rankLayouts(col any, schema ColumnSchema) (LayoutResult, bool) {
+	best := LayoutResult{}
+	bestRaw := []byte(nil)
+	found := false
+	n := sliceLen(col)
+	for _, enc := range layoutCandidates(schema.Type) {
+		encStart := time.Now().UnixNano()
+		raw, err := encodeWith(enc, col, schema.Type)
+		if err != nil {
+			continue
+		}
+		encNs := time.Now().UnixNano() - encStart
+
+		for _, codec := range layoutCodecs {
+			// Candidates arrive in the order BenchmarkLayouts sorts by, so taking
+			// a strict improvement keeps the earlier layout on a tie. A codec this
+			// build cannot serve is passed over, not reported.
+			if out, err := Compress(raw, codec); err == nil &&
+				(!found || len(out) < best.CompressedSize ||
+					(len(out) == best.CompressedSize && len(raw) < best.EncodedSize)) {
+				found = true
+				best = LayoutResult{
+					Name:           encName(enc) + "+" + codecName(codec),
+					EncodedSize:    len(raw),
+					CompressedSize: len(out),
+					EncodeNs:       encNs,
+					Encoding:       enc,
+					Compress:       codec,
+				}
+				bestRaw = raw
+			}
+		}
+	}
+	if !found {
+		return LayoutResult{}, false
+	}
+
+	// Report the winner as the writer will produce it, so the decode time is the
+	// one that matters and the reader is confirmed able to read it back.
+	full, ok := measureEncoded(bestRaw, best.Encoding, best.Compress, n, schema.Type)
+	full.EncodeNs += best.EncodeNs
+	return full, ok
+}
+
+// measureLayout measures one encoding and codec for col. It is the per-candidate
+// path BenchmarkLayouts takes.
 func measureLayout(col any, schema ColumnSchema, enc, codec uint8) (LayoutResult, bool) {
-	encodeStart := time.Now().UnixNano()
 	encoded, err := encodeWith(enc, col, schema.Type)
 	if err != nil {
 		return LayoutResult{}, false
 	}
+	return measureEncoded(encoded, enc, codec, sliceLen(col), schema.Type)
+}
+
+// measureEncoded measures one encoding and codec for a column already in its
+// encoded form. Every codec consumes the same bytes, so a column that is encoded
+// once can be measured against all of them through this entry point without
+// repeating the encode.
+func measureEncoded(encoded []byte, enc, codec uint8, n int, typ uint8) (LayoutResult, bool) {
+	encodeStart := time.Now().UnixNano()
 	compressed, err := Compress(encoded, codec)
 	if err != nil {
 		return LayoutResult{}, false
@@ -224,7 +285,7 @@ func measureLayout(col any, schema ColumnSchema, enc, codec uint8) (LayoutResult
 
 	// Decompress accepts the same codecs as Compress.
 	raw, _ := Decompress(compressed, codec)
-	if _, err := decodeWith(enc, raw, sliceLen(col), schema.Type); err != nil {
+	if _, err := decodeWith(enc, raw, n, typ); err != nil {
 		return LayoutResult{}, false
 	}
 	decodeEnd := time.Now().UnixNano()

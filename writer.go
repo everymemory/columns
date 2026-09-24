@@ -108,10 +108,10 @@ func (w *Writer) AddRowGroup(columns [][]any) error {
 	}
 
 	// Choosing a layout, encoding and compressing are independent per column and
-	// are where the write time actually goes — the compressor is the largest item
-	// on the profile — so they run across columns at once. A column's result is
-	// written in order afterwards, which keeps the bytes identical to a serial
-	// write: no encoder sees another column's data.
+	// are where the write time goes, the compressor above all, so they run across
+	// columns at once. A column's result is written in order afterwards, which
+	// keeps the bytes identical to a serial write: no encoder sees another
+	// column's data.
 	chunks := encodeColumns(typed, w.schema)
 
 	for i := range columns {

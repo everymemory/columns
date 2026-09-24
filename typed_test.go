@@ -107,7 +107,7 @@ func TestLayoutTypedInputs(t *testing.T) {
 
 // boxValues has a fast path for each of the thirteen column types. Every value
 // it hands back must equal what a plain conversion would have produced, and
-// must still point at a value the caller can read back — the fast path shares
+// must still point at a value the caller can read back: the fast path shares
 // the source slice's backing array rather than copying each value out.
 func TestBoxValuesMatchesConversion(t *testing.T) {
 	cases := []struct {

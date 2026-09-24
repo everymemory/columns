@@ -19,9 +19,9 @@ func DecodePlain(b []byte, typ uint8) ([]any, error) {
 	return boxValues(typed), nil
 }
 
-// decodePlainTyped decodes plain data into a slice of the Go type for typ —
-// []int64 for TypeInt64 and so on — rather than []any. DecodePlain boxes it, and
-// the typed reader uses it to skip the boxing altogether.
+// decodePlainTyped decodes plain data into a slice of the Go type for typ, []int64
+// for TypeInt64 and so on, rather than []any. DecodePlain boxes it, and the typed
+// reader uses it to skip the boxing altogether.
 func decodePlainTyped(b []byte, typ uint8) (any, error) {
 	switch typ {
 	case TypeBool:
@@ -282,8 +282,8 @@ func DecodeDict(b []byte) ([][]byte, error) {
 }
 
 // decodeDictTyped decodes a dictionary chunk into the values of typ. Entries are
-// the encoded form of a value — little-endian for the fixed width types, raw
-// bytes for strings and byte slices — so a fixed width type's entries are laid
+// the encoded form of a value, little-endian for the fixed width types and raw
+// bytes for strings and byte slices, so a fixed width type's entries are laid
 // out in value order and decoded as one plain column, and the strings a string
 // column converts are the distinct entries rather than one per value.
 func decodeDictTyped(b []byte, typ uint8) (any, error) {
@@ -341,7 +341,8 @@ func indexDict[T any](dict []T, indices []uint32) ([]T, error) {
 // stops rather than letting a short entry shift every value after it.
 func fixedDictEntries(entries [][]byte, indices []uint32, typ uint8) (any, error) {
 	width := fixedWidth(typ)
-	flat := make([]byte, 0, len(indices)*width)
+	flat := make([]byte, len(indices)*width)
+	off := 0
 	for _, idx := range indices {
 		if int(idx) >= len(entries) {
 			return nil, fmt.Errorf("keine: dict index %d out of range", idx)
@@ -350,7 +351,8 @@ func fixedDictEntries(entries [][]byte, indices []uint32, typ uint8) (any, error
 		if len(e) != width {
 			return nil, fmt.Errorf("keine: dict entry is %d bytes, a value of type %d is %d", len(e), typ, width)
 		}
-		flat = append(flat, e...)
+		copy(flat[off:off+width], e)
+		off += width
 	}
 	return decodePlainTyped(flat, typ)
 }
@@ -371,28 +373,33 @@ func fixedWidth(typ uint8) int {
 	return 0
 }
 
-// bitunpack is the inverse of bitpackIndices.
+// bitunpack is the inverse of bitpackIndices. b must hold n values at nbits
+// each, which the caller has already sized, so the loop assembles bytes into
+// values rather than testing one bit at a time. The accumulator never holds
+// more than nbits + 7 bits, which fits in a uint64 for every width a uint32
+// index can need, so one path handles all of them.
 func bitunpack(b []byte, n int, nbits uint) []uint32 {
 	out := make([]uint32, n)
 	if nbits == 0 {
 		return out
 	}
-	var pos uint64
+	var acc uint64
+	var bits uint
 	for i := 0; i < n; i++ {
-		var v uint32
-		for j := uint(0); j < nbits; j++ {
-			if pos/8 < uint64(len(b)) && b[pos/8]&(byte(0x80)>>(pos%8)) != 0 {
-				v |= 1 << (nbits - 1 - j)
-			}
-			pos++
+		for bits < nbits {
+			acc = acc<<8 | uint64(b[0])
+			b = b[1:]
+			bits += 8
 		}
-		out[i] = v
+		out[i] = uint32(acc >> (bits - nbits))
+		bits -= nbits
+		acc &= (1 << bits) - 1
 	}
 	return out
 }
 
 // decodeTyped dispatches a chunk to the decoder for enc and returns the values
-// as a slice of the Go type that decoder produces — []int64 from EncDelta,
+// as a slice of the Go type that decoder produces, []int64 from EncDelta and
 // []string from EncDict. n is the number of values in the chunk.
 func decodeTyped(enc uint8, data []byte, n int, typ uint8) (any, error) {
 	switch enc {
@@ -445,11 +452,11 @@ func decodeWith(enc uint8, data []byte, n int, typ uint8) ([]any, error) {
 	return boxColumn(typed, enc, typ)
 }
 
-// boxValues converts a typed slice — []int64, []string and so on — into []any
+// boxValues converts a typed slice, []int64, []string and so on, into []any
 // without copying a single value. Each interface header points at its element
-// where it already sits in the source slice, so a 10000-value column costs one
-// allocation instead of one per value: converting a value type to an interface
-// allocates a box for it, and a column of those is a column of boxes.
+// where it already sits in the source slice, so a column costs one allocation
+// instead of one per value: converting a value type to an interface allocates a
+// box for it, and a column of those is a column of boxes.
 //
 // Keeping interior pointers into s is safe because the decoders build a fresh
 // slice for every column and the caller takes ownership of it, so nothing
@@ -666,67 +673,6 @@ func canonicalTyped[T any](vals []any, coerce func(any) (T, error)) ([]T, error)
 		out[i] = x
 	}
 	return out, nil
-}
-
-func canonicalValue(v any, typ uint8) (any, error) {
-	switch typ {
-	case TypeBool:
-		return coerceBool(v)
-	case TypeInt8:
-		n, err := coerceInt(v, 8)
-		if err != nil {
-			return nil, err
-		}
-		return int8(n), nil
-	case TypeInt16:
-		n, err := coerceInt(v, 16)
-		if err != nil {
-			return nil, err
-		}
-		return int16(n), nil
-	case TypeInt32:
-		n, err := coerceInt(v, 32)
-		if err != nil {
-			return nil, err
-		}
-		return int32(n), nil
-	case TypeInt64:
-		return coerceInt(v, 64)
-	case TypeUint8:
-		n, err := coerceUint(v, 8)
-		if err != nil {
-			return nil, err
-		}
-		return uint8(n), nil
-	case TypeUint16:
-		n, err := coerceUint(v, 16)
-		if err != nil {
-			return nil, err
-		}
-		return uint16(n), nil
-	case TypeUint32:
-		n, err := coerceUint(v, 32)
-		if err != nil {
-			return nil, err
-		}
-		return uint32(n), nil
-	case TypeUint64:
-		return coerceUint(v, 64)
-	case TypeFloat32:
-		f, err := coerceFloat(v, 32)
-		if err != nil {
-			return nil, err
-		}
-		return float32(f), nil
-	case TypeFloat64:
-		return coerceFloat(v, 64)
-	case TypeString:
-		return coerceString(v)
-	case TypeBytes:
-		return coerceBytes(v)
-	default:
-		return nil, fmt.Errorf("keine: unknown type %d", typ)
-	}
 }
 
 func coerceBool(v any) (bool, error) {

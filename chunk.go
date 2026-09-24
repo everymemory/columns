@@ -20,7 +20,7 @@ type ColumnChunk struct {
 }
 
 // parseChunk reads a chunk out of b, which must hold exactly the chunk's bytes.
-// c's slices point into b, so b has to outlive c — the reader keeps its buffer
+// c's slices point into b, so b has to outlive c: the reader reuses its buffer
 // for the next row group, and a chunk handed to another goroutine is decoded
 // before that happens.
 func parseChunk(b []byte, c *ColumnChunk) error {

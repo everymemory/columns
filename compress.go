@@ -13,12 +13,15 @@ import (
 // flateLevel is the DEFLATE level used by the flate, gzip and zlib codecs. It is
 // always valid for the three constructors below.
 //
-// Level 3 rather than the default 6. DEFLATE's cost is not symmetric in what it
-// is given: on two million bytes of pseudo-random float64, level 6 compressed
-// 3.80x in 109ms and level 3 compressed 3.75x in 28ms, and on four million bytes
-// of repeated email strings level 6 compressed 7.93x in 44ms and level 3
+// Level 3 rather than the default 6. On two million bytes of pseudo-random
+// float64, level 6 compressed 3.80x in 109ms and level 3 compressed 3.75x in
+// 28ms; on four million bytes of repeated email strings, 7.93x in 44ms against
 // 7.88x in 25ms. The last three levels buy two tenths of a percent for four
-// times the time, so this is where the write time lives.
+// times the time.
+//
+// Level 1 is not worth it either. On the 200000-row benchmark it wrote 9.69 B/row
+// in 93ms against level 3's 9.07 B/row in 107ms, but reading the larger file took
+// 34ms against 27ms. The bytes it saves going out come back as read time.
 const flateLevel = 3
 
 // LZW is configured least significant bit first with eight bit literals.

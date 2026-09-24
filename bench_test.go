@@ -218,6 +218,73 @@ func BenchmarkTypedRead(b *testing.B) {
 	}
 }
 
+// comparisonColumns are the shapes a columnar workload actually sees: a
+// monotonic key, a random key, a low entropy float, a low cardinality string and
+// a high cardinality string that shares a suffix. comparisonRows is the row
+// count the whole-file numbers in the README are reported at.
+var comparisonColumns = []*benchColumn{
+	&benchColumns[1], // int64-run
+	&benchColumns[2], // int64-random
+	&benchColumns[3], // float64
+	&benchColumns[4], // string-low-card
+	&benchColumns[5], // string-high-card
+}
+
+const comparisonRows = 200000
+
+// BenchmarkComparison writes and reads one row group of all five comparison
+// columns in a single file, which is how a workload actually uses the format:
+// the columns are encoded in parallel and share one footer. It reports the file
+// size and both directions of the transfer, so the README's numbers are
+// reproducible with `go test -bench=BenchmarkComparison`.
+func BenchmarkComparison(b *testing.B) {
+	schema := make([]ColumnSchema, len(comparisonColumns))
+	columns := make([][]any, len(comparisonColumns))
+	for i, c := range comparisonColumns {
+		schema[i] = c.schema
+		columns[i] = c.build(comparisonRows)
+	}
+
+	file := func() []byte {
+		buf := &bytes.Buffer{}
+		w := NewWriter(buf, schema)
+		if err := w.AddRowGroup(columns); err != nil {
+			b.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			b.Fatal(err)
+		}
+		return buf.Bytes()
+	}
+	data := file()
+	b.ReportMetric(float64(len(data)), "bytes")
+	b.ReportMetric(float64(len(data))/float64(comparisonRows), "B/row")
+
+	r, err := NewReader(bytes.NewReader(data))
+	if err != nil {
+		b.Fatal(err)
+	}
+	read := make([]int, len(comparisonColumns))
+	for i := range read {
+		read[i] = i
+	}
+
+	b.Run("write", func(b *testing.B) {
+		b.ReportMetric(float64(len(data))/float64(comparisonRows), "B/row")
+		for i := 0; i < b.N; i++ {
+			file()
+		}
+	})
+	b.Run("read", func(b *testing.B) {
+		b.SetBytes(int64(len(data)))
+		for i := 0; i < b.N; i++ {
+			if _, err := r.ReadRowGroup(0, read); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
 // BenchmarkPartialRead measures skipping the columns a query does not want,
 // which is what ColMeta.ByteLength exists for.
 func BenchmarkPartialRead(b *testing.B) {

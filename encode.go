@@ -203,10 +203,9 @@ func EncodeOffsetBytes(vals [][]byte) []byte {
 
 // EncodeAffix writes the bytes every value in the column has at its start and at
 // its end, then each value with those bytes gone: a length-prefixed stream of
-// what is left between them. Identifiers sharing a domain, a path or a key are
-// the usual case — the shared part is stored once rather than per value, and
-// the middles are that much shorter for whatever codec follows, which is what
-// makes a high cardinality string column cheap to read as well as to store.
+// what is left between them. Values that share a domain, a path or a key share
+// that part once rather than per value, and the middles are that much shorter
+// for whatever codec follows.
 func EncodeAffix(vals any) ([]byte, error) {
 	switch s := vals.(type) {
 	case []string:
@@ -415,20 +414,29 @@ func dictFlat[T any](s []T, width int, put func(v T, b []byte)) ([]string, int, 
 }
 
 // bitpackIndices packs indices using nbits per value, most significant bit
-// first, padded to a byte boundary.
+// first, padded to a byte boundary. The accumulator never holds more than
+// nbits + 7 bits, which fits in a uint64 for every width a uint32 index can
+// need, so one path handles all of them.
 func bitpackIndices(indices []uint32, nbits uint) []byte {
 	if nbits == 0 {
 		return make([]byte, 0)
 	}
 	out := make([]byte, (uint64(len(indices))*uint64(nbits)+7)/8)
-	var pos uint64
+	var acc uint64
+	var bits uint
+	p := 0
 	for _, idx := range indices {
-		for j := uint(0); j < nbits; j++ {
-			if idx&(1<<(nbits-1-j)) != 0 {
-				out[pos/8] |= byte(0x80 >> (pos % 8))
-			}
-			pos++
+		acc = acc<<nbits | uint64(idx)
+		bits += nbits
+		for bits >= 8 {
+			out[p] = byte(acc >> (bits - 8))
+			p++
+			bits -= 8
 		}
+		acc &= (1 << bits) - 1
+	}
+	if bits > 0 {
+		out[p] = byte(acc << (8 - bits))
 	}
 	return out
 }

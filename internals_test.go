@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"reflect"
 	"testing"
@@ -665,6 +666,69 @@ func TestCoerceBytesAndParse(t *testing.T) {
 	}
 }
 
+// canonicalValue coerces one value to the Go type typ implies. Only this test
+// file asks for a single value; the writer and reader coerce whole columns.
+func canonicalValue(v any, typ uint8) (any, error) {
+	switch typ {
+	case TypeBool:
+		return coerceBool(v)
+	case TypeInt8:
+		n, err := coerceInt(v, 8)
+		if err != nil {
+			return nil, err
+		}
+		return int8(n), nil
+	case TypeInt16:
+		n, err := coerceInt(v, 16)
+		if err != nil {
+			return nil, err
+		}
+		return int16(n), nil
+	case TypeInt32:
+		n, err := coerceInt(v, 32)
+		if err != nil {
+			return nil, err
+		}
+		return int32(n), nil
+	case TypeInt64:
+		return coerceInt(v, 64)
+	case TypeUint8:
+		n, err := coerceUint(v, 8)
+		if err != nil {
+			return nil, err
+		}
+		return uint8(n), nil
+	case TypeUint16:
+		n, err := coerceUint(v, 16)
+		if err != nil {
+			return nil, err
+		}
+		return uint16(n), nil
+	case TypeUint32:
+		n, err := coerceUint(v, 32)
+		if err != nil {
+			return nil, err
+		}
+		return uint32(n), nil
+	case TypeUint64:
+		return coerceUint(v, 64)
+	case TypeFloat32:
+		f, err := coerceFloat(v, 32)
+		if err != nil {
+			return nil, err
+		}
+		return float32(f), nil
+	case TypeFloat64:
+		return coerceFloat(v, 64)
+	case TypeString:
+		return coerceString(v)
+	case TypeBytes:
+		return coerceBytes(v)
+	default:
+		return nil, fmt.Errorf("keine: unknown type %d", typ)
+	}
+}
+
 func TestCanonicalValues(t *testing.T) {
 	ok := []struct {
 		v    any
@@ -813,6 +877,21 @@ func TestLayoutHelpers(t *testing.T) {
 	// check in measureLayout exists to catch.
 	if _, ok := measureLayout([]string{"abc", "def"}, ColumnSchema{Name: "x", Type: TypeInt32}, EncDict, CompressNone); ok {
 		t.Error("measureLayout with values that cannot be decoded back: want not ok")
+	}
+
+	// An empty column gives every candidate a size of zero, so the ordering the
+	// sort falls back to is the encoded size.
+	results := benchmarkLayoutsTyped([]bool{}, ColumnSchema{Name: "x", Type: TypeBool})
+	if len(results) != 6 {
+		t.Fatalf("benchmarkLayoutsTyped of an empty bool column: got %d results, want 6", len(results))
+	}
+	if results[0].EncodedSize != 0 || results[0].CompressedSize != 0 {
+		t.Errorf("benchmarkLayoutsTyped of an empty bool column: first result = %+v, want zero sizes", results[0])
+	}
+	for i := 1; i < len(results); i++ {
+		if results[i].CompressedSize < results[i-1].CompressedSize {
+			t.Errorf("benchmarkLayoutsTyped result %d is larger than result %d: %+v then %+v", i-1, i, results[i-1], results[i])
+		}
 	}
 }
 
@@ -1338,8 +1417,8 @@ func TestReadRowGroupReadFail(t *testing.T) {
 	meta := ColMeta{ByteLength: int64(len(chunk)), Encoding: EncPlain, Compress: CompressNone}
 	file := craftFile(chunk, meta, schema, 2)
 
-	// The footer costs three reads — the length, the trailing magic and the
-	// footer itself — so the fourth is the first byte of the chunk.
+	// The footer costs three reads: the length, the trailing magic and the
+	// footer itself, so the fourth is the first byte of the chunk.
 	r, err := NewReader(&flakyReadSeeker{r: bytes.NewReader(file), failRead: 4})
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)

@@ -253,9 +253,9 @@ func ReadColumn[T any](rd *Reader, index, col int) ([]T, error) {
 		return out, nil
 	}
 
-	// The encoding produces a wider type than the column declares — Delta keeps
-	// int64 diffs for every integer width — so narrow to the declared type
-	// before converting.
+	// The encoding produces a wider type than the column declares: Delta keeps
+	// int64 diffs for every integer width. Narrow to the declared type before
+	// converting.
 	vals, err := canonicalColumn(boxValues(typed), typ)
 	if err != nil {
 		return nil, err
