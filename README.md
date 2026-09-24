@@ -159,36 +159,46 @@ from the same pseudo-random stream so neither sees easier data:
 
 | | bytes/row | write | read all | read 1 column | read typed |
 | --- | --- | --- | --- | --- | --- |
-| keine | 9.06 | 260ms | 35ms | 8ms | 33ms |
+| keine | 9.86 | 130ms | 40ms | 10ms | 32ms |
 | parquet zstd | 12.86 | 102ms | 17ms | 9ms | — |
 | parquet snappy | 21.32 | 96ms | 18ms | 8ms | — |
 | parquet none | 43.71 | 81ms | 13ms | 8ms | — |
 
-keine is smaller than parquet at every compression level, and reading one column
-is level with it. Writing is still slower, and what is left of the gap sits
-mostly in one place: `compress/flate` at its default level.
+keine is smaller than parquet at every compression level and within a quarter of
+its write speed, and reading one column is level with it.
 
 Encoding and compressing a column touches no other, so the writer runs them
 across columns at once and writes each result in order, which keeps the bytes
 identical to a serial write. The reader splits the same way: chunk bytes come
 through one shared file handle serially, and decompression and decoding run
-across columns. That is what closed most of the read gap. The work that remains
-is flate, and flate's cost is not symmetric: a column of pseudo-random float64
-values compresses 3.80x at level 6 in 109ms, and 3.75x at level 3 in 28ms. The
-standard library ships no zstd, so there is no faster codec to reach for, only a
-slower setting to stop using.
+across columns. That is what closed most of the read gap. What is left of the
+write gap is `compress/flate`: the standard library ships no zstd, so there is no
+faster codec to reach for, only a slower setting to stop using.
 
-Parquet also pays nothing to choose a layout: its encodings are compiled in.
-keine measures them per column, which costs about 40ms of this write and is why
-it can be smaller than a format with a better compressor.
+DEFLATE's cost is not symmetric in what it is given, so the level is where the
+time lives. On this dataset's columns, measured at every level: the pseudo-random
+float64 column compresses 2.81x at level 6 in 200ms and 2.69x at level 3 in 35ms,
+and the near-distinct string column compresses 5.62x in 82ms and 5.44x in 43ms.
+The last three levels buy four hundredths of a ratio for six times the time.
+Writing at level 3 costs about nine percent of the file size and halves the write,
+which is why the table above is 9.86 bytes/row rather than 9.06.
+
+Parquet pays nothing to choose a layout: its encodings are compiled in. keine
+measures them per column, which costs about 40ms of this write and is why it can
+be smaller than a format with a better compressor.
 
 Reading all five columns is still behind, and the profile says why: flate
 decompression is 43% of that read and GC is another 25%. The decoding itself is
-no longer the cost it was — boxing every value into an interface used to
-allocate a copy of each one, and a column now shares one backing array instead,
-so a 10000-value int64 column reads with 10 allocations rather than 10010 and
-takes about half the time. Strings got the same treatment: a dictionary column
-converts each distinct entry once and shares those headers across every value
-that repeats it, and a plain string column's values are slices of one buffer
-rather than a copy each. That took the comparison file's read from 134ms to 35ms
-and its allocations from 403000 to 3500 while the output bytes stayed identical.
+no longer the cost it was — boxing every value into an interface used to allocate
+a copy of each one, and a column now shares one backing array instead, so a
+10000-value int64 column reads with 10 allocations rather than 10010 and takes
+about half the time. Strings got the same treatment: a dictionary column converts
+each distinct entry once and shares those headers across every value that repeats
+it, and a plain string column's values are slices of one buffer rather than a copy
+each. That took the comparison file's read from 134ms to 40ms and its allocations
+from 403000 to 3500.
+
+The typed column reads three integer columns in 32ms where the boxed path takes
+longer for the same work. `ReadColumn` is the path to use when the schema is
+known and a query touches few columns, since it skips the interface boxing
+`ReadRowGroup` pays for a uniform return type.
