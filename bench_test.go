@@ -283,6 +283,33 @@ func BenchmarkComparison(b *testing.B) {
 			}
 		}
 	})
+	b.Run("read scoped", func(b *testing.B) {
+		b.SetBytes(int64(len(data)))
+		for i := 0; i < b.N; i++ {
+			err := r.ReadRowGroupScoped(0, read, func(c *Columns) error {
+				for j := range read {
+					switch comparisonColumns[j].schema.Type {
+					case TypeInt64:
+						if _, err := Column[int64](c, j); err != nil {
+							return err
+						}
+					case TypeFloat64:
+						if _, err := Column[float64](c, j); err != nil {
+							return err
+						}
+					default:
+						if _, err := Column[string](c, j); err != nil {
+							return err
+						}
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
 
 // BenchmarkPartialRead measures skipping the columns a query does not want,

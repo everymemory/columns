@@ -2,6 +2,7 @@ package keine
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"reflect"
 	"testing"
@@ -598,6 +599,240 @@ func TestReadColumnNullableSchemaDense(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, []int64{1, 2, 3}) {
 		t.Errorf("ReadColumn = %v, want [1 2 3]", got)
+	}
+}
+
+// TestReadRowGroupScoped covers the typed path: every type has to come back
+// through it unchanged, a column has to be readable alongside its neighbours, and
+// the slices only stay valid inside the call. Asking for a type a column does not
+// hold, or a position that was not requested, is an error rather than a wrong
+// slice.
+func TestReadRowGroupScoped(t *testing.T) {
+	schema := make([]ColumnSchema, len(allTypes))
+	for i, typ := range allTypes {
+		schema[i] = ColumnSchema{Name: fmt.Sprintf("t%d_%d", i, typ), Type: typ}
+	}
+	cols := make([][]any, len(allTypes))
+	for c, typ := range allTypes {
+		col := make([]any, rowsPerGroup)
+		for r := 0; r < rowsPerGroup; r++ {
+			col[r] = genValue(typ, 0, r)
+		}
+		cols[c] = col
+	}
+
+	var buf bytes.Buffer
+	w := NewWriter(&buf, schema)
+	if err := w.AddRowGroup(cols); err != nil {
+		t.Fatalf("AddRowGroup: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	r, err := NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+
+	reads := map[uint8]func(*Columns, int) (any, error){
+		TypeBool:    func(c *Columns, i int) (any, error) { return Column[bool](c, i) },
+		TypeInt8:    func(c *Columns, i int) (any, error) { return Column[int8](c, i) },
+		TypeInt16:   func(c *Columns, i int) (any, error) { return Column[int16](c, i) },
+		TypeInt32:   func(c *Columns, i int) (any, error) { return Column[int32](c, i) },
+		TypeInt64:   func(c *Columns, i int) (any, error) { return Column[int64](c, i) },
+		TypeUint8:   func(c *Columns, i int) (any, error) { return Column[uint8](c, i) },
+		TypeUint16:  func(c *Columns, i int) (any, error) { return Column[uint16](c, i) },
+		TypeUint32:  func(c *Columns, i int) (any, error) { return Column[uint32](c, i) },
+		TypeUint64:  func(c *Columns, i int) (any, error) { return Column[uint64](c, i) },
+		TypeFloat32: func(c *Columns, i int) (any, error) { return Column[float32](c, i) },
+		TypeFloat64: func(c *Columns, i int) (any, error) { return Column[float64](c, i) },
+		TypeBytes:   func(c *Columns, i int) (any, error) { return Column[[]byte](c, i) },
+		TypeString:  func(c *Columns, i int) (any, error) { return Column[string](c, i) },
+	}
+
+	for i, typ := range allTypes {
+		err := r.ReadRowGroupScoped(0, []int{i}, func(c *Columns) error {
+			got, err := reads[typ](c, 0)
+			if err != nil {
+				return fmt.Errorf("Column[%s]: %w", typeNames[typ], err)
+			}
+			slice := reflect.ValueOf(got)
+			if slice.Len() != rowsPerGroup {
+				return fmt.Errorf("Column[%s] returned %d values, want %d",
+					typeNames[typ], slice.Len(), rowsPerGroup)
+			}
+			for k := 0; k < rowsPerGroup; k++ {
+				want := genValue(typ, 0, k)
+				if !reflect.DeepEqual(slice.Index(k).Interface(), want) {
+					return fmt.Errorf("Column[%s][%d] = %v, want %v",
+						typeNames[typ], k, slice.Index(k).Interface(), want)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Errorf("ReadRowGroupScoped for %s: %v", typeNames[typ], err)
+		}
+	}
+
+	// Reading columns together has to give each one its own values. The positions
+	// are the requested set, not the schema, so asking out of order reads out of
+	// order.
+	at := map[uint8]int{}
+	for i, typ := range allTypes {
+		at[typ] = i
+	}
+	order := []int{at[TypeString], at[TypeInt64], at[TypeFloat64]}
+	err = r.ReadRowGroupScoped(0, order, func(c *Columns) error {
+		strs, err := Column[string](c, 0)
+		if err != nil {
+			return err
+		}
+		ints, err := Column[int64](c, 1)
+		if err != nil {
+			return err
+		}
+		flts, err := Column[float64](c, 2)
+		if err != nil {
+			return err
+		}
+		for k := 0; k < rowsPerGroup; k++ {
+			wantS := genValue(TypeString, 0, k).(string)
+			if strs[k] != wantS {
+				return fmt.Errorf("strings[%d] = %q, want %q", k, strs[k], wantS)
+			}
+			if ints[k] != genValue(TypeInt64, 0, k) {
+				return fmt.Errorf("ints[%d] = %d, want %v", k, ints[k], genValue(TypeInt64, 0, k))
+			}
+			if flts[k] != genValue(TypeFloat64, 0, k) {
+				return fmt.Errorf("floats[%d] = %v, want %v", k, flts[k], genValue(TypeFloat64, 0, k))
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Errorf("ReadRowGroupScoped of three columns together: %v", err)
+	}
+
+	// Asking for a type the column does not hold is an error, not a wrong slice.
+	if err := r.ReadRowGroupScoped(0, []int{at[TypeInt64]}, func(c *Columns) error {
+		if _, err := Column[string](c, 0); err == nil {
+			t.Error("Column[string] on an int64 column succeeded, want a type mismatch error")
+		}
+		// A position past the requested set is out of range even when the schema
+		// has a column there.
+		if _, err := Column[int64](c, 1); err == nil {
+			t.Error("Column at position 1 succeeded, want out of range")
+		}
+		if _, err := Column[int64](c, -1); err == nil {
+			t.Error("Column at position -1 succeeded, want out of range")
+		}
+		return nil
+	}); err != nil {
+		t.Errorf("ReadRowGroupScoped of a mismatched type: %v", err)
+	}
+
+	if err := r.ReadRowGroupScoped(0, []int{len(allTypes)}, func(c *Columns) error {
+		return nil
+	}); err == nil {
+		t.Error("ReadRowGroupScoped past the last column succeeded, want out of range")
+	}
+	if err := r.ReadRowGroupScoped(0, []int{-1}, func(c *Columns) error {
+		return nil
+	}); err == nil {
+		t.Error("ReadRowGroupScoped of column -1 succeeded, want out of range")
+	}
+	if err := r.ReadRowGroupScoped(1, []int{0}, func(c *Columns) error {
+		return nil
+	}); err == nil {
+		t.Error("ReadRowGroupScoped on row group 1 succeeded, want out of range")
+	}
+
+	// The caller's error reaches the caller, and the read it came from is not
+	// silent about it.
+	want := errors.New("keine test: stop early")
+	if got := r.ReadRowGroupScoped(0, []int{0}, func(c *Columns) error {
+		return want
+	}); !errors.Is(got, want) {
+		t.Errorf("ReadRowGroupScoped returned %v, want the caller's %v", got, want)
+	}
+}
+
+// A nullable column has no room in a typed slice, so the scoped path refuses it
+// rather than handing back a column with a hole in it.
+func TestReadRowGroupScopedNulls(t *testing.T) {
+	schema := []ColumnSchema{
+		{Name: "n", Type: TypeInt64, Nullable: true},
+		{Name: "d", Type: TypeInt64},
+	}
+	cols := [][]any{
+		{int64(1), nil, int64(3)},
+		{int64(1), int64(2), int64(3)},
+	}
+
+	var buf bytes.Buffer
+	w := NewWriter(&buf, schema)
+	if err := w.AddRowGroup(cols); err != nil {
+		t.Fatalf("AddRowGroup: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	r, err := NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	if err := r.ReadRowGroupScoped(0, []int{0}, func(c *Columns) error {
+		return nil
+	}); err == nil {
+		t.Error("ReadRowGroupScoped of a nullable column succeeded, want an error")
+	}
+
+	// A dense column in the same file reads fine, so the refusal is the nulls.
+	if err := r.ReadRowGroupScoped(0, []int{1}, func(c *Columns) error {
+		got, err := Column[int64](c, 0)
+		if err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(got, []int64{1, 2, 3}) {
+			return fmt.Errorf("Column[int64] = %v, want [1 2 3]", got)
+		}
+		return nil
+	}); err != nil {
+		t.Errorf("ReadRowGroupScoped of the dense column: %v", err)
+	}
+}
+
+// A chunk whose encoding produces a wider type than its column declares still
+// narrows on the scoped path, so a caller asking for the declared type gets it.
+func TestReadRowGroupScopedNarrows(t *testing.T) {
+	chunk := craftChunk(EncDelta, CompressNone, nil, EncodeDelta([]int64{42, 43}))
+	meta := ColMeta{ByteLength: int64(len(chunk)), Encoding: EncDelta, Compress: CompressNone}
+	file := craftFile(chunk, meta, []ColumnSchema{{Name: "i", Type: TypeInt8}}, 2)
+
+	r, err := NewReader(bytes.NewReader(file))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = r.ReadRowGroupScoped(0, []int{0}, func(c *Columns) error {
+		got, err := Column[int8](c, 0)
+		if err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(got, []int8{42, 43}) {
+			return fmt.Errorf("Column[int8] = %v, want [42 43]", got)
+		}
+		// Asking for the intermediate type is a mismatch: the column declares
+		// int8, so that is what it decodes to here.
+		if _, err := Column[int64](c, 0); err == nil {
+			return errors.New("Column[int64] on an int8 column succeeded, want a type mismatch error")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Errorf("ReadRowGroupScoped of a delta on an int8 column: %v", err)
 	}
 }
 
