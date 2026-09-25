@@ -172,6 +172,24 @@ ids, _ := keine.ReadColumn[int64](r, 0, 0)
 `TypeString`. A column with nulls has nowhere to put a `nil` in a `[]T`, so it
 returns an error and `ReadRowGroup` reads those.
 
+When the same reader scans the same columns over and over, `ReadRowGroupScoped`
+hands the values to a callback as typed slices and takes them back when it
+returns. Nothing is boxed, and the slices point into buffers the reader keeps
+for its next read, so after the first one a row group costs almost no
+allocation:
+
+```go
+r.ReadRowGroupScoped(0, []int{0}, func(c *keine.Columns) error {
+    ids, _ := keine.Column[int64](c, 0)
+    // ids is valid until this returns
+    return nil
+})
+```
+
+Holding a slice past the callback reads whatever the next read wrote over it, so
+it is a borrowing API: copy out what you need before returning. A nullable
+column is an error here for the same reason it is in `ReadColumn`.
+
 ## Status
 
 v0.2.0. The format is stable enough to write and read real data, but it is not a
@@ -200,9 +218,15 @@ Xeon X5687 with `go test -bench=BenchmarkComparison -count=3`:
 ```
 BenchmarkComparison
     15.07 bytes/row
-    write    89 ms   33 MB/s
-    read     27 ms  113 MB/s
+    write        92 ms   33 MB/s
+    read         25 ms   118 MB/s   32.7 MB   900 allocs
+    read scoped  12 ms   248 MB/s   137 KB    853 allocs
 ```
+
+The scoped read returns typed slices into the reader's own buffers, so the
+memory it reports is transient: only the first read allocates the columns. The
+boxed read hands every value to the caller, and 16 bytes of that per value is
+the interface header itself, which is the floor for a `[]any` return.
 
 `BenchmarkExperiment` is the layout choice cost the writer pays per column.
 `BenchmarkSizes` reports every candidate's size, since the winner is only
@@ -215,7 +239,7 @@ whole write and read paths, `BenchmarkTypedRead` the unboxed read path, and
 The comparison below was taken once, against pyarrow, with both formats fed the
 same values from the same pseudo-random stream so neither saw easier data. The
 harness and the dataset are not in this repository, and the dataset is not the one
-`BenchmarkComparison` uses, so the 9.07 bytes/row there and the 14.75 above are
+`BenchmarkComparison` uses, so the 9.07 bytes/row there and the 15.07 above are
 two different files. Treat the table as a one-time measurement, not something to
 reproduce here.
 
@@ -230,7 +254,10 @@ On 200000 rows in 5 columns:
 
 keine is smaller than parquet at every compression level and within about a
 quarter of its write speed, and reading one column is level with it. Reading all
-five is where it still loses.
+five is where it still loses, and that table predates the buffer reuse, so the
+gap it shows is wider now than when it was taken; the scoped read of
+`BenchmarkComparison` is twice the speed of its boxed one on the same data. A fair
+rematch needs the parquet harness again, which is not in this repository.
 
 ## Where the time goes
 
@@ -257,18 +284,26 @@ measures them per column, on a sample, and that measurement is inside the write
 time above, about 38ms of the 132ms the one-off comparison measured. It is what
 buys the size advantage over a format with a better compressor.
 
-The read profile after the block split is roughly a third DEFLATE, a fifth GC and
+The read profile after the block split was roughly a third DEFLATE, a fifth GC and
 a seventh decoding. The decoding is no longer the cost it was: boxing every value
 into an interface used to allocate a copy of each one, and a column now shares one
 backing array instead, so a 10000-value int64 column reads with 10 allocations
 rather than 10010. Strings got the same treatment, and that change alone took the
 comparison file's read from 134ms to 32ms and its allocations from 403000 to 3500.
 
+The remaining allocations were the decoders' own result slices and the DEFLATE
+machinery behind them, which is what the scoped path now holds onto: each decoder
+writes into a destination the reader keeps, and each block's decompressor is reset
+rather than built. A scoped read of the comparison file allocates 137 KB, of which
+nothing is the columns. A boxed read still allocates its values, because those are
+the caller's to keep; 16 bytes a value of that is the interface header, which is
+the floor a `[]any` return cannot go below.
+
 The block split costs about two percent of the file size, since each of a column's
 DEFLATE streams carries its own Huffman table instead of one for the column, and
-buys the 34ms to 27ms read. Larger blocks measured a slightly smaller file and no
-faster a read: at five columns the reader runs out of work before it runs out of
-cores.
+took the comparison file's read from 34ms to 27ms. Reusing the buffers has since
+taken it to 25ms. Larger blocks measured a slightly smaller file and no faster a
+read: at five columns the reader runs out of work before it runs out of cores.
 
 The remainder is DEFLATE itself, and it costs unevenly. The same 1.6MB decompresses
 in 0.43ms for a column of near-monotonic deltas and in 10ms for a column of
@@ -278,6 +313,12 @@ bytes per row are a pseudo-random int64 column no encoding and no codec shrinks,
 and removing the float column entirely would save about seven percent of read time.
 Closing the rest is a codec question, not a parallelism one.
 
-The typed read path exists for the case where the schema is known and a query
-touches few columns. `ReadColumn` reads an integer column without the interface
-boxing `ReadRowGroup` pays for a uniform return type.
+With the allocations gone, DEFLATE is what a scoped read is: about 60% of its 12ms.
+The remainder is decoding and the parallel machinery around it.
+
+The three read paths are for three callers. `ReadRowGroup` returns `[]any` and
+covers nulls, and its cost is the interface headers as much as the bytes.
+`ReadColumn` reads one column into a typed slice and skips them. `ReadRowGroupScoped`
+reads several, takes the values back when it is done, and is the one that gets
+close to allocating nothing: it is what a scan over the same schema wants, and the
+one to reach for when the read is the workload rather than the values it returns.
