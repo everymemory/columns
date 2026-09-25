@@ -13,6 +13,11 @@ import (
 // magic is written at the start of a file and again after the footer length.
 const magic = "KEIN"
 
+// formatVersion is the byte after the leading magic. A reader that sees another
+// version refuses the file rather than misreading it, so a change to the layout
+// on disk is a clean break instead of a silent corruption.
+const formatVersion = 1
+
 // Writer accumulates row groups into a keine file. Writes go to w directly:
 // chunks are large sequential blocks, and buffering would only obscure which
 // write failed.
@@ -24,15 +29,19 @@ type Writer struct {
 	writeErr  error
 }
 
-// NewWriter writes the leading magic. If that write fails, the error is
-// returned by the first AddRowGroup or Close call.
+// NewWriter writes the leading magic and the format version. If that write
+// fails, the error is returned by the first AddRowGroup or Close call.
 func NewWriter(w io.Writer, schema []ColumnSchema) *Writer {
 	wr := &Writer{w: w, schema: schema}
 	if _, err := w.Write([]byte(magic)); err != nil {
 		wr.writeErr = err
 		return wr
 	}
-	wr.offset = int64(len(magic))
+	if _, err := w.Write([]byte{formatVersion}); err != nil {
+		wr.writeErr = err
+		return wr
+	}
+	wr.offset = int64(len(magic) + 1)
 	return wr
 }
 
@@ -108,10 +117,11 @@ func (w *Writer) AddRowGroup(columns [][]any) error {
 	}
 
 	// Choosing a layout, encoding and compressing are independent per column and
-	// are where the write time goes, the compressor above all, so they run across
-	// columns at once. A column's result is written in order afterwards, which
-	// keeps the bytes identical to a serial write: no encoder sees another
-	// column's data.
+	// are where the write time goes, the compressor above all. Each column splits
+	// into blocks and compresses them across cores, and a table wider than the
+	// machine has cores still runs no more compressors at once than there are. A
+	// column's result is written in order afterwards, which keeps the bytes
+	// identical to a serial write: no encoder sees another column's data.
 	chunks := encodeColumns(typed, w.schema)
 
 	for i := range columns {
@@ -137,9 +147,8 @@ func (w *Writer) AddRowGroup(columns [][]any) error {
 }
 
 // encodeColumns picks a layout for each column and encodes and compresses it,
-// returning one chunk per column. Encoding one column touches no other, so the
-// work is spread across cores; a table wider than the machine has cores still
-// runs no more encoders at once than there are.
+// returning one chunk per column. Encoding one column touches no other, and
+// neither does compressing one block of it, so both spread across cores.
 func encodeColumns(typed []any, schema []ColumnSchema) []ColumnChunk {
 	chunks := make([]ColumnChunk, len(typed))
 	var wg sync.WaitGroup
@@ -156,13 +165,11 @@ func encodeColumns(typed []any, schema []ColumnSchema) []ColumnChunk {
 			// winning layout round tripped successfully inside the experiment, so
 			// encoding it again cannot fail.
 			encoded, _ := encodeWith(best.Encoding, typed[i], schema[i].Type)
-			// best.Compress is one of the codecs Compress implements.
-			compressed, _ := Compress(encoded, best.Compress)
 			chunks[i] = ColumnChunk{
 				Encoding:  best.Encoding,
 				Compress:  best.Compress,
 				RawLength: uint32(len(encoded)),
-				Data:      compressed,
+				Blocks:    splitBlocks(encoded, best.Compress),
 			}
 		}(i)
 	}

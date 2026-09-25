@@ -38,6 +38,21 @@ func NewReader(r io.ReadSeeker) (*Reader, error) {
 	if end < 8 {
 		return nil, fmt.Errorf("keine: file is %d bytes, too small to contain a footer", end)
 	}
+
+	lead := make([]byte, len(magic)+1)
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("keine: cannot seek to start of file: %w", err)
+	}
+	if _, err := io.ReadFull(r, lead); err != nil {
+		return nil, fmt.Errorf("keine: cannot read the leading magic: %w", err)
+	}
+	if string(lead[:len(magic)]) != magic {
+		return nil, fmt.Errorf("keine: leading magic %q is not %q", lead[:len(magic)], magic)
+	}
+	if version := lead[len(magic)]; version != formatVersion {
+		return nil, fmt.Errorf("keine: file is format version %d, this build reads version %d", version, formatVersion)
+	}
+
 	if _, err := r.Seek(end-8, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("keine: cannot seek to footer: %w", err)
 	}
@@ -163,11 +178,15 @@ type readResult struct {
 
 // decodeColumns decompresses and decodes each job outside the results slice,
 // which lets the caller keep reading chunks while the previous ones are still
-// being worked on. The decompressed bytes are the largest thing a read
-// allocates, so every goroutine returns its buffer to the pool it took it from.
-// The pool lives on the Reader, so it keeps one buffer per column across row
-// groups and grows to the widest one; after the first row group the decompress
-// allocates nothing.
+// being worked on. A column's blocks decompress into one buffer the size of the
+// column, each into its own region of it, so reassembly is placement rather than
+// a copy; decoding waits for them and then runs in parallel too. The pool lives
+// on the Reader, so it keeps one buffer per column across row groups and grows
+// to the widest one; after the first row group the decompress allocates nothing.
+//
+// The semaphore is taken around a goroutine's own work and released before it
+// waits on anything, so a column waiting for its blocks never occupies a slot
+// another block needs.
 func (rd *Reader) decodeColumns(jobs []readJob, results []readResult) {
 	schema := rd.footer.Schema
 	var wg sync.WaitGroup
@@ -176,18 +195,36 @@ func (rd *Reader) decodeColumns(jobs []readJob, results []readResult) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
 			j := jobs[i]
 			sch := schema[j.ci]
 			meta := j.rg.Columns[j.ci]
 
-			buf := sizedBuffer(j.chunk.RawLength, rd.buffers.Get().([]byte))
-			raw, err := decompressInto(buf[:0], j.chunk.Data, j.chunk.Compress)
-			if err != nil {
-				results[i].err = fmt.Errorf("keine: decompressing column %d (%s): %w", j.ci, sch.Name, err)
-				return
+			raw := sizedBuffer(j.chunk.RawLength, rd.buffers.Get().([]byte))[:j.chunk.RawLength]
+			blockErrs := make([]error, len(j.chunk.Blocks))
+
+			var blockWg sync.WaitGroup
+			off := uint32(0)
+			for k, blk := range j.chunk.Blocks {
+				k, blk, at := k, blk, off
+				off += blk.RawLength
+				blockWg.Add(1)
+				go func() {
+					defer blockWg.Done()
+					sem <- struct{}{}
+					defer func() { <-sem }()
+					if err := decompressBlock(raw, at, blk, j.chunk.Compress); err != nil {
+						blockErrs[k] = err
+					}
+				}()
+			}
+			blockWg.Wait()
+
+			for k, err := range blockErrs {
+				if err != nil {
+					results[i].err = fmt.Errorf("keine: decompressing column %d (%s), block %d: %w", j.ci, sch.Name, k, err)
+					rd.buffers.Put(raw[:0])
+					return
+				}
 			}
 
 			// Only the non-null values were encoded.
@@ -195,15 +232,19 @@ func (rd *Reader) decodeColumns(jobs []readJob, results []readResult) {
 			if len(j.chunk.NullBitmap) > 0 {
 				numValues -= int(meta.NullCount)
 			}
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			typed, err := decodeTyped(j.chunk.Encoding, raw, numValues, sch.Type)
 			if err != nil {
 				results[i].err = fmt.Errorf("keine: decoding column %d (%s): %w", j.ci, sch.Name, err)
+				rd.buffers.Put(raw[:0])
 				return
 			}
 
 			vals, err := boxColumn(typed, j.chunk.Encoding, sch.Type)
 			if err != nil {
 				results[i].err = err
+				rd.buffers.Put(raw[:0])
 				return
 			}
 			if len(j.chunk.NullBitmap) > 0 {
@@ -212,7 +253,7 @@ func (rd *Reader) decodeColumns(jobs []readJob, results []readResult) {
 			// Nothing the caller gets back points into raw: strings and byte
 			// slices are copied out of it as they are decoded. Put it back
 			// afterwards rather than before, since decoding reads it.
-			rd.buffers.Put(raw)
+			rd.buffers.Put(raw[:0])
 			results[i].vals = vals
 		}(i)
 	}
@@ -307,7 +348,7 @@ func (rd *Reader) readColumn(start int64, rg RowGroupMeta, ci int) (typed any, n
 		return nil, nil, fmt.Errorf("keine: reading column %d (%s): %w", ci, rd.footer.Schema[ci].Name, err)
 	}
 
-	raw, err := decompressInto(sizedBuffer(chunk.RawLength, rd.raw), chunk.Data, chunk.Compress)
+	raw, err := readBlocks(sizedBuffer(chunk.RawLength, rd.raw), chunk)
 	if err != nil {
 		return nil, nil, fmt.Errorf("keine: decompressing column %d (%s): %w", ci, rd.footer.Schema[ci].Name, err)
 	}
@@ -327,6 +368,39 @@ func (rd *Reader) readColumn(start int64, rg RowGroupMeta, ci int) (typed any, n
 		nulls = DecodeBitmap(chunk.NullBitmap, int(rg.NumRows))
 	}
 	return typed, nulls, nil
+}
+
+// readBlocks reassembles chunk's encoded stream into buf, which must be at least
+// RawLength bytes wide. This is the single column path, so the blocks are done in
+// order: one column has nothing to run them alongside.
+func readBlocks(buf []byte, chunk ColumnChunk) ([]byte, error) {
+	raw := buf[:chunk.RawLength]
+	off := uint32(0)
+	for _, blk := range chunk.Blocks {
+		if err := decompressBlock(raw, off, blk, chunk.Compress); err != nil {
+			return nil, err
+		}
+		off += blk.RawLength
+	}
+	return raw, nil
+}
+
+// decompressBlock decompresses blk into its region of raw, which is the bytes at
+// off for blk.RawLength. A block whose contents do not land where its header
+// says is an error rather than a silent shortening of the column: the region
+// stays zeroed and the length check catches the result that grew elsewhere.
+func decompressBlock(raw []byte, off uint32, blk ColumnBlock, codec uint8) error {
+	if uint64(off)+uint64(blk.RawLength) > uint64(len(raw)) {
+		return fmt.Errorf("block wants %d bytes at offset %d, the column holds %d", blk.RawLength, off, len(raw))
+	}
+	out, err := decompressInto(raw[off:off:off+blk.RawLength], blk.Data, codec)
+	if err != nil {
+		return err
+	}
+	if uint32(len(out)) != blk.RawLength {
+		return fmt.Errorf("decompressed to %d bytes, header says %d", len(out), blk.RawLength)
+	}
+	return nil
 }
 
 // readChunk seeks to one column chunk, reads its recorded byte length into

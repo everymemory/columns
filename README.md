@@ -12,6 +12,7 @@ both by measuring the alternatives on the data itself.
 
 ```
 "KEIN"
+format version     1 byte
 row group 0
     column chunk
     column chunk
@@ -31,8 +32,13 @@ compress            1 byte
 null bitmap length  uint32
 raw data length     uint32
 data length         uint32
+block count         uint32
+block raw lengths   uint32 per block
+block lengths       uint32 per block
 null bitmap
-data
+block 0
+block 1
+...
 ```
 
 The footer holds the schema and the metadata for every row group: each column's
@@ -41,9 +47,17 @@ is encoded with `encoding/gob`. The footer comes last and carries its own length
 so a reader opens a file with one seek to the end and then jumps straight to any
 column of any row group.
 
-The chunk carries its decompressed length as well as its stored length, so a
-reader sizes its buffer once instead of growing it into shape. That field is
-redundant with the footer's byte length only when the codec is none.
+A column's encoded bytes are split into blocks of at most 256KB and each block is
+compressed on its own, so decompression is work that can run in parallel within a
+column rather than one serial stream per column. Blocks are byte ranges of the
+encoded stream rather than ranges of values, so concatenating the decompressed
+blocks gives the encoder's exact output and no encoder or decoder has to know the
+split happened. A column shorter than a block stays a single block.
+
+The chunk carries its total decompressed length, and each block its own, so a
+reader sizes its buffer once and each block lands in its own region of it rather
+than being appended into place. That field is redundant with the footer's byte
+length only when the codec is none.
 
 ## Types and encodings
 
@@ -160,12 +174,18 @@ returns an error and `ReadRowGroup` reads those.
 
 ## Status
 
-v0.1.0. The format is stable enough to write and read real data, but it is not a
+v0.2.0. The format is stable enough to write and read real data, but it is not a
 production storage engine. There is no schema evolution, no concurrency control,
 and no way to append to an existing file. Round-trip tests cover every type,
-encoding and codec, and the layout experiment is exercised against columns chosen
-to favour each one. The writer is deterministic: two writes of the same values
-produce the same bytes, which a golden file test pins.
+encoding and codec, columns long enough to span several blocks, and the layout
+experiment is exercised against columns chosen to favour each one. The writer is
+deterministic: two writes of the same values produce the same bytes, which a
+golden file test pins.
+
+The byte after the leading magic is the format version, currently 1. A reader that
+meets another version refuses the file rather than misreading it, so a layout
+change is a clean break. Files written by v0.1.0 have no version byte and will be
+refused.
 
 ## Benchmarks
 
@@ -179,9 +199,9 @@ Xeon X5687 with `go test -bench=BenchmarkComparison -count=3`:
 
 ```
 BenchmarkComparison
-    14.75 bytes/row
-    write    110 ms   27 MB/s
-    read      35 ms   83 MB/s
+    15.07 bytes/row
+    write    89 ms   33 MB/s
+    read     27 ms  113 MB/s
 ```
 
 `BenchmarkExperiment` is the layout choice cost the writer pays per column.
@@ -215,10 +235,12 @@ five is where it still loses.
 ## Where the time goes
 
 Encoding and compressing a column touches no other, so the writer runs them
-across columns at once and writes each result in order, which keeps the bytes
-identical to a serial write. The reader splits the same way: chunk bytes come
-through one shared file handle serially, and decompression and decoding run
-across columns. That is what closed most of the read gap.
+across blocks and columns at once and writes each result in order, which keeps the
+bytes identical to a serial write. The reader splits the same way: chunk bytes
+come through one shared file handle serially, and each block's decompression and
+each column's decoding run across cores. A five-column read on a 16-core machine
+used to occupy five cores; the same read now fans out to about twenty blocks and
+fills the machine, which took the comparison file's read from 34ms to 27ms.
 
 What is left of the write gap is `compress/flate`. The standard library ships no
 zstd, so there is no faster codec to reach for, only a slower setting to stop
@@ -228,31 +250,34 @@ pseudo-random float64 column compresses 2.81x at level 6 in 200ms and 2.69x at
 level 3 in 35ms, and the near-distinct string column compresses 5.62x in 82ms and
 5.44x in 43ms. The last three levels buy four hundredths of a ratio for six times
 the time. Writing at level 3 costs about nine percent of the file size and halves
-the write, which is why the table above is 9.07 bytes/row rather than 9.06.
+the write.
 
 Parquet pays nothing to choose a layout: its encodings are compiled in. keine
 measures them per column, on a sample, and that measurement is inside the write
-time above, about 38ms of the 132ms. It is what buys the size advantage over a
-format with a better compressor.
+time above, about 38ms of the 132ms the one-off comparison measured. It is what
+buys the size advantage over a format with a better compressor.
 
-Reading all five columns is still behind, and the profile says why: flate
-decompression is 43% of that read and GC is another 25%. The decoding itself is no
-longer the cost it was. Boxing every value into an interface used to allocate a
-copy of each one; a column now shares one backing array instead, so a 10000-value
-int64 column reads with 10 allocations rather than 10010 and takes about half the
-time. Strings got the same treatment: a dictionary column converts each distinct
-entry once and shares those headers across every value that repeats it, and a
-plain string column's values are slices of one buffer rather than a copy each.
-That took the comparison file's read from 134ms to 32ms and its allocations from
-403000 to 3500.
+The read profile after the block split is roughly a third DEFLATE, a fifth GC and
+a seventh decoding. The decoding is no longer the cost it was: boxing every value
+into an interface used to allocate a copy of each one, and a column now shares one
+backing array instead, so a 10000-value int64 column reads with 10 allocations
+rather than 10010. Strings got the same treatment, and that change alone took the
+comparison file's read from 134ms to 32ms and its allocations from 403000 to 3500.
 
-What is left is DEFLATE itself, and it costs unevenly. The same 1.6MB decompresses
+The block split costs about two percent of the file size, since each of a column's
+DEFLATE streams carries its own Huffman table instead of one for the column, and
+buys the 34ms to 27ms read. Larger blocks measured a slightly smaller file and no
+faster a read: at five columns the reader runs out of work before it runs out of
+cores.
+
+The remainder is DEFLATE itself, and it costs unevenly. The same 1.6MB decompresses
 in 0.43ms for a column of near-monotonic deltas and in 10ms for a column of
 low-entropy floats, a 25x spread from entropy alone, independent of buffer
-management. The two slow columns are the whole remaining gap, so no amount of
-buffer pooling closes it; a faster codec would.
+management. That is why the comparison file's slow columns dominate: 8 of its 15
+bytes per row are a pseudo-random int64 column no encoding and no codec shrinks,
+and removing the float column entirely would save about seven percent of read time.
+Closing the rest is a codec question, not a parallelism one.
 
 The typed read path exists for the case where the schema is known and a query
-touches few columns. `ReadColumn` reads three integer columns in 32ms where the
-boxed path takes longer for the same work, because it skips the interface boxing
-`ReadRowGroup` pays for a uniform return type.
+touches few columns. `ReadColumn` reads an integer column without the interface
+boxing `ReadRowGroup` pays for a uniform return type.

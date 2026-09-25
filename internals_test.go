@@ -58,9 +58,10 @@ func TestWriteChunkErrors(t *testing.T) {
 		Encoding:   EncPlain,
 		Compress:   CompressNone,
 		NullBitmap: []byte{1},
-		Data:       []byte{1, 2, 3, 4},
+		RawLength:  4,
+		Blocks:     []ColumnBlock{{RawLength: 4, Data: []byte{1, 2, 3, 4}}},
 	}
-	for n := 0; n < 7; n++ {
+	for n := 0; n < 4; n++ {
 		if err := WriteChunk(&failAfter{n: n}, chunk); err == nil {
 			t.Errorf("WriteChunk with a writer failing after %d writes: want error, got nil", n)
 		}
@@ -69,11 +70,14 @@ func TestWriteChunkErrors(t *testing.T) {
 
 func TestReadChunkTruncated(t *testing.T) {
 	full := []byte{byte(EncPlain), byte(CompressNone)}
-	full = binary.LittleEndian.AppendUint32(full, 2)
-	full = binary.LittleEndian.AppendUint32(full, 4)
-	full = binary.LittleEndian.AppendUint32(full, 4)
-	full = append(full, 0x01, 0x02)
-	full = append(full, 0xAA, 0xBB, 0xCC, 0xDD)
+	full = binary.LittleEndian.AppendUint32(full, 2) // null bitmap length
+	full = binary.LittleEndian.AppendUint32(full, 4) // raw length
+	full = binary.LittleEndian.AppendUint32(full, 4) // stored length
+	full = binary.LittleEndian.AppendUint32(full, 1) // block count
+	full = binary.LittleEndian.AppendUint32(full, 4) // block raw length
+	full = binary.LittleEndian.AppendUint32(full, 4) // block stored length
+	full = append(full, 0x01, 0x02)                  // null bitmap
+	full = append(full, 0xAA, 0xBB, 0xCC, 0xDD)      // block
 
 	for cut := 0; cut < len(full); cut++ {
 		if _, err := ReadChunk(bytes.NewReader(full[:cut])); err == nil {
@@ -82,6 +86,75 @@ func TestReadChunkTruncated(t *testing.T) {
 	}
 	if _, err := ReadChunk(bytes.NewReader(full)); err != nil {
 		t.Errorf("ReadChunk of a complete chunk: %v", err)
+	}
+}
+
+// TestReadChunkLyingHeader covers the chunk a corrupt or hostile file describes:
+// its block table asks for more bytes than the chunk has, and for a raw length
+// the blocks cannot match. Both have to fail rather than read past the chunk or
+// hand the decoder a column that is part zeros.
+func TestReadChunkLyingHeader(t *testing.T) {
+	encode := func(raw, stored, blockRaw, blockStored uint32) []byte {
+		b := []byte{byte(EncPlain), byte(CompressNone)}
+		b = binary.LittleEndian.AppendUint32(b, 0)
+		b = binary.LittleEndian.AppendUint32(b, raw)
+		b = binary.LittleEndian.AppendUint32(b, stored)
+		b = binary.LittleEndian.AppendUint32(b, 1)
+		b = binary.LittleEndian.AppendUint32(b, blockRaw)
+		b = binary.LittleEndian.AppendUint32(b, blockStored)
+		b = append(b, 0xAA, 0xBB, 0xCC, 0xDD)
+		return b
+	}
+	for _, c := range []struct {
+		name                       string
+		raw, stored, bRaw, bStored uint32
+	}{
+		{"block past the chunk", 4, 4, 4, 8},
+		{"blocks hold more than the header", 4, 8, 4, 4},
+		{"raw length short of the block", 2, 4, 4, 4},
+	} {
+		if _, err := ReadChunk(bytes.NewReader(encode(c.raw, c.stored, c.bRaw, c.bStored))); err == nil {
+			t.Errorf("%s: ReadChunk: want error, got nil", c.name)
+		}
+		chunk := ColumnChunk{}
+		if err := parseChunk(encode(c.raw, c.stored, c.bRaw, c.bStored), &chunk); err == nil {
+			t.Errorf("%s: parseChunk: want error, got nil", c.name)
+		}
+	}
+
+	// A chunk that declares no blocks is malformed, not an empty column.
+	noBlocks := []byte{byte(EncPlain), byte(CompressNone), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	if _, err := ReadChunk(bytes.NewReader(noBlocks)); err == nil {
+		t.Error("ReadChunk with no blocks: want error, got nil")
+	}
+	if err := parseChunk(noBlocks, &ColumnChunk{}); err == nil {
+		t.Error("parseChunk with no blocks: want error, got nil")
+	}
+}
+
+// TestDecompressBlock covers the two guards a well-formed file never trips: a
+// block that runs past the column's buffer, and one that decompresses to
+// something other than its recorded length. Both have to fail rather than leave
+// the decoder reading part of a column.
+func TestDecompressBlock(t *testing.T) {
+	raw := make([]byte, 8)
+
+	past := ColumnBlock{RawLength: 4, Data: []byte{1, 2, 3, 4}}
+	if err := decompressBlock(raw, 6, past, CompressNone); err == nil {
+		t.Error("decompressBlock past the buffer: want error, got nil")
+	}
+	short := ColumnBlock{RawLength: 4, Data: []byte{1, 2}}
+	if err := decompressBlock(raw, 0, short, CompressNone); err == nil {
+		t.Error("decompressBlock of a block shorter than its raw length: want error, got nil")
+	}
+	long := ColumnBlock{RawLength: 2, Data: []byte{1, 2, 3, 4}}
+	if err := decompressBlock(raw, 0, long, CompressNone); err == nil {
+		t.Error("decompressBlock of a block longer than its raw length: want error, got nil")
+	}
+
+	fits := ColumnBlock{RawLength: 4, Data: []byte{1, 2, 3, 4}}
+	if err := decompressBlock(raw, 4, fits, CompressNone); err != nil {
+		t.Errorf("decompressBlock of a fitting block: %v", err)
 	}
 }
 
@@ -911,6 +984,12 @@ func TestWriterErrors(t *testing.T) {
 		t.Error("Close after a failed magic write: want error, got nil")
 	}
 
+	// The format version is the write after it, and fails the same way.
+	w = NewWriter(&failAfter{n: 1}, schema)
+	if err := w.AddRowGroup([][]any{{true, false}}); err == nil {
+		t.Error("AddRowGroup after a failed version write: want error, got nil")
+	}
+
 	w = NewWriter(io.Discard, schema)
 	if err := w.AddRowGroup([][]any{{true}, {false}}); err == nil {
 		t.Error("AddRowGroup with the wrong column count: want error, got nil")
@@ -935,14 +1014,16 @@ func TestWriterErrors(t *testing.T) {
 		t.Error("AddRowGroup of values that break statistics: want error, got nil")
 	}
 
-	// The underlying writer fails partway through the chunk.
-	w = NewWriter(&failAfter{n: 1}, schema)
+	// The underlying writer fails partway through the chunk. NewWriter has
+	// written the magic and the version, so the chunk header is the third write.
+	w = NewWriter(&failAfter{n: 2}, schema)
 	if err := w.AddRowGroup([][]any{{true, false}}); err == nil {
 		t.Error("AddRowGroup with a failing writer: want error, got nil")
 	}
 
-	// Close failing at each of its three writes.
-	for n := 1; n <= 3; n++ {
+	// Close failing at each of its three writes. NewWriter has already written the
+	// magic and the format version, so Close's are the third, fourth and fifth.
+	for n := 2; n <= 4; n++ {
 		w := NewWriter(&failAfter{n: n}, nil)
 		if err := w.AddRowGroup(nil); err != nil {
 			t.Fatalf("AddRowGroup of an empty row group: %v", err)
@@ -1007,6 +1088,9 @@ func craftChunk(enc, codec uint8, bitmap, data []byte) []byte {
 	b = binary.LittleEndian.AppendUint32(b, uint32(len(bitmap)))
 	b = binary.LittleEndian.AppendUint32(b, uint32(len(data)))
 	b = binary.LittleEndian.AppendUint32(b, uint32(len(data)))
+	b = binary.LittleEndian.AppendUint32(b, 1) // one block holding the data
+	b = binary.LittleEndian.AppendUint32(b, uint32(len(data)))
+	b = binary.LittleEndian.AppendUint32(b, uint32(len(data)))
 	b = append(b, bitmap...)
 	b = append(b, data...)
 	return b
@@ -1016,12 +1100,13 @@ func craftChunk(enc, codec uint8, bitmap, data []byte) []byte {
 func craftFile(chunk []byte, meta ColMeta, schema []ColumnSchema, numRows uint32) []byte {
 	var f []byte
 	f = append(f, magic...)
+	f = append(f, formatVersion)
 	f = append(f, chunk...)
 	fb := encodeFooter(Footer{
 		Schema: schema,
 		RowGroups: []RowGroupMeta{{
 			NumRows:    numRows,
-			ByteOffset: int64(len(magic)),
+			ByteOffset: int64(len(magic) + 1),
 			Columns:    []ColMeta{meta},
 		}},
 	})
@@ -1186,6 +1271,46 @@ func TestAffixTruncated(t *testing.T) {
 	}
 }
 
+// TestZeroRowGroup writes and reads a row group with no rows at all. Every
+// column's encoded stream is empty, so a chunk is one empty block and the reader
+// reassembles nothing.
+func TestZeroRowGroup(t *testing.T) {
+	schema := []ColumnSchema{
+		{Name: "i", Type: TypeInt64},
+		{Name: "s", Type: TypeString},
+		{Name: "b", Type: TypeBytes, Nullable: true},
+	}
+	var buf bytes.Buffer
+	w := NewWriter(&buf, schema)
+	if err := w.AddRowGroup([][]any{{}, {}, {}}); err != nil {
+		t.Fatalf("AddRowGroup of zero rows: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	r, err := NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	got, err := r.ReadRowGroup(0, []int{0, 1, 2})
+	if err != nil {
+		t.Fatalf("ReadRowGroup of zero rows: %v", err)
+	}
+	for i, col := range got {
+		if len(col) != 0 {
+			t.Errorf("column %d of a zero row group: got %d values, want 0", i, len(col))
+		}
+	}
+
+	// The typed path reads the same empty column.
+	if ints, err := ReadColumn[int64](r, 0, 0); err != nil {
+		t.Errorf("ReadColumn of a zero row group: %v", err)
+	} else if len(ints) != 0 {
+		t.Errorf("ReadColumn of a zero row group: got %d values, want 0", len(ints))
+	}
+}
+
 // Empty strings are a column the writer and reader both have to handle: a
 // decoder that points a string at its buffer takes the address of a zero length
 // slice for one, which used to panic.
@@ -1283,6 +1408,7 @@ func TestReaderErrors(t *testing.T) {
 	}
 
 	badMagic := []byte(magic)
+	badMagic = append(badMagic, formatVersion)
 	badMagic = append(badMagic, 0, 0, 0, 0)
 	badMagic = append(badMagic, "XXXX"...)
 	if _, err := NewReader(bytes.NewReader(badMagic)); err == nil {
@@ -1290,10 +1416,35 @@ func TestReaderErrors(t *testing.T) {
 	}
 
 	tooLong := []byte(magic)
+	tooLong = append(tooLong, formatVersion)
 	tooLong = append(tooLong, 0xFF, 0, 0, 0)
 	tooLong = append(tooLong, magic...)
 	if _, err := NewReader(bytes.NewReader(tooLong)); err == nil {
 		t.Error("NewReader with a footer length beyond the file: want error, got nil")
+	}
+
+	// The magic is right but the byte after it is not, which is what a file from
+	// another version of this format looks like.
+	wrongVersion := craftFile(chunk, meta, schema, 2)
+	wrongVersion[len(magic)] = formatVersion + 1
+	if _, err := NewReader(bytes.NewReader(wrongVersion)); err == nil {
+		t.Error("NewReader of a later format version: want error, got nil")
+	}
+	corruptLead := craftFile(chunk, meta, schema, 2)
+	corruptLead[0] = 'X'
+	if _, err := NewReader(bytes.NewReader(corruptLead)); err == nil {
+		t.Error("NewReader with a bad leading magic: want error, got nil")
+	}
+
+	// The footer length is honest but the bytes behind it are not a footer, so
+	// decoding them has to fail rather than yield a schema.
+	badFooter := []byte(magic)
+	badFooter = append(badFooter, formatVersion)
+	badFooter = append(badFooter, 0xDE, 0xAD, 0xBE, 0xEF)
+	badFooter = binary.LittleEndian.AppendUint32(badFooter, 4)
+	badFooter = append(badFooter, magic...)
+	if _, err := NewReader(bytes.NewReader(badFooter)); err == nil {
+		t.Error("NewReader with an undecodable footer: want error, got nil")
 	}
 
 	corrupt := []byte(magic)
@@ -1358,7 +1509,9 @@ func TestReaderErrors(t *testing.T) {
 		t.Error("ReadRowGroup of a chunk shorter than recorded: want error, got nil")
 	}
 
-	for _, n := range []int{1, 2, 3} {
+	// NewReader performs four seeks and four reads: to the end, back to the start
+	// for the magic and version, to the trailer and to the footer.
+	for _, n := range []int{1, 2, 3, 4} {
 		if _, err := NewReader(&flakyReadSeeker{r: bytes.NewReader(good), failSeek: n}); err == nil {
 			t.Errorf("NewReader with a seek failing at call %d: want error, got nil", n)
 		}
@@ -1367,7 +1520,7 @@ func TestReaderErrors(t *testing.T) {
 		}
 	}
 
-	r, err = NewReader(&flakyReadSeeker{r: bytes.NewReader(good), failSeek: 4})
+	r, err = NewReader(&flakyReadSeeker{r: bytes.NewReader(good), failSeek: 5})
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
@@ -1417,9 +1570,10 @@ func TestReadRowGroupReadFail(t *testing.T) {
 	meta := ColMeta{ByteLength: int64(len(chunk)), Encoding: EncPlain, Compress: CompressNone}
 	file := craftFile(chunk, meta, schema, 2)
 
-	// The footer costs three reads: the length, the trailing magic and the
-	// footer itself, so the fourth is the first byte of the chunk.
-	r, err := NewReader(&flakyReadSeeker{r: bytes.NewReader(file), failRead: 4})
+	// The footer costs four reads: the leading magic and version, the length, the
+	// trailing magic and the footer itself, so the fifth is the first byte of the
+	// chunk.
+	r, err := NewReader(&flakyReadSeeker{r: bytes.NewReader(file), failRead: len(magic) + 1})
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}

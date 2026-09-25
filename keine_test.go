@@ -353,9 +353,10 @@ func TestRowGroupMeta(t *testing.T) {
 	if rg.NumRows != 4 {
 		t.Errorf("NumRows = %d, want 4", rg.NumRows)
 	}
-	// The file starts with the magic header, so the row group follows it.
-	if rg.ByteOffset != 4 {
-		t.Errorf("ByteOffset = %d, want 4", rg.ByteOffset)
+	// The file starts with the magic and the format version, so the row group
+	// follows them.
+	if rg.ByteOffset != int64(len(magic)+1) {
+		t.Errorf("ByteOffset = %d, want %d", rg.ByteOffset, len(magic)+1)
 	}
 	if len(rg.Columns) != 2 {
 		t.Fatalf("got %d columns, want 2", len(rg.Columns))
@@ -529,7 +530,8 @@ func TestReadColumnSeekFail(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	r, err := NewReader(&flakyReadSeeker{r: bytes.NewReader(buf.Bytes()), failSeek: 4})
+	// NewReader performs four seeks, so the fifth is ReadColumn's seek to the chunk.
+	r, err := NewReader(&flakyReadSeeker{r: bytes.NewReader(buf.Bytes()), failSeek: 5})
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
@@ -596,6 +598,58 @@ func TestReadColumnNullableSchemaDense(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, []int64{1, 2, 3}) {
 		t.Errorf("ReadColumn = %v, want [1 2 3]", got)
+	}
+}
+
+// TestMultiBlockRoundTrip covers columns long enough to split into several
+// blocks. A block boundary is a byte offset into the encoded stream, so the
+// values a decoder reassembles have to be identical to the ones written, and a
+// column has to round trip through both read paths when it spans blocks.
+func TestMultiBlockRoundTrip(t *testing.T) {
+	// Enough values for a little over two blocks at eight bytes each, so the
+	// last block is short and the first two are full.
+	const rows = 2*blockSize/8 + 1000
+
+	ints := make([]any, rows)
+	strs := make([]any, rows)
+	for i := range ints {
+		ints[i] = int64(i*31 + 7)
+		strs[i] = fmt.Sprintf("value-%d", i)
+	}
+	schema := []ColumnSchema{
+		{Name: "i", Type: TypeInt64},
+		{Name: "s", Type: TypeString},
+	}
+
+	var buf bytes.Buffer
+	w := NewWriter(&buf, schema)
+	if err := w.AddRowGroup([][]any{ints, strs}); err != nil {
+		t.Fatalf("AddRowGroup: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	r, err := NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	if got, err := r.ReadRowGroup(0, []int{0}); err != nil {
+		t.Fatalf("ReadRowGroup: %v", err)
+	} else if !reflect.DeepEqual(got[0], ints) {
+		t.Errorf("int64 column spanning blocks round tripped to %d values, want %d", len(got[0]), rows)
+	}
+
+	// The string column, and the typed read path, exercise the same blocks.
+	if got, err := r.ReadRowGroup(0, []int{1}); err != nil {
+		t.Fatalf("ReadRowGroup of the string column: %v", err)
+	} else if !reflect.DeepEqual(got[0], strs) {
+		t.Errorf("string column spanning blocks round tripped to %d values, want %d", len(got[0]), rows)
+	}
+	if got, err := ReadColumn[int64](r, 0, 0); err != nil {
+		t.Fatalf("ReadColumn: %v", err)
+	} else if len(got) != rows {
+		t.Errorf("ReadColumn of a multi block column: got %d values, want %d", len(got), rows)
 	}
 }
 
