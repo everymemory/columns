@@ -9,10 +9,39 @@ import (
 	"unsafe"
 )
 
+// dest is the reusable destination for one column's decoded values. Fixed width
+// types need only vals: a decoder writes its result into it rather than
+// allocating one, so a column that repeats costs no allocation after the first
+// read. Strings and byte slices are slices of buf rather than a copy each, so
+// they need that too, and a dictionary column unpacks its indices into idx.
+//
+// The values a decoder returns alias these buffers, so a path that reuses them
+// hands them out only for as long as it can guarantee the caller is finished
+// with them. The boxing paths pass a fresh dest and let the caller keep what it
+// was given.
+type dest struct {
+	vals any
+	buf  []byte
+	idx  []uint32
+}
+
+// sizedSlice returns n elements, reusing have's capacity when it is already that
+// wide. A decoder that writes into its result instead of allocating one is what
+// keeps a repeating column free after its first read. A column of no values
+// still gets an empty slice rather than a nil one, because that is what it was
+// given before the buffers were reused and a caller comparing with
+// reflect.DeepEqual can tell them apart.
+func sizedSlice[T any](have []T, n int) []T {
+	if have != nil && cap(have) >= n {
+		return have[:n]
+	}
+	return make([]T, n)
+}
+
 // DecodePlain is the inverse of EncodePlain. typ is required because the bytes
 // alone do not say how many values they hold.
 func DecodePlain(b []byte, typ uint8) ([]any, error) {
-	typed, err := decodePlainTyped(b, typ)
+	typed, err := decodePlainTyped(b, typ, &dest{})
 	if err != nil {
 		return nil, err
 	}
@@ -22,40 +51,47 @@ func DecodePlain(b []byte, typ uint8) ([]any, error) {
 // decodePlainTyped decodes plain data into a slice of the Go type for typ, []int64
 // for TypeInt64 and so on, rather than []any. DecodePlain boxes it, and the typed
 // reader uses it to skip the boxing altogether.
-func decodePlainTyped(b []byte, typ uint8) (any, error) {
+func decodePlainTyped(b []byte, typ uint8, d *dest) (any, error) {
 	switch typ {
 	case TypeBool:
-		out := make([]bool, len(b))
+		out, _ := d.vals.([]bool)
+		out = sizedSlice(out, len(b))
+		d.vals = out
 		for i, c := range b {
 			out[i] = c != 0
 		}
 		return out, nil
 	case TypeInt8:
-		out := make([]int8, len(b))
+		out, _ := d.vals.([]int8)
+		out = sizedSlice(out, len(b))
+		d.vals = out
 		for i, c := range b {
 			out[i] = int8(c)
 		}
 		return out, nil
 	case TypeInt16:
-		return decodeFixedT(b, 2, func(s []byte) int16 { return int16(binary.LittleEndian.Uint16(s)) })
+		return decodeFixedT(b, 2, func(s []byte) int16 { return int16(binary.LittleEndian.Uint16(s)) }, d)
 	case TypeInt32:
-		return decodeFixedT(b, 4, func(s []byte) int32 { return int32(binary.LittleEndian.Uint32(s)) })
+		return decodeFixedT(b, 4, func(s []byte) int32 { return int32(binary.LittleEndian.Uint32(s)) }, d)
 	case TypeInt64:
-		return decodeFixedT(b, 8, func(s []byte) int64 { return int64(binary.LittleEndian.Uint64(s)) })
+		return decodeFixedT(b, 8, func(s []byte) int64 { return int64(binary.LittleEndian.Uint64(s)) }, d)
 	case TypeUint8:
-		return append([]uint8(nil), b...), nil
+		out, _ := d.vals.([]uint8)
+		out = append(out[:0], b...)
+		d.vals = out
+		return out, nil
 	case TypeUint16:
-		return decodeFixedT(b, 2, func(s []byte) uint16 { return binary.LittleEndian.Uint16(s) })
+		return decodeFixedT(b, 2, func(s []byte) uint16 { return binary.LittleEndian.Uint16(s) }, d)
 	case TypeUint32:
-		return decodeFixedT(b, 4, func(s []byte) uint32 { return binary.LittleEndian.Uint32(s) })
+		return decodeFixedT(b, 4, func(s []byte) uint32 { return binary.LittleEndian.Uint32(s) }, d)
 	case TypeUint64:
-		return decodeFixedT(b, 8, func(s []byte) uint64 { return binary.LittleEndian.Uint64(s) })
+		return decodeFixedT(b, 8, func(s []byte) uint64 { return binary.LittleEndian.Uint64(s) }, d)
 	case TypeFloat32:
-		return decodeFixedT(b, 4, func(s []byte) float32 { return math.Float32frombits(binary.LittleEndian.Uint32(s)) })
+		return decodeFixedT(b, 4, func(s []byte) float32 { return math.Float32frombits(binary.LittleEndian.Uint32(s)) }, d)
 	case TypeFloat64:
-		return decodeFixedT(b, 8, func(s []byte) float64 { return math.Float64frombits(binary.LittleEndian.Uint64(s)) })
+		return decodeFixedT(b, 8, func(s []byte) float64 { return math.Float64frombits(binary.LittleEndian.Uint64(s)) }, d)
 	case TypeString, TypeBytes:
-		return decodePlainVarlen(b, typ)
+		return decodePlainVarlen(b, typ, d)
 	default:
 		return nil, fmt.Errorf("keine: unknown type %d", typ)
 	}
@@ -68,7 +104,7 @@ func decodePlainTyped(b []byte, typ uint8) (any, error) {
 // column from allocating once per value. Byte slices still get their own copy
 // each, because they are mutable and a caller writing one would otherwise
 // clobber its neighbours.
-func decodePlainVarlen(b []byte, typ uint8) (any, error) {
+func decodePlainVarlen(b []byte, typ uint8, d *dest) (any, error) {
 	nvals, total, ok := varlenStats(b)
 	if !ok {
 		return nil, fmt.Errorf("keine: plain data truncated at value %d", nvals)
@@ -78,8 +114,11 @@ func decodePlainVarlen(b []byte, typ uint8) (any, error) {
 		// One buffer holds every value's bytes and each string points into it.
 		// Strings are immutable, so sharing the buffer cannot corrupt a value,
 		// and N distinct strings cost two allocations instead of N+1.
-		text := make([]byte, total)
-		out := make([]string, nvals)
+		text := sizedSlice(d.buf, total)
+		d.buf = text
+		out, _ := d.vals.([]string)
+		out = sizedSlice(out, nvals)
+		d.vals = out
 		var off int
 		for i := 0; i < nvals; i++ {
 			n := int(binary.LittleEndian.Uint32(b[:4]))
@@ -92,7 +131,9 @@ func decodePlainVarlen(b []byte, typ uint8) (any, error) {
 		return out, nil
 	}
 
-	out := make([][]byte, nvals)
+	out, _ := d.vals.([][]byte)
+	out = sizedSlice(out, nvals)
+	d.vals = out
 	for i := 0; i < nvals; i++ {
 		n := int(binary.LittleEndian.Uint32(b[:4]))
 		b = b[4:]
@@ -106,16 +147,6 @@ func decodePlainVarlen(b []byte, typ uint8) (any, error) {
 // of values and how many bytes they occupy in total. Both are needed to size
 // the result and its backing buffer before any value is placed. When the chunk
 // is truncated, nvals is the index of the value it happened at.
-// stringAt is the string at b[off:off+n] without copying it. A zero length
-// string is empty and taking the address of an empty slice's first element
-// panics, so that case does not go near it.
-func stringAt(b []byte, off, n int) string {
-	if n == 0 {
-		return ""
-	}
-	return unsafe.String(&b[off], n)
-}
-
 func varlenStats(b []byte) (nvals, total int, ok bool) {
 	for len(b) > 0 {
 		if len(b) < 4 {
@@ -133,11 +164,23 @@ func varlenStats(b []byte) (nvals, total int, ok bool) {
 	return nvals, total, true
 }
 
-func decodeFixedT[T any](b []byte, width int, convert func([]byte) T) ([]T, error) {
+// stringAt is the string at b[off:off+n] without copying it. A zero length
+// string is empty and taking the address of an empty slice's first element
+// panics, so that case does not go near it.
+func stringAt(b []byte, off, n int) string {
+	if n == 0 {
+		return ""
+	}
+	return unsafe.String(&b[off], n)
+}
+
+func decodeFixedT[T any](b []byte, width int, convert func([]byte) T, d *dest) ([]T, error) {
 	if len(b)%width != 0 {
 		return nil, fmt.Errorf("keine: plain data length %d is not a multiple of %d", len(b), width)
 	}
-	out := make([]T, len(b)/width)
+	out, _ := d.vals.([]T)
+	out = sizedSlice(out, len(b)/width)
+	d.vals = out
 	for i := range out {
 		out[i] = convert(b[i*width : (i+1)*width])
 	}
@@ -146,7 +189,17 @@ func decodeFixedT[T any](b []byte, width int, convert func([]byte) T) ([]T, erro
 
 // DecodeRLEBitpack is the inverse of EncodeRLEBitpack. It unpacks n values.
 func DecodeRLEBitpack(b []byte, n int) []bool {
-	out := make([]bool, n)
+	return decodeRLEBitpack(b, n, &dest{})
+}
+
+// decodeRLEBitpack is DecodeRLEBitpack writing into d. The bitmap only sets the
+// true bits, so a reused destination has to be cleared first: the bits a
+// previous read left set are indistinguishable from ones this one wrote.
+func decodeRLEBitpack(b []byte, n int, d *dest) []bool {
+	out, _ := d.vals.([]bool)
+	out = sizedSlice(out, n)
+	d.vals = out
+	clear(out)
 	for i := 0; i < n; i++ {
 		if i/8 >= len(b) {
 			break
@@ -160,24 +213,34 @@ func DecodeRLEBitpack(b []byte, n int) []bool {
 
 // DecodeDelta is the inverse of EncodeDelta.
 func DecodeDelta(b []byte) ([]int64, error) {
+	return decodeDelta(b, &dest{})
+}
+
+func decodeDelta(b []byte, d *dest) ([]int64, error) {
 	if len(b)%8 != 0 {
 		return nil, fmt.Errorf("keine: delta data length %d is not a multiple of 8", len(b))
 	}
-	out := make([]int64, len(b)/8)
+	out, _ := d.vals.([]int64)
+	out = sizedSlice(out, len(b)/8)
+	d.vals = out
 	var prev int64
 	for i := 0; i < len(out); i++ {
-		d := int64(binary.LittleEndian.Uint64(b[i*8:]))
+		diff := int64(binary.LittleEndian.Uint64(b[i*8:]))
 		if i > 0 {
-			d += prev
+			diff += prev
 		}
-		out[i] = d
-		prev = d
+		out[i] = diff
+		prev = diff
 	}
 	return out, nil
 }
 
 // DecodeOffsetBytes is the inverse of EncodeOffsetBytes.
 func DecodeOffsetBytes(b []byte) ([][]byte, error) {
+	return decodeOffsetBytes(b, &dest{})
+}
+
+func decodeOffsetBytes(b []byte, d *dest) ([][]byte, error) {
 	if len(b) < 4 {
 		return nil, fmt.Errorf("keine: offset bytes data truncated")
 	}
@@ -186,17 +249,19 @@ func DecodeOffsetBytes(b []byte) ([][]byte, error) {
 	if len(b) < hdr {
 		return nil, fmt.Errorf("keine: offset bytes header truncated")
 	}
-	offsets := make([]int, n)
-	for i := 0; i < n; i++ {
-		offsets[i] = int(binary.LittleEndian.Uint32(b[4+4*i:]))
-	}
+	// An offset is read where it is used rather than unpacked ahead of the
+	// values, which is one slice a column long that nobody keeps.
+	at := func(i int) int { return int(binary.LittleEndian.Uint32(b[4+4*i:])) }
 	raw := b[hdr:]
-	out := make([][]byte, n)
+
+	out, _ := d.vals.([][]byte)
+	out = sizedSlice(out, n)
+	d.vals = out
 	for i := 0; i < n; i++ {
-		start := offsets[i]
+		start := at(i)
 		end := len(raw)
 		if i+1 < n {
-			end = offsets[i+1]
+			end = at(i + 1)
 		}
 		if start < 0 || end < start || end > len(raw) {
 			return nil, fmt.Errorf("keine: invalid offset %d in offset bytes data", start)
@@ -213,6 +278,10 @@ func DecodeOffsetBytes(b []byte) ([][]byte, error) {
 // their own copy, because a caller writing one would otherwise clobber its
 // neighbours.
 func DecodeAffix(b []byte, typ uint8) (any, error) {
+	return decodeAffix(b, typ, &dest{})
+}
+
+func decodeAffix(b []byte, typ uint8, d *dest) (any, error) {
 	if len(b) < 8 {
 		return nil, fmt.Errorf("keine: affix data is %d bytes, too small for a header", len(b))
 	}
@@ -238,8 +307,11 @@ func DecodeAffix(b []byte, typ uint8) (any, error) {
 
 	if typ == TypeString {
 		size := nvals*(len(pre)+len(suf)) + total
-		text := make([]byte, size)
-		out := make([]string, nvals)
+		text := sizedSlice(d.buf, size)
+		d.buf = text
+		out, _ := d.vals.([]string)
+		out = sizedSlice(out, nvals)
+		d.vals = out
 		off := 0
 		for i := 0; i < nvals; i++ {
 			n := int(binary.LittleEndian.Uint32(b[:4]))
@@ -255,7 +327,9 @@ func DecodeAffix(b []byte, typ uint8) (any, error) {
 		return out, nil
 	}
 
-	out := make([][]byte, nvals)
+	out, _ := d.vals.([][]byte)
+	out = sizedSlice(out, nvals)
+	d.vals = out
 	for i := 0; i < nvals; i++ {
 		n := int(binary.LittleEndian.Uint32(b[:4]))
 		b = b[4:]
@@ -274,7 +348,7 @@ func DecodeAffix(b []byte, typ uint8) (any, error) {
 // they were keyed on; a reader that knows the column's type decodes them through
 // the typed path instead.
 func DecodeDict(b []byte) ([][]byte, error) {
-	vals, err := decodeDictTyped(b, TypeBytes)
+	vals, err := decodeDictTyped(b, TypeBytes, &dest{})
 	if err != nil {
 		return nil, err
 	}
@@ -286,7 +360,7 @@ func DecodeDict(b []byte) ([][]byte, error) {
 // bytes for strings and byte slices, so a fixed width type's entries are laid
 // out in value order and decoded as one plain column, and the strings a string
 // column converts are the distinct entries rather than one per value.
-func decodeDictTyped(b []byte, typ uint8) (any, error) {
+func decodeDictTyped(b []byte, typ uint8, d *dest) (any, error) {
 	if len(b) < 12 {
 		return nil, fmt.Errorf("keine: dict data truncated")
 	}
@@ -297,9 +371,11 @@ func decodeDictTyped(b []byte, typ uint8) (any, error) {
 	if len(b) < 12+idxBytes {
 		return nil, fmt.Errorf("keine: dict indices truncated")
 	}
-	indices := bitunpack(b[12:12+idxBytes], nvals, uint(nbits))
+	indices := decodeBitunpack(b[12:12+idxBytes], nvals, uint(nbits), d)
 
-	entries, err := DecodeOffsetBytes(b[12+idxBytes:])
+	// The entries are the dictionary's own values, which a caller of this chunk
+	// never sees, so they are decoded into a destination of their own.
+	entries, err := decodeOffsetBytes(b[12+idxBytes:], &dest{})
 	if err != nil {
 		return nil, err
 	}
@@ -316,16 +392,18 @@ func decodeDictTyped(b []byte, typ uint8) (any, error) {
 			for i, e := range entries {
 				dict[i] = string(e)
 			}
-			return indexDict(dict, indices)
+			return indexDict(dict, indices, d)
 		}
-		return indexDict(entries, indices)
+		return indexDict(entries, indices, d)
 	}
-	return fixedDictEntries(entries, indices, typ)
+	return fixedDictEntries(entries, indices, typ, d)
 }
 
 // indexDict maps each index to its entry.
-func indexDict[T any](dict []T, indices []uint32) ([]T, error) {
-	out := make([]T, len(indices))
+func indexDict[T any](dict []T, indices []uint32, d *dest) ([]T, error) {
+	out, _ := d.vals.([]T)
+	out = sizedSlice(out, len(indices))
+	d.vals = out
 	for i, idx := range indices {
 		if int(idx) >= len(dict) {
 			return nil, fmt.Errorf("keine: dict index %d out of range", idx)
@@ -339,9 +417,13 @@ func indexDict[T any](dict []T, indices []uint32) ([]T, error) {
 // chunk decodes as one plain column of the declared type. An entry that is not
 // exactly that wide is a file disagreeing with its own schema, and reading it
 // stops rather than letting a short entry shift every value after it.
-func fixedDictEntries(entries [][]byte, indices []uint32, typ uint8) (any, error) {
+func fixedDictEntries(entries [][]byte, indices []uint32, typ uint8, d *dest) (any, error) {
 	width := fixedWidth(typ)
-	flat := make([]byte, len(indices)*width)
+	// The flat stream is the plain column this chunk decodes as, and the buffer
+	// is the one a string column would have used; a fixed width column never
+	// needs both in one decode.
+	flat := sizedSlice(d.buf, len(indices)*width)
+	d.buf = flat
 	off := 0
 	for _, idx := range indices {
 		if int(idx) >= len(entries) {
@@ -354,7 +436,7 @@ func fixedDictEntries(entries [][]byte, indices []uint32, typ uint8) (any, error
 		copy(flat[off:off+width], e)
 		off += width
 	}
-	return decodePlainTyped(flat, typ)
+	return decodePlainTyped(flat, typ, d)
 }
 
 // fixedWidth is the encoded width of a fixed width type, and zero for the types
@@ -379,7 +461,16 @@ func fixedWidth(typ uint8) int {
 // more than nbits + 7 bits, which fits in a uint64 for every width a uint32
 // index can need, so one path handles all of them.
 func bitunpack(b []byte, n int, nbits uint) []uint32 {
-	out := make([]uint32, n)
+	return decodeBitunpack(b, n, nbits, &dest{})
+}
+
+// decodeBitunpack is bitunpack writing into d. Every index is zero when the
+// values were all the dictionary's first entry, which is the early return, so a
+// reused destination is cleared first the same way the bitmap path is.
+func decodeBitunpack(b []byte, n int, nbits uint, d *dest) []uint32 {
+	out := sizedSlice(d.idx, n)
+	d.idx = out
+	clear(out)
 	if nbits == 0 {
 		return out
 	}
@@ -400,21 +491,23 @@ func bitunpack(b []byte, n int, nbits uint) []uint32 {
 
 // decodeTyped dispatches a chunk to the decoder for enc and returns the values
 // as a slice of the Go type that decoder produces, []int64 from EncDelta and
-// []string from EncDict. n is the number of values in the chunk.
-func decodeTyped(enc uint8, data []byte, n int, typ uint8) (any, error) {
+// []string from EncDict. n is the number of values in the chunk. d is the
+// destination the decoders write into; pass a fresh one when the caller keeps
+// the result, since every value it gets back points into it.
+func decodeTyped(enc uint8, data []byte, n int, typ uint8, d *dest) (any, error) {
 	switch enc {
 	case EncPlain:
-		return decodePlainTyped(data, typ)
+		return decodePlainTyped(data, typ, d)
 	case EncRLEBitpack:
-		return DecodeRLEBitpack(data, n), nil
+		return decodeRLEBitpack(data, n, d), nil
 	case EncDelta:
-		return DecodeDelta(data)
+		return decodeDelta(data, d)
 	case EncDict:
-		return decodeDictTyped(data, typ)
+		return decodeDictTyped(data, typ, d)
 	case EncAffix:
-		return DecodeAffix(data, typ)
+		return decodeAffix(data, typ, d)
 	case EncOffsetBytes:
-		return DecodeOffsetBytes(data)
+		return decodeOffsetBytes(data, d)
 	default:
 		return nil, fmt.Errorf("keine: unknown encoding %d", enc)
 	}
@@ -445,7 +538,7 @@ func encProducesType(enc, typ uint8) bool {
 // decodeWith dispatches data to the decoder for enc, then converts the values
 // to the Go types implied by typ. n is the number of values in the chunk.
 func decodeWith(enc uint8, data []byte, n int, typ uint8) ([]any, error) {
-	typed, err := decodeTyped(enc, data, n, typ)
+	typed, err := decodeTyped(enc, data, n, typ, &dest{})
 	if err != nil {
 		return nil, err
 	}

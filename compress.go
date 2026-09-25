@@ -8,6 +8,7 @@ import (
 	"compress/zlib"
 	"fmt"
 	"io"
+	"sync"
 )
 
 // flateLevel is the DEFLATE level used by the flate, gzip and zlib codecs. It is
@@ -29,6 +30,20 @@ const (
 	lzwOrder = lzw.LSB
 	lzwWidth = 8
 )
+
+// flateReaders recycles a DEFLATE decompressor between blocks. The decompressor
+// owns the sliding window and the huffman scratch, which is where most of a
+// read's memory goes once the decoders stopped allocating; a column of a few
+// hundred blocks would build and drop that many of them otherwise. Reset is
+// what makes one reusable, and it discards the previous block's state
+// entirely, so a reader taken from the pool is indistinguishable from a new
+// one.
+//
+// Gzip and zlib validate their checksums when the reader closes, so a pooled
+// one would have to be closed before it is reused rather than reset in place;
+// the flate codec is what the writer picks, and the other two are rare enough
+// that they still allocate.
+var flateReaders sync.Pool
 
 // Compress applies codec to data. CompressNone returns data unchanged.
 func Compress(data []byte, codec uint8) ([]byte, error) {
@@ -98,9 +113,19 @@ func decompressInto(dst, data []byte, codec uint8) ([]byte, error) {
 	case CompressNone:
 		return append(dst, data...), nil
 	case CompressFlate:
-		r := flate.NewReader(bytes.NewReader(data))
-		defer r.Close()
-		return readAllInto(dst, r)
+		r, _ := flateReaders.Get().(io.ReadCloser)
+		if r == nil {
+			r = flate.NewReader(bytes.NewReader(nil))
+		}
+		// Reset reads nothing, so it cannot fail for a decompressor of this
+		// codec. Whatever reports otherwise is not a reader to hand back to the
+		// next block.
+		if err := r.(flate.Resetter).Reset(bytes.NewReader(data), nil); err != nil {
+			return nil, err
+		}
+		out, err := readAllInto(dst, r)
+		flateReaders.Put(r)
+		return out, err
 	case CompressGzip:
 		r, err := gzip.NewReader(bytes.NewReader(data))
 		if err != nil {

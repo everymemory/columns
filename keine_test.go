@@ -888,18 +888,216 @@ func TestMultiBlockRoundTrip(t *testing.T) {
 	}
 }
 
+// TestReadRowGroupScopedReused reads the same columns over and over. The scoped
+// path decodes into destinations the Reader keeps, so a second read writes over
+// the first's values, and a decoder that only writes some of its elements would
+// leave the previous read's behind for the caller to see. The encodings that do
+// that are the ones with a zero or a run-length form: a bitmap, bit packed
+// indices and a dictionary whose values are all one entry.
+func TestReadRowGroupScopedReused(t *testing.T) {
+	schema := []ColumnSchema{
+		{Name: "b", Type: TypeBool},
+		{Name: "i", Type: TypeInt64},
+		{Name: "s", Type: TypeString},
+	}
+	allFalse := make([]any, rowsPerGroup)
+	for i := range allFalse {
+		allFalse[i] = false
+	}
+	ints := make([]any, rowsPerGroup)
+	for i := range ints {
+		ints[i] = int64(i)
+	}
+	strs := make([]any, rowsPerGroup)
+	for i := range strs {
+		strs[i] = "same"
+	}
+
+	var buf bytes.Buffer
+	w := NewWriter(&buf, schema)
+	if err := w.AddRowGroup([][]any{allFalse, ints, strs}); err != nil {
+		t.Fatalf("AddRowGroup: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	r, err := NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+
+	// read returns the columns it asked for and copies them out of the Reader's
+	// buffers, so the values survive the next call. The whole point of the copy
+	// is that nothing else does.
+	read := func(cols []int) ([][]any, error) {
+		got := make([][]any, len(cols))
+		err := r.ReadRowGroupScoped(0, cols, func(c *Columns) error {
+			for k := range cols {
+				if c.errs[k] != nil {
+					return c.errs[k]
+				}
+				got[k] = boxValues(c.typed[k])
+			}
+			return nil
+		})
+		return got, err
+	}
+
+	want := [][]any{allFalse, ints, strs}
+	for pass := 0; pass < 3; pass++ {
+		got, err := read([]int{0, 1, 2})
+		if err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		for k := range want {
+			if !reflect.DeepEqual(got[k], want[k]) {
+				t.Errorf("pass %d, column %d: got %v, want %d values", pass, k, got[k], len(want[k]))
+			}
+		}
+	}
+
+	// A narrower read reuses only the first destinations and leaves the rest
+	// holding the wide read's values, so a later wide read has to overwrite all
+	// of them rather than the few it shares an index with.
+	if _, err := read([]int{0}); err != nil {
+		t.Fatalf("narrow read: %v", err)
+	}
+	got, err := read([]int{0, 1, 2})
+	if err != nil {
+		t.Fatalf("wide read after a narrow one: %v", err)
+	}
+	for k := range want {
+		if !reflect.DeepEqual(got[k], want[k]) {
+			t.Errorf("after a narrow read, column %d: got %v, want %d values", k, got[k], len(want[k]))
+		}
+	}
+
+	// A boxed read and a typed read on the same Reader mix destinations of their
+	// own with the shared ones, and have to come out right in either order.
+	boxed, err := r.ReadRowGroup(0, []int{1})
+	if err != nil {
+		t.Fatalf("ReadRowGroup: %v", err)
+	}
+	if !reflect.DeepEqual(boxed[0], ints) {
+		t.Errorf("ReadRowGroup after scoped reads: got %d values, want %d", len(boxed[0]), rowsPerGroup)
+	}
+	typed, err := read([]int{1})
+	if err != nil {
+		t.Fatalf("scoped read after ReadRowGroup: %v", err)
+	}
+	if !reflect.DeepEqual(typed[0], ints) {
+		t.Errorf("scoped read after ReadRowGroup: got %d values, want %d", len(typed[0]), rowsPerGroup)
+	}
+}
+
+// TestReadRowGroupScopedAcrossRowGroups reads two row groups through one
+// Reader. The destinations and the decompression buffers are the Reader's and
+// are shared between the groups, so the second group's values have to land in
+// buffers the first group filled. The second group is deliberately the neutral
+// one for the encodings that only write some of their elements, which is where
+// leftovers would show.
+func TestReadRowGroupScopedAcrossRowGroups(t *testing.T) {
+	schema := []ColumnSchema{
+		{Name: "b", Type: TypeBool},
+		{Name: "s", Type: TypeString},
+	}
+	trues := make([]any, rowsPerGroup)
+	distinct := make([]any, rowsPerGroup)
+	for i := range trues {
+		trues[i] = true
+		distinct[i] = fmt.Sprintf("value-%d", i)
+	}
+	falses := make([]any, rowsPerGroup)
+	sames := make([]any, rowsPerGroup)
+	for i := range falses {
+		falses[i] = false
+		sames[i] = "same"
+	}
+
+	var buf bytes.Buffer
+	w := NewWriter(&buf, schema)
+	if err := w.AddRowGroup([][]any{trues, distinct}); err != nil {
+		t.Fatalf("AddRowGroup of the first group: %v", err)
+	}
+	if err := w.AddRowGroup([][]any{falses, sames}); err != nil {
+		t.Fatalf("AddRowGroup of the second group: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	r, err := NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	if r.RowGroupCount() != 2 {
+		t.Fatalf("file has %d row groups, want 2", r.RowGroupCount())
+	}
+
+	// The first group fills the destinations, the second has to overwrite all of
+	// it. Reading the first group twice also covers a repeat using the same
+	// buffers the first read left behind.
+	for i := 0; i < 2; i++ {
+		if err := r.ReadRowGroupScoped(0, []int{0, 1}, func(c *Columns) error {
+			bools, err := Column[bool](c, 0)
+			if err != nil {
+				return err
+			}
+			strs, err := Column[string](c, 1)
+			if err != nil {
+				return err
+			}
+			for k := range bools {
+				if !bools[k] {
+					return fmt.Errorf("bools[%d] = false, want true", k)
+				}
+				if strs[k] != distinct[k] {
+					return fmt.Errorf("strings[%d] = %q, want %q", k, strs[k], distinct[k])
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("reading the first group, pass %d: %v", i, err)
+		}
+	}
+
+	err = r.ReadRowGroupScoped(1, []int{0, 1}, func(c *Columns) error {
+		bools, err := Column[bool](c, 0)
+		if err != nil {
+			return err
+		}
+		strs, err := Column[string](c, 1)
+		if err != nil {
+			return err
+		}
+		for k := range bools {
+			if bools[k] {
+				return fmt.Errorf("bools[%d] = true, want false; the bitmap was not cleared", k)
+			}
+			if strs[k] != "same" {
+				return fmt.Errorf("strings[%d] = %q, want %q", k, strs[k], "same")
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Errorf("reading the second group after the first: %v", err)
+	}
+}
+
 func TestTypedDecodeErrors(t *testing.T) {
-	if _, err := decodePlainTyped([]byte{0x01}, TypeBytes); err == nil {
+	if _, err := decodePlainTyped([]byte{0x01}, TypeBytes, &dest{}); err == nil {
 		t.Error("decodePlainTyped with a truncated byte length prefix: want error, got nil")
 	}
 	prefix := []byte{0xff, 0xff, 0xff, 0xff}
-	if _, err := decodePlainTyped(append(prefix, 1, 2), TypeBytes); err == nil {
+	if _, err := decodePlainTyped(append(prefix, 1, 2), TypeBytes, &dest{}); err == nil {
 		t.Error("decodePlainTyped with a byte length beyond the data: want error, got nil")
 	}
-	if _, err := decodePlainTyped(nil, 0xFF); err == nil {
+	if _, err := decodePlainTyped(nil, 0xFF, &dest{}); err == nil {
 		t.Error("decodePlainTyped with an unknown type: want error, got nil")
 	}
-	if _, err := decodeTyped(0xFF, nil, 0, TypeInt64); err == nil {
+	if _, err := decodeTyped(0xFF, nil, 0, TypeInt64, &dest{}); err == nil {
 		t.Error("decodeTyped with an unknown encoding: want error, got nil")
 	}
 	if got, ok := asValues[int64](nil); ok {

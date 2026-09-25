@@ -25,6 +25,14 @@ type Reader struct {
 	raw      []byte
 	chunkbuf []byte
 	rawbufs  [][]byte
+
+	// dests holds one reusable decode destination per column of the row group the
+	// scoped path is reading. Nothing that path hands a caller points anywhere but
+	// into its own column's destination, and it hands them out only for the
+	// duration of its callback, so they can be reused rather than collected. The
+	// other read paths hand out values the caller keeps, so they decode into a
+	// fresh destination every time.
+	dests []*dest
 }
 
 // NewReader reads the footer of a file written by Writer. The file must end
@@ -131,7 +139,13 @@ func (rd *Reader) ReadRowGroup(index int, colIndexes []int) ([][]any, error) {
 		return nil, err
 	}
 
-	typed, errs := rd.decodeJobs(jobs)
+	// The caller keeps what it is given, so every column decodes into a
+	// destination of its own rather than into one the next read reuses.
+	dests := make([]*dest, len(jobs))
+	for i := range dests {
+		dests[i] = &dest{}
+	}
+	typed, errs := rd.decodeJobs(jobs, dests)
 	for k, t := range typed {
 		if errs[k] != nil {
 			return nil, errs[k]
@@ -181,7 +195,10 @@ func (rd *Reader) ReadRowGroupScoped(index int, cols []int, fn func(*Columns) er
 		return err
 	}
 
-	typed, errs := rd.decodeJobs(jobs)
+	for len(rd.dests) < len(jobs) {
+		rd.dests = append(rd.dests, &dest{})
+	}
+	typed, errs := rd.decodeJobs(jobs, rd.dests[:len(jobs)])
 	return fn(&Columns{rd: rd, rg: rg, cols: cols, typed: typed, errs: errs})
 }
 
@@ -289,14 +306,15 @@ func (rd *Reader) readJobs(rg RowGroupMeta, colIndexes []int) ([]readJob, error)
 // would have been cleared at the next collection, and this read path allocates
 // enough per call that the pool missed more often than it hit.
 //
+// dests supplies each job's decode destination. A caller that keeps the values it
+// was given passes a fresh one per job, since every value a decoder returns
+// points into its destination; the scoped path hands the same destinations back
+// every read, which is what makes its second and later reads allocate nothing.
+//
 // The semaphore is taken around a goroutine's own work and released before it
 // waits on anything, so a column waiting for its blocks never occupies a slot
 // another block needs.
-//
-// Nothing a decoder returns points into the decompression buffer: fixed width
-// values are copied out of it, and strings point into a slab the decoder built
-// for them. The buffer goes back to the Reader as soon as its column is decoded.
-func (rd *Reader) decodeJobs(jobs []readJob) ([]any, []error) {
+func (rd *Reader) decodeJobs(jobs []readJob, dests []*dest) ([]any, []error) {
 	schema := rd.footer.Schema
 	typed := make([]any, len(jobs))
 	errs := make([]error, len(jobs))
@@ -345,7 +363,7 @@ func (rd *Reader) decodeJobs(jobs []readJob) ([]any, []error) {
 			}
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			t, err := decodeTyped(j.chunk.Encoding, raw, numValues, sch.Type)
+			t, err := decodeTyped(j.chunk.Encoding, raw, numValues, sch.Type, dests[i])
 			if err != nil {
 				errs[i] = fmt.Errorf("keine: decoding column %d (%s): %w", j.ci, sch.Name, err)
 				rd.rawbufs[i] = raw[:0]
@@ -458,7 +476,7 @@ func (rd *Reader) readColumn(start int64, rg RowGroupMeta, ci int) (typed any, n
 	if len(chunk.NullBitmap) > 0 {
 		numValues -= int(rg.Columns[ci].NullCount)
 	}
-	typed, err = decodeTyped(chunk.Encoding, raw, numValues, rd.footer.Schema[ci].Type)
+	typed, err = decodeTyped(chunk.Encoding, raw, numValues, rd.footer.Schema[ci].Type, &dest{})
 	if err != nil {
 		return nil, nil, fmt.Errorf("keine: decoding column %d (%s): %w", ci, rd.footer.Schema[ci].Name, err)
 	}

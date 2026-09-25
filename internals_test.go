@@ -230,6 +230,28 @@ func TestCompressCodecs(t *testing.T) {
 	}
 }
 
+// TestPooledFlateReaderResetError reaches the one failure a pooled decompressor
+// can report. A flate reader never fails a reset, so the reader in the pool has
+// to be one that does: decompressInto has to hand the error on and keep that
+// reader out of the pool, where it would poison every read after it.
+func TestPooledFlateReaderResetError(t *testing.T) {
+	flateReaders.Put(&failingResetReader{})
+	if _, err := decompressInto(nil, []byte{1, 2, 3}, CompressFlate); err == nil {
+		t.Error("decompressInto with a reader that cannot reset: want error, got nil")
+	}
+	if got, ok := flateReaders.Get().(*failingResetReader); ok {
+		t.Errorf("the reader that failed to reset went back into the pool: %v", got)
+	}
+}
+
+type failingResetReader struct{}
+
+func (failingResetReader) Read([]byte) (int, error) { return 0, io.EOF }
+func (failingResetReader) Close() error             { return nil }
+func (failingResetReader) Reset(io.Reader, []byte) error {
+	return fmt.Errorf("keine test: reset refused")
+}
+
 // TestCompressStreamErrors reaches each write failure inside compressStream.
 // Collecting into a failing writer is what makes those branches observable.
 // Each codec buffers and flushes on its own schedule, so the sweep tries every
@@ -481,7 +503,7 @@ func TestDictTypedRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: EncodeDict: %v", c.name, err)
 		}
-		got, err := decodeDictTyped(encoded, c.typ)
+		got, err := decodeDictTyped(encoded, c.typ, &dest{})
 		if err != nil {
 			t.Fatalf("%s: decodeDictTyped: %v", c.name, err)
 		}
@@ -537,7 +559,7 @@ func TestDictTypedErrors(t *testing.T) {
 	b = binary.LittleEndian.AppendUint32(b, 1)
 	b = append(b, 0x80)                   // indices: 1, 0
 	b = append(b, 1, 0, 0, 0, 0, 0, 0, 0) // one eight byte entry
-	if _, err := decodeDictTyped(b, TypeInt64); err == nil {
+	if _, err := decodeDictTyped(b, TypeInt64, &dest{}); err == nil {
 		t.Error("decodeDictTyped with an out of range index: want error, got nil")
 	}
 
@@ -546,7 +568,7 @@ func TestDictTypedErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := decodeDictTyped(entries, TypeInt64); err == nil {
+	if _, err := decodeDictTyped(entries, TypeInt64, &dest{}); err == nil {
 		t.Error("decodeDictTyped with entries of the wrong width: want error, got nil")
 	}
 }
@@ -560,6 +582,48 @@ func TestBitpackRoundTrip(t *testing.T) {
 	if len(bitpackIndices([]uint32{1, 2}, 0)) != 0 {
 		t.Error("bitpackIndices with zero bits should return no bytes")
 	}
+}
+
+// TestBitunpackClearsDestination covers a destination reused by two calls. The
+// first fills it with nonzero indices, the second decodes a dictionary of one
+// entry, which takes no bits per index and so writes nothing: without a clear,
+// every index is the one the previous column left behind.
+func TestBitunpackClearsDestination(t *testing.T) {
+	indices := []uint32{0, 1, 2, 3, 4, 5, 6, 7, 0, 7, 3}
+	d := &dest{}
+	got := decodeBitunpack(bitpackIndices(indices, 3), len(indices), 3, d)
+	if !reflect.DeepEqual(got, indices) {
+		t.Fatalf("bitpack round trip into a destination = %v, want %v", got, indices)
+	}
+
+	zero := make([]uint32, len(indices))
+	got = decodeBitunpack(nil, len(indices), 0, d)
+	if !reflect.DeepEqual(got, zero) {
+		t.Errorf("bitunpack of zero bits into a used destination = %v, want all zero", got)
+	}
+}
+
+// TestRLEBitpackClearsDestination is the same check for the bitmap decoder,
+// which sets only the true bits and leaves the false ones at whatever the
+// destination held.
+func TestRLEBitpackClearsDestination(t *testing.T) {
+	const n = 16
+	d := &dest{}
+	if got := decodeRLEBitpack([]byte{0xFF, 0xFF}, n, d); !allTrue(got) {
+		t.Fatalf("bitmap of all true bits = %v, want all true", got)
+	}
+	if got := decodeRLEBitpack(nil, n, d); allTrue(got) {
+		t.Errorf("bitmap of no bits into a used destination = %v, want all false", got)
+	}
+}
+
+func allTrue(b []bool) bool {
+	for _, v := range b {
+		if !v {
+			return false
+		}
+	}
+	return len(b) > 0
 }
 
 func TestCoerceBool(t *testing.T) {
