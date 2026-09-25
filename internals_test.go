@@ -158,6 +158,27 @@ func TestDecompressBlock(t *testing.T) {
 	}
 }
 
+// TestDecompressBlockTruncated reaches the read failure inside readAllInto. A
+// stream cut short fails once part of it is already placed, which is a different
+// branch from a stream that ends cleanly short of the space set aside for it, so
+// the bounds and length checks in decompressBlock do not cover it.
+func TestDecompressBlockTruncated(t *testing.T) {
+	data := bytes.Repeat([]byte{1, 2, 3, 4}, 2000)
+	compressed, err := Compress(data, CompressFlate)
+	if err != nil {
+		t.Fatalf("Compress: %v", err)
+	}
+	// Removing the tail takes the stream's terminating block with it, so the
+	// reader fails rather than reporting an early end.
+	cut := compressed[:len(compressed)/2]
+
+	region := make([]byte, len(data))
+	blk := ColumnBlock{RawLength: uint32(len(data)), Data: cut}
+	if err := decompressBlock(region, 0, blk, CompressFlate); err == nil {
+		t.Error("decompressBlock of a truncated stream: want error, got nil")
+	}
+}
+
 func TestCompressCodecs(t *testing.T) {
 	data := []byte{1, 2, 3}
 
@@ -1376,6 +1397,14 @@ func TestNarrowingReadErrors(t *testing.T) {
 	if _, err := ReadColumn[[]byte](r, 0, 0); err == nil {
 		t.Error("ReadColumn of a delta on a bytes column: want error, got nil")
 	}
+	if err := r.ReadRowGroupScoped(0, []int{0}, func(c *Columns) error {
+		if _, err := Column[[]byte](c, 0); err == nil {
+			return errors.New("Column[bytes] of a delta on a bytes column succeeded, want an error")
+		}
+		return nil
+	}); err != nil {
+		t.Errorf("ReadRowGroupScoped of a delta on a bytes column: %v", err)
+	}
 
 	// The same delta on the integer column it belongs to reads back exactly, so
 	// the failure is the declared type rather than the encoding.
@@ -1579,5 +1608,37 @@ func TestReadRowGroupReadFail(t *testing.T) {
 	}
 	if _, err := r.ReadRowGroup(0, []int{0}); err == nil {
 		t.Error("ReadRowGroup with a failing read: want error, got nil")
+	}
+
+	// The scoped path reads the same chunks, so a read that fails there has to
+	// fail too rather than handing the callback a column it cannot decode.
+	r2, err := NewReader(&flakyReadSeeker{r: bytes.NewReader(file), failRead: len(magic) + 1})
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	if err := r2.ReadRowGroupScoped(0, []int{0}, func(c *Columns) error {
+		return nil
+	}); err == nil {
+		t.Error("ReadRowGroupScoped with a failing read: want error, got nil")
+	}
+
+	// A decode that fails reaches the caller through Column rather than through
+	// the read, since that is where the column was asked for. A chunk whose data
+	// is not a whole number of values is the simplest such file.
+	short := craftChunk(EncPlain, CompressNone, nil, []byte{1, 0, 2})
+	shortFile := craftFile(short, ColMeta{ByteLength: int64(len(short)), Encoding: EncPlain, Compress: CompressNone},
+		[]ColumnSchema{{Name: "i", Type: TypeInt16}}, 2)
+	r3, err := NewReader(bytes.NewReader(shortFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = r3.ReadRowGroupScoped(0, []int{0}, func(c *Columns) error {
+		if _, err := Column[int16](c, 0); err == nil {
+			return errors.New("Column of a chunk short of a whole value succeeded, want an error")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Errorf("ReadRowGroupScoped of a short chunk: %v", err)
 	}
 }

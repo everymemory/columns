@@ -128,19 +128,33 @@ func decompressInto(dst, data []byte, codec uint8) ([]byte, error) {
 
 // readAllInto is io.ReadAll appending into dst, which it grows as needed and
 // hands back with its capacity intact.
+//
+// Growth is checked rather than assumed. Every block on the read path hands
+// this a destination sized to its exact decompressed length, so a full buffer
+// means the reader is finished, not that it ran out of room. Growing the moment
+// the buffer filled allocated a copy of the whole column once per block and
+// discarded it on the next read, which was the read path's single biggest
+// allocation. Reading into scratch once the destination is full tells the two
+// apart: nothing more to read means the result already fits, and whatever it
+// does return is placed by the append that grows.
 func readAllInto(dst []byte, r io.Reader) ([]byte, error) {
+	var scratch [4096]byte
 	for {
-		if cap(dst) == len(dst) {
-			more := cap(dst)
-			if more == 0 {
-				more = 4096
+		if cap(dst) > len(dst) {
+			n, err := r.Read(dst[len(dst):cap(dst)])
+			dst = dst[:len(dst)+n]
+			if err != nil {
+				if err == io.EOF {
+					return dst, nil
+				}
+				return dst, err
 			}
-			bigger := make([]byte, len(dst), cap(dst)+more)
-			copy(bigger, dst)
-			dst = bigger
+			continue
 		}
-		m, err := r.Read(dst[len(dst):cap(dst)])
-		dst = dst[:len(dst)+m]
+		n, err := r.Read(scratch[:])
+		if n > 0 {
+			dst = append(dst, scratch[:n]...)
+		}
 		if err != nil {
 			if err == io.EOF {
 				return dst, nil

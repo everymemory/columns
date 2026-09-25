@@ -14,22 +14,23 @@ type Reader struct {
 	footer Footer
 
 	// rgbuf holds the chunks of the row group being read, one region per column.
-	// raw is the decompressed bytes of the column being decoded on the typed
-	// path. Nothing a caller gets back points into either once decoding finishes,
-	// so both are kept for the next read instead of being collected. A Reader
-	// holds the position of its ReadSeeker and is not safe to use from multiple
-	// goroutines, so they need no synchronisation.
+	// rawbufs holds one decompression buffer per column of that row group, and raw
+	// the decompressed bytes of the column the typed path decodes. Nothing a
+	// caller gets back points into any of them once decoding finishes, so all
+	// three are kept for the next read instead of being collected. A Reader holds
+	// the position of its ReadSeeker and is not safe to use from multiple
+	// goroutines, so they need no synchronisation; each is indexed by the job that
+	// owns it, and no two jobs share an index.
 	rgbuf    []byte
 	raw      []byte
 	chunkbuf []byte
-	buffers  sync.Pool
+	rawbufs  [][]byte
 }
 
 // NewReader reads the footer of a file written by Writer. The file must end
 // with the footer, its length as a little-endian uint32, and the magic.
 func NewReader(r io.ReadSeeker) (*Reader, error) {
 	rd := &Reader{r: r}
-	rd.buffers.New = func() any { return []byte(nil) }
 
 	end, err := r.Seek(0, io.SeekEnd)
 	if err != nil {
@@ -125,40 +126,115 @@ func (rd *Reader) ReadRowGroup(index int, colIndexes []int) ([][]any, error) {
 		}
 	}
 
-	// One buffer holds every requested chunk, each in its own region, so a chunk
-	// handed to a decode goroutine needs no copy: nothing a later column reads
-	// overlaps it. The buffer stays with the Reader for the next row group.
-	total := int64(0)
-	for _, ci := range colIndexes {
-		total += rg.Columns[ci].ByteLength
-	}
-	if int64(cap(rd.rgbuf)) < total {
-		rd.rgbuf = make([]byte, total)
-	} else {
-		rd.rgbuf = rd.rgbuf[:total]
+	jobs, err := rd.readJobs(rg, colIndexes)
+	if err != nil {
+		return nil, err
 	}
 
-	jobs := make([]readJob, len(colIndexes))
-	off := 0
-	for k, ci := range colIndexes {
-		region := rd.rgbuf[off : off+int(rg.Columns[ci].ByteLength)]
-		chunk, err := rd.readChunk(startOf(rg, ci), region)
+	typed, errs := rd.decodeJobs(jobs)
+	for k, t := range typed {
+		if errs[k] != nil {
+			return nil, errs[k]
+		}
+		j := jobs[k]
+		sch := rd.footer.Schema[j.ci]
+		vals, err := boxColumn(t, j.chunk.Encoding, sch.Type)
 		if err != nil {
 			return nil, err
 		}
-		jobs[k] = readJob{chunk: chunk, rg: rg, ci: ci}
-		off += int(rg.Columns[ci].ByteLength)
-	}
-
-	results := make([]readResult, len(jobs))
-	rd.decodeColumns(jobs, results)
-	for k, res := range results {
-		if res.err != nil {
-			return nil, res.err
+		if len(j.chunk.NullBitmap) > 0 {
+			vals = expandNulls(vals, DecodeBitmap(j.chunk.NullBitmap, int(j.rg.NumRows)), int(j.rg.NumRows))
 		}
-		out[k] = res.vals
+		out[k] = vals
 	}
 
+	return out, nil
+}
+
+// ReadRowGroupScoped reads the requested columns of one row group and calls fn
+// with a view of them. The view hands back typed slices rather than []any, so no
+// value is boxed in an interface, but the slices point into buffers this Reader
+// owns and hands to its next read: fn must be finished with them before it
+// returns, because holding one past the call reads whatever the next read wrote
+// over it. The columns are decoded in parallel, same as ReadRowGroup, and only
+// the ones asked for.
+//
+// A nullable column has nowhere to put a nil in a typed slice, so it is an error
+// here and ReadRowGroup reads those.
+func (rd *Reader) ReadRowGroupScoped(index int, cols []int, fn func(*Columns) error) error {
+	rg, err := rd.RowGroupMeta(index)
+	if err != nil {
+		return err
+	}
+	for _, ci := range cols {
+		if ci < 0 || ci >= len(rg.Columns) {
+			return fmt.Errorf("keine: column index %d out of range (have %d)", ci, len(rg.Columns))
+		}
+		if rg.Columns[ci].NullCount > 0 {
+			return fmt.Errorf("keine: column %d (%s) has %d null values; the scoped path returns typed slices, which have nowhere for a nil, so ReadRowGroup reads those",
+				ci, rd.footer.Schema[ci].Name, rg.Columns[ci].NullCount)
+		}
+	}
+
+	jobs, err := rd.readJobs(rg, cols)
+	if err != nil {
+		return err
+	}
+
+	typed, errs := rd.decodeJobs(jobs)
+	return fn(&Columns{rd: rd, rg: rg, cols: cols, typed: typed, errs: errs})
+}
+
+// Columns is the view of the row group one ReadRowGroupScoped call read. Its
+// slices are valid until that call's fn returns.
+type Columns struct {
+	rd    *Reader
+	rg    RowGroupMeta
+	cols  []int
+	typed []any
+	errs  []error
+}
+
+// Column is one of the columns ReadRowGroupScoped was asked for, as a slice of
+// the column's Go type: int64 for TypeInt64, string for TypeString. i is the
+// position in the set that was requested, not the position in the schema. T must
+// match the type the column decodes to; asking for another is an error rather
+// than a silent mismatch.
+//
+// The one case that still allocates is a narrow integer column encoded with
+// Delta, whose differences decode as int64 no matter the declared width. It is
+// narrowed to the declared type, which is one slice the caller owns.
+func Column[T any](c *Columns, i int) ([]T, error) {
+	if i < 0 || i >= len(c.typed) {
+		return nil, fmt.Errorf("keine: column %d out of range (requested %d)", i, len(c.typed))
+	}
+	if c.errs[i] != nil {
+		return nil, c.errs[i]
+	}
+
+	t := c.typed[i]
+	if !encProducesType(c.rg.Columns[c.cols[i]].Encoding, c.rd.footer.Schema[c.cols[i]].Type) {
+		vals, err := canonicalColumn(boxValues(t), c.rd.footer.Schema[c.cols[i]].Type)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]T, len(vals))
+		for k, v := range vals {
+			tv, ok := v.(T)
+			if !ok {
+				return nil, fmt.Errorf("keine: column %d (%s) narrows to %T, not %T",
+					i, c.rd.footer.Schema[c.cols[i]].Name, v, *new(T))
+			}
+			out[k] = tv
+		}
+		return out, nil
+	}
+
+	out, ok := t.([]T)
+	if !ok {
+		return nil, fmt.Errorf("keine: column %d (%s) decodes to %T, not %T",
+			i, c.rd.footer.Schema[c.cols[i]].Name, t, *new(T))
+	}
 	return out, nil
 }
 
@@ -170,25 +246,60 @@ type readJob struct {
 	ci    int
 }
 
-// readResult is where a readJob's decoded values land.
-type readResult struct {
-	vals []any
-	err  error
+// readJobs reads the chunks of the requested columns into one buffer, each in
+// its own region, and parses them. One buffer holds every requested chunk so a
+// chunk handed to a decode goroutine needs no copy: nothing a later column reads
+// overlaps it. The buffer stays with the Reader for the next row group.
+func (rd *Reader) readJobs(rg RowGroupMeta, colIndexes []int) ([]readJob, error) {
+	total := int64(0)
+	for _, ci := range colIndexes {
+		total += rg.Columns[ci].ByteLength
+	}
+	if int64(cap(rd.rgbuf)) < total {
+		rd.rgbuf = make([]byte, total)
+	} else {
+		rd.rgbuf = rd.rgbuf[:total]
+	}
+
+	jobs := make([]readJob, len(colIndexes))
+	for len(rd.rawbufs) < len(jobs) {
+		rd.rawbufs = append(rd.rawbufs, nil)
+	}
+	off := 0
+	for k, ci := range colIndexes {
+		region := rd.rgbuf[off : off+int(rg.Columns[ci].ByteLength)]
+		chunk, err := rd.readChunk(startOf(rg, ci), region)
+		if err != nil {
+			return nil, err
+		}
+		jobs[k] = readJob{chunk: chunk, rg: rg, ci: ci}
+		off += int(rg.Columns[ci].ByteLength)
+	}
+	return jobs, nil
 }
 
-// decodeColumns decompresses and decodes each job outside the results slice,
-// which lets the caller keep reading chunks while the previous ones are still
-// being worked on. A column's blocks decompress into one buffer the size of the
-// column, each into its own region of it, so reassembly is placement rather than
-// a copy; decoding waits for them and then runs in parallel too. The pool lives
-// on the Reader, so it keeps one buffer per column across row groups and grows
-// to the widest one; after the first row group the decompress allocates nothing.
+// decodeJobs decompresses and decodes each job's column into a slice of its
+// declared Go type, and leaves boxing and null expansion to the caller, so a
+// caller that wants typed slices does not pay for interfaces. A column's blocks
+// decompress into one buffer the size of the column, each into its own region of
+// it, so reassembly is placement rather than a copy; decoding waits for them and
+// then runs in parallel too. Each buffer is the Reader's own and indexed by job,
+// so it survives a garbage collection and keeps the widest column it has seen:
+// after the first row group the decompression allocates nothing. A sync.Pool
+// would have been cleared at the next collection, and this read path allocates
+// enough per call that the pool missed more often than it hit.
 //
 // The semaphore is taken around a goroutine's own work and released before it
 // waits on anything, so a column waiting for its blocks never occupies a slot
 // another block needs.
-func (rd *Reader) decodeColumns(jobs []readJob, results []readResult) {
+//
+// Nothing a decoder returns points into the decompression buffer: fixed width
+// values are copied out of it, and strings point into a slab the decoder built
+// for them. The buffer goes back to the Reader as soon as its column is decoded.
+func (rd *Reader) decodeJobs(jobs []readJob) ([]any, []error) {
 	schema := rd.footer.Schema
+	typed := make([]any, len(jobs))
+	errs := make([]error, len(jobs))
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, runtime.NumCPU())
 	for i := range jobs {
@@ -199,7 +310,7 @@ func (rd *Reader) decodeColumns(jobs []readJob, results []readResult) {
 			sch := schema[j.ci]
 			meta := j.rg.Columns[j.ci]
 
-			raw := sizedBuffer(j.chunk.RawLength, rd.buffers.Get().([]byte))[:j.chunk.RawLength]
+			raw := sizedBuffer(j.chunk.RawLength, rd.rawbufs[i])[:j.chunk.RawLength]
 			blockErrs := make([]error, len(j.chunk.Blocks))
 
 			var blockWg sync.WaitGroup
@@ -221,8 +332,8 @@ func (rd *Reader) decodeColumns(jobs []readJob, results []readResult) {
 
 			for k, err := range blockErrs {
 				if err != nil {
-					results[i].err = fmt.Errorf("keine: decompressing column %d (%s), block %d: %w", j.ci, sch.Name, k, err)
-					rd.buffers.Put(raw[:0])
+					errs[i] = fmt.Errorf("keine: decompressing column %d (%s), block %d: %w", j.ci, sch.Name, k, err)
+					rd.rawbufs[i] = raw[:0]
 					return
 				}
 			}
@@ -234,30 +345,18 @@ func (rd *Reader) decodeColumns(jobs []readJob, results []readResult) {
 			}
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			typed, err := decodeTyped(j.chunk.Encoding, raw, numValues, sch.Type)
+			t, err := decodeTyped(j.chunk.Encoding, raw, numValues, sch.Type)
 			if err != nil {
-				results[i].err = fmt.Errorf("keine: decoding column %d (%s): %w", j.ci, sch.Name, err)
-				rd.buffers.Put(raw[:0])
+				errs[i] = fmt.Errorf("keine: decoding column %d (%s): %w", j.ci, sch.Name, err)
+				rd.rawbufs[i] = raw[:0]
 				return
 			}
-
-			vals, err := boxColumn(typed, j.chunk.Encoding, sch.Type)
-			if err != nil {
-				results[i].err = err
-				rd.buffers.Put(raw[:0])
-				return
-			}
-			if len(j.chunk.NullBitmap) > 0 {
-				vals = expandNulls(vals, DecodeBitmap(j.chunk.NullBitmap, int(j.rg.NumRows)), int(j.rg.NumRows))
-			}
-			// Nothing the caller gets back points into raw: strings and byte
-			// slices are copied out of it as they are decoded. Put it back
-			// afterwards rather than before, since decoding reads it.
-			rd.buffers.Put(raw[:0])
-			results[i].vals = vals
+			rd.rawbufs[i] = raw[:0]
+			typed[i] = t
 		}(i)
 	}
 	wg.Wait()
+	return typed, errs
 }
 
 // ReadColumn reads one column of one row group as a typed slice, so a TypeInt64
