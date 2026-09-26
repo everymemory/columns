@@ -254,10 +254,14 @@ On 200000 rows in 5 columns:
 
 keine is smaller than parquet at every compression level and within about a
 quarter of its write speed, and reading one column is level with it. Reading all
-five is where it still loses, and that table predates the buffer reuse, so the
-gap it shows is wider now than when it was taken; the scoped read of
-`BenchmarkComparison` is twice the speed of its boxed one on the same data. A fair
-rematch needs the parquet harness again, which is not in this repository.
+five is where the table still shows keine behind, but the two sides of that
+number are different contracts. pyarrow reads into typed columnar buffers;
+`ReadRowGroup` hands the caller owned values in interfaces, which costs 16 bytes
+a value before any decoding, and no `[]any` return can go below that. The scoped
+read is the path that matches pyarrow's — typed slices, nothing boxed — and its
+11.5 ms is under the 16 ms the table measured for parquet zstd. That is a stale
+number read across a gap, not a rematch: the harness behind it is gone, so treat
+it as a reason to rebuild the harness rather than as a result.
 
 ## Where the time goes
 
