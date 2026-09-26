@@ -98,7 +98,7 @@ func BenchmarkLayouts(col []any, schema ColumnSchema) []LayoutResult {
 	if err != nil {
 		return nil
 	}
-	return benchmarkLayoutsTyped(typed, schema)
+	return benchmarkLayoutsTyped(typed, schema, &measureScratch{})
 }
 
 // maxExperimentRows caps how many values ExperimentLayouts measures. Layout
@@ -177,25 +177,26 @@ func ExperimentLayouts(col []any, schema ColumnSchema) LayoutResult {
 	if err != nil {
 		return LayoutResult{Name: encName(EncPlain) + "+" + codecName(CompressNone), Encoding: EncPlain, Compress: CompressNone}
 	}
-	return experimentLayoutsTyped(typed, schema)
+	return experimentLayoutsTyped(typed, schema, &measureScratch{})
 }
 
 // experimentLayoutsTyped is ExperimentLayouts for an already canonical column,
 // so a writer that has already coerced the values measures them once more
-// rather than twice.
-func experimentLayoutsTyped(typed any, schema ColumnSchema) LayoutResult {
-	best, ok := rankLayouts(experimentSampleTyped(typed), schema)
+// rather than twice. ms is the buffer the measurements land in, which a column
+// keeps across the whole write.
+func experimentLayoutsTyped(typed any, schema ColumnSchema, ms *measureScratch) LayoutResult {
+	best, ok := rankLayouts(experimentSampleTyped(typed), schema, ms)
 	if !ok {
 		return LayoutResult{Name: encName(EncPlain) + "+" + codecName(CompressNone), Encoding: EncPlain, Compress: CompressNone}
 	}
 	return best
 }
 
-func benchmarkLayoutsTyped(col any, schema ColumnSchema) []LayoutResult {
+func benchmarkLayoutsTyped(col any, schema ColumnSchema, ms *measureScratch) []LayoutResult {
 	var results []LayoutResult
 	for _, enc := range layoutCandidates(schema.Type) {
 		for _, codec := range layoutCodecs {
-			r, ok := measureLayout(col, schema, enc, codec)
+			r, ok := measureLayout(col, schema, enc, codec, ms)
 			if ok {
 				results = append(results, r)
 			}
@@ -216,8 +217,9 @@ func benchmarkLayoutsTyped(col any, schema ColumnSchema) []LayoutResult {
 // only the winner is round tripped, since that is the one the writer encodes
 // again without checking. Compression is measured at flateLevel, the level the
 // file is written at, so the choice this makes and the size it reports are the
-// ones a full benchmark would have reached.
-func rankLayouts(col any, schema ColumnSchema) (LayoutResult, bool) {
+// ones a full benchmark would have reached. Each measurement lands in ms, which
+// the next one overwrites, and the only thing kept from one is its length.
+func rankLayouts(col any, schema ColumnSchema, ms *measureScratch) (LayoutResult, bool) {
 	best := LayoutResult{}
 	bestRaw := []byte(nil)
 	found := false
@@ -234,7 +236,7 @@ func rankLayouts(col any, schema ColumnSchema) (LayoutResult, bool) {
 			// Candidates arrive in the order BenchmarkLayouts sorts by, so taking
 			// a strict improvement keeps the earlier layout on a tie. A codec this
 			// build cannot serve is passed over, not reported.
-			if out, err := Compress(raw, codec); err == nil &&
+			if out, err := ms.compress(raw, codec); err == nil &&
 				(!found || len(out) < best.CompressedSize ||
 					(len(out) == best.CompressedSize && len(raw) < best.EncodedSize)) {
 				found = true
@@ -256,28 +258,29 @@ func rankLayouts(col any, schema ColumnSchema) (LayoutResult, bool) {
 
 	// Report the winner as the writer will produce it, so the decode time is the
 	// one that matters and the reader is confirmed able to read it back.
-	full, ok := measureEncoded(bestRaw, best.Encoding, best.Compress, n, schema.Type)
+	full, ok := measureEncoded(bestRaw, best.Encoding, best.Compress, n, schema.Type, ms)
 	full.EncodeNs += best.EncodeNs
 	return full, ok
 }
 
 // measureLayout measures one encoding and codec for col. It is the per-candidate
 // path BenchmarkLayouts takes.
-func measureLayout(col any, schema ColumnSchema, enc, codec uint8) (LayoutResult, bool) {
+func measureLayout(col any, schema ColumnSchema, enc, codec uint8, ms *measureScratch) (LayoutResult, bool) {
 	encoded, err := encodeWith(enc, col, schema.Type)
 	if err != nil {
 		return LayoutResult{}, false
 	}
-	return measureEncoded(encoded, enc, codec, sliceLen(col), schema.Type)
+	return measureEncoded(encoded, enc, codec, sliceLen(col), schema.Type, ms)
 }
 
 // measureEncoded measures one encoding and codec for a column already in its
 // encoded form. Every codec consumes the same bytes, so a column that is encoded
 // once can be measured against all of them through this entry point without
-// repeating the encode.
-func measureEncoded(encoded []byte, enc, codec uint8, n int, typ uint8) (LayoutResult, bool) {
+// repeating the encode. The compressed bytes are borrowed from ms for the round
+// trip only; the decompressed column they are turned back into is its own.
+func measureEncoded(encoded []byte, enc, codec uint8, n int, typ uint8, ms *measureScratch) (LayoutResult, bool) {
 	encodeStart := time.Now().UnixNano()
-	compressed, err := Compress(encoded, codec)
+	compressed, err := ms.compress(encoded, codec)
 	if err != nil {
 		return LayoutResult{}, false
 	}

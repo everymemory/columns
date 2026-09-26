@@ -45,7 +45,25 @@ const (
 // that they still allocate.
 var flateReaders sync.Pool
 
-// Compress applies codec to data. CompressNone returns data unchanged.
+// The writer pools recycle the codec machinery on the write side. A compressor
+// carries the hash table and the window, which is what a write's memory is made
+// of once the encoders stopped allocating: the layout experiment compresses a
+// column once per codec, and every block of every column after that, so a write
+// builds and drops hundreds of these. Reset makes one reusable, and none of the
+// three writes anything to its destination before the first Write call, so a
+// writer created against io.Discard and reset onto the real one produces the
+// same bytes a fresh one would.
+//
+// LZW has no Reset, so it still allocates. It never wins on real data, so the
+// experiment reaches it but the writer does not.
+var (
+	flateWriters sync.Pool
+	gzipWriters  sync.Pool
+	zlibWriters  sync.Pool
+)
+
+// Compress applies codec to data. CompressNone returns data unchanged. The
+// result is the caller's to keep.
 func Compress(data []byte, codec uint8) ([]byte, error) {
 	switch codec {
 	case CompressNone:
@@ -62,31 +80,75 @@ func Compress(data []byte, codec uint8) ([]byte, error) {
 	}
 }
 
+// measureScratch is the reusable destination for a layout measurement. The
+// experiment compresses a column once per codec and discards nearly every
+// result the moment it has measured it, so the buffer each one landed in was
+// most of a write's allocation. One stays with a column for the whole write,
+// and a column is the unit of parallelism, so nothing else reaches it.
+//
+// compress hands back a slice of that buffer, which the next call overwrites,
+// so a caller has to be finished with one result before it asks for the next.
+// The two that use it only read a length and decompress into a buffer of their
+// own, so neither keeps anything.
+type measureScratch struct {
+	buf bytes.Buffer
+}
+
+// compress is Compress into the buffer this scratch keeps. The result is
+// borrowed from it, not owned.
+func (ms *measureScratch) compress(data []byte, codec uint8) ([]byte, error) {
+	if codec == CompressNone {
+		return data, nil
+	}
+	ms.buf.Reset()
+	if err := compressStream(&ms.buf, data, codec); err != nil {
+		return nil, err
+	}
+	return ms.buf.Bytes(), nil
+}
+
 // compressStream writes the compressed form of data to w. Errors from Close are
 // reported only when Write succeeded, since a Write error is the more useful
-// one to surface. Close runs either way to release the codec's buffers.
+// one to surface. Close runs either way to flush the codec's buffers, after
+// which the writer goes back to its pool; Reset clears whatever state a failed
+// write left behind, so nothing about an erroring stream reaches the next one.
 func compressStream(w io.Writer, data []byte, codec uint8) error {
 	switch codec {
 	case CompressFlate:
-		fw, _ := flate.NewWriter(w, flateLevel)
+		fw, _ := flateWriters.Get().(*flate.Writer)
+		if fw == nil {
+			fw, _ = flate.NewWriter(io.Discard, flateLevel)
+		}
+		fw.Reset(w)
 		_, err := fw.Write(data)
 		if cerr := fw.Close(); err == nil {
 			err = cerr
 		}
+		flateWriters.Put(fw)
 		return err
 	case CompressGzip:
-		gw, _ := gzip.NewWriterLevel(w, flateLevel)
+		gw, _ := gzipWriters.Get().(*gzip.Writer)
+		if gw == nil {
+			gw, _ = gzip.NewWriterLevel(io.Discard, flateLevel)
+		}
+		gw.Reset(w)
 		_, err := gw.Write(data)
 		if cerr := gw.Close(); err == nil {
 			err = cerr
 		}
+		gzipWriters.Put(gw)
 		return err
 	case CompressZlib:
-		zw, _ := zlib.NewWriterLevel(w, flateLevel)
+		zw, _ := zlibWriters.Get().(*zlib.Writer)
+		if zw == nil {
+			zw, _ = zlib.NewWriterLevel(io.Discard, flateLevel)
+		}
+		zw.Reset(w)
 		_, err := zw.Write(data)
 		if cerr := zw.Close(); err == nil {
 			err = cerr
 		}
+		zlibWriters.Put(zw)
 		return err
 	case CompressLzw:
 		lw := lzw.NewWriter(w, lzwOrder, lzwWidth)

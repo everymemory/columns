@@ -95,11 +95,11 @@ func TestLayoutTypedInputs(t *testing.T) {
 	if got := sampleDispatch(in, 2); !reflect.DeepEqual(got, in) {
 		t.Errorf("sampleDispatch of an unsupported type = %v, want it unchanged", got)
 	}
-	if _, ok := measureLayout([]string{"x"}, ColumnSchema{Name: "b", Type: TypeBool}, EncRLEBitpack, CompressNone); ok {
+	if _, ok := measureLayout([]string{"x"}, ColumnSchema{Name: "b", Type: TypeBool}, EncRLEBitpack, CompressNone, &measureScratch{}); ok {
 		t.Error("measureLayout of a bool encoding on strings: want not ok")
 	}
 	// A type with no candidate encodings falls back to Plain+None.
-	best := experimentLayoutsTyped([]int{1, 2, 3}, ColumnSchema{Name: "x", Type: 0xFF})
+	best := experimentLayoutsTyped([]int{1, 2, 3}, ColumnSchema{Name: "x", Type: 0xFF}, &measureScratch{})
 	if best.Encoding != EncPlain || best.Compress != CompressNone {
 		t.Errorf("experimentLayoutsTyped fallback = %s, want Plain+None", best.Name)
 	}

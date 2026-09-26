@@ -27,6 +27,12 @@ type Writer struct {
 	rowGroups []RowGroupMeta
 	offset    int64
 	writeErr  error
+
+	// measure is one scratch buffer per column, for the layout experiment's
+	// compression measurements. A column is the unit of parallelism in the
+	// write below, so element i is only ever touched by column i's goroutine
+	// and needs no synchronisation.
+	measure []measureScratch
 }
 
 // NewWriter writes the leading magic and the format version. If that write
@@ -122,7 +128,12 @@ func (w *Writer) AddRowGroup(columns [][]any) error {
 	// machine has cores still runs no more compressors at once than there are. A
 	// column's result is written in order afterwards, which keeps the bytes
 	// identical to a serial write: no encoder sees another column's data.
-	chunks := encodeColumns(typed, w.schema)
+	// The schema fixes the column count for the writer's lifetime, so this
+	// grows once and later row groups reuse the same buffers.
+	if len(w.measure) < len(columns) {
+		w.measure = make([]measureScratch, len(columns))
+	}
+	chunks := encodeColumns(typed, w.schema, w.measure)
 
 	for i := range columns {
 		meta := metas[i]
@@ -149,7 +160,9 @@ func (w *Writer) AddRowGroup(columns [][]any) error {
 // encodeColumns picks a layout for each column and encodes and compresses it,
 // returning one chunk per column. Encoding one column touches no other, and
 // neither does compressing one block of it, so both spread across cores.
-func encodeColumns(typed []any, schema []ColumnSchema) []ColumnChunk {
+// measure supplies one scratch buffer per column for the layout choice, whose
+// element i belongs to column i alone.
+func encodeColumns(typed []any, schema []ColumnSchema, measure []measureScratch) []ColumnChunk {
 	chunks := make([]ColumnChunk, len(typed))
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, runtime.NumCPU())
@@ -160,7 +173,7 @@ func encodeColumns(typed []any, schema []ColumnSchema) []ColumnChunk {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			best := experimentLayoutsTyped(typed[i], schema[i])
+			best := experimentLayoutsTyped(typed[i], schema[i], &measure[i])
 			// Every value in the column has been canonicalized already, and the
 			// winning layout round tripped successfully inside the experiment, so
 			// encoding it again cannot fail.

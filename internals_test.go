@@ -1016,16 +1016,16 @@ func TestLayoutHelpers(t *testing.T) {
 		t.Errorf("ExperimentLayouts fallback = %+v, want Plain+None", best)
 	}
 
-	if _, ok := measureLayout([]any{int8(1)}, ColumnSchema{Name: "x", Type: TypeInt8}, EncPlain, CompressZstd); ok {
+	if _, ok := measureLayout([]any{int8(1)}, ColumnSchema{Name: "x", Type: TypeInt8}, EncPlain, CompressZstd, &measureScratch{}); ok {
 		t.Error("measureLayout with a codec that cannot compress: want not ok")
 	}
-	if _, ok := measureLayout([]any{int8(1)}, ColumnSchema{Name: "x", Type: TypeInt8}, EncPlain, CompressFlate); !ok {
+	if _, ok := measureLayout([]any{int8(1)}, ColumnSchema{Name: "x", Type: TypeInt8}, EncPlain, CompressFlate, &measureScratch{}); !ok {
 		t.Error("measureLayout with CompressFlate: want ok")
 	}
 	if _, err := canonicalColumnTyped([]any{struct{}{}}, TypeBool); err == nil {
 		t.Error("canonicalColumnTyped of an uncoercible value: want error, got nil")
 	}
-	if _, ok := measureLayout([]string{"x"}, ColumnSchema{Name: "x", Type: TypeBool}, EncRLEBitpack, CompressNone); ok {
+	if _, ok := measureLayout([]string{"x"}, ColumnSchema{Name: "x", Type: TypeBool}, EncRLEBitpack, CompressNone, &measureScratch{}); ok {
 		t.Error("measureLayout with a column of the wrong Go type: want not ok")
 	}
 
@@ -1033,13 +1033,13 @@ func TestLayoutHelpers(t *testing.T) {
 	// decoded strings must convert back to the column type. Strings that do
 	// not parse as integers make the round trip fail, which is what the decode
 	// check in measureLayout exists to catch.
-	if _, ok := measureLayout([]string{"abc", "def"}, ColumnSchema{Name: "x", Type: TypeInt32}, EncDict, CompressNone); ok {
+	if _, ok := measureLayout([]string{"abc", "def"}, ColumnSchema{Name: "x", Type: TypeInt32}, EncDict, CompressNone, &measureScratch{}); ok {
 		t.Error("measureLayout with values that cannot be decoded back: want not ok")
 	}
 
 	// An empty column gives every candidate a size of zero, so the ordering the
 	// sort falls back to is the encoded size.
-	results := benchmarkLayoutsTyped([]bool{}, ColumnSchema{Name: "x", Type: TypeBool})
+	results := benchmarkLayoutsTyped([]bool{}, ColumnSchema{Name: "x", Type: TypeBool}, &measureScratch{})
 	if len(results) != 6 {
 		t.Fatalf("benchmarkLayoutsTyped of an empty bool column: got %d results, want 6", len(results))
 	}
