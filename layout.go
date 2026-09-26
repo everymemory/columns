@@ -106,6 +106,16 @@ func BenchmarkLayouts(col []any, schema ColumnSchema) []LayoutResult {
 // monotonicity and value lengths all stabilise well below this many values, so
 // a sample costs a fraction of the encode and decode passes while picking the
 // same winner.
+//
+// The count is not free to shrink, because striding does not preserve the
+// cardinality of a periodic column. A column of 200000 rows whose values repeat
+// every 200 is sampled at stride 25 here, which collapses it to 8 distinct
+// values and flatters a dictionary into looking 12 times better than it is;
+// the encoding the whole column wants still wins, but by accident. Halving the
+// cap moves the stride to 49, which is coprime to 200, and the sample then sees
+// all 200 values honestly and picks a different encoding than the column wants,
+// which made the comparison file 0.3 percent larger. The experiment costs what
+// it costs because that agreement is what makes the sample trustworthy.
 const maxExperimentRows = 8192
 
 // experimentSample returns up to maxExperimentRows evenly spaced values from
