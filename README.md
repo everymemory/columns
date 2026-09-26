@@ -281,7 +281,7 @@ rather than a claim about the table:
 
 | | bytes/row | write | read all |
 | --- | --- | --- | --- |
-| keine | 158.98 | 953 ms | 211 ms (scoped) |
+| keine | 158.98 | 770 ms | 195 ms (scoped) |
 | parquet zstd | 166.74 | 703 ms | 235 ms |
 | parquet snappy | 236.64 | 514 ms | 296 ms |
 | parquet none | 380.95 | 253 ms | 111 ms |
@@ -289,10 +289,10 @@ rather than a claim about the table:
 Real data inverts the write conclusion. Synthetic data is mostly integers, and
 a text column of HTML comment bodies is most of this file: 86 MB of the 108 MB
 encoded, which flate turns into 36 MB. keine is still smaller than parquet's zstd
-by five percent and still reads a little faster, but it writes 35% slower,
-because DEFLATE at level 3 is what it has and zstd is what parquet has. Parquet's
-uncompressed file is the fastest both ways and 2.4 times the size, which is the
-trade that is actually being bought.
+by five percent and still reads a little faster, but it writes about ten percent
+slower, because DEFLATE at level 3 is what it has and zstd is what parquet has.
+Parquet's uncompressed file is the fastest both ways and 2.4 times the size,
+which is the trade that is actually being bought.
 
 The shard also found a bug the benchmark could not. Compressing a column's blocks
 used to be a serial loop inside one per-column goroutine, so that 330-block text
@@ -300,6 +300,17 @@ column ran on a single core while fifteen sat idle, and the README's claim that
 the writer parallelises across blocks was not what the code did. Blocks now share
 one semaphore across the whole write, the way the reader already did, which took
 this shard's write from 2312 ms to 953 ms without changing a byte of the file.
+
+The same shard then found a second problem, this time in the layout experiment. On
+the 8192-row sample, Affix compressed eleven bytes smaller than Plain on the text
+column — 1133307 against 1133318 — while encoding eight bytes larger, and on the
+full column that sign flips and Affix comes out twenty-six bytes larger. Eleven
+bytes is less than flate's block alignment moves on any change to the head of a
+stream, so it was noise, and the experiment was buying it with 350 ms of Affix
+encoding that made the file bigger. A win inside that margin is now a tie, and the
+tie goes to the encoding that produced fewer bytes, which took the same write to
+about 770 ms. Neither side of the comparison is timing, so the choice stays a
+function of the values alone and the file stays reproducible.
 
 ## Where the time goes
 

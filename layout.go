@@ -233,12 +233,11 @@ func rankLayouts(col any, schema ColumnSchema, ms *measureScratch) (LayoutResult
 		encNs := time.Now().UnixNano() - encStart
 
 		for _, codec := range layoutCodecs {
-			// Candidates arrive in the order BenchmarkLayouts sorts by, so taking
-			// a strict improvement keeps the earlier layout on a tie. A codec this
-			// build cannot serve is passed over, not reported.
-			if out, err := ms.compress(raw, codec); err == nil &&
-				(!found || len(out) < best.CompressedSize ||
-					(len(out) == best.CompressedSize && len(raw) < best.EncodedSize)) {
+			out, err := ms.compress(raw, codec)
+			// A codec this build cannot serve is passed over, not reported. The
+			// scratch is a bytes.Buffer, which cannot fail a write, so the error
+			// half of this is here for the codecs that can.
+			if err == nil && (!found || improves(len(out), len(raw), best.CompressedSize, best.EncodedSize)) {
 				found = true
 				best = LayoutResult{
 					Name:           encName(enc) + "+" + codecName(codec),
@@ -263,7 +262,45 @@ func rankLayouts(col any, schema ColumnSchema, ms *measureScratch) (LayoutResult
 	return full, ok
 }
 
-// measureLayout measures one encoding and codec for col. It is the per-candidate
+// improves reports whether one candidate should replace another. Candidates are
+// tried in layoutCandidates order, so a later one has to earn its place.
+//
+// Compressed size is not monotonic in the bytes handed to a codec. Adding a few
+// highly compressible bytes at the head of a stream moves where the codec's
+// blocks fall, and the compressed length moves with them by a handful of bytes
+// either way. A candidate can therefore measure a few bytes smaller while being
+// a few bytes larger uncompressed, and on a sample that is a small fraction of
+// the column that sign can flip when the whole column is encoded: a real column
+// spans many more blocks, so the alignment that helped on the sample is not the
+// alignment the file gets. A win that small is not a win, so it counts as a tie
+// and the tie goes to the encoding that produced fewer bytes, which costs less
+// to write, costs less to read, and does not depend on how the codec blocked the
+// sample.
+//
+// The margin is a fraction of the incumbent's compressed size, so it scales with
+// the column and is still generous on a tiny one. Neither input is timing, so
+// this keeps the choice a function of the values alone and the file stays
+// reproducible.
+const tieFraction = 512
+
+func improves(compressed, encoded, bestCompressed, bestEncoded int) bool {
+	margin := bestCompressed / tieFraction
+	switch {
+	case compressed > bestCompressed+margin:
+		return false
+	case compressed < bestCompressed-margin:
+		return true
+	}
+	// Inside the margin the two are indistinguishable, so the encoded size
+	// decides, and where the encoding is the same one the codec that came out
+	// smaller does.
+	if encoded != bestEncoded {
+		return encoded < bestEncoded
+	}
+	return compressed < bestCompressed
+}
+
+// measureLayout measures one encoding and codec for a column, the combination
 // path BenchmarkLayouts takes.
 func measureLayout(col any, schema ColumnSchema, enc, codec uint8, ms *measureScratch) (LayoutResult, bool) {
 	encoded, err := encodeWith(enc, col, schema.Type)

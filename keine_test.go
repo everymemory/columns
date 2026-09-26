@@ -321,6 +321,37 @@ func TestExperimentLayoutSampleMatches(t *testing.T) {
 	}
 }
 
+// improves decides whether one candidate layout displaces another, and the rule
+// is subtle enough that measuring it through a column leaves the interesting
+// cases to luck. The margins below are the columns the rule was written for: two
+// candidates within flate's block alignment noise of each other, where the one
+// that compressed a hair smaller is also the one that encoded larger.
+func TestImproves(t *testing.T) {
+	tests := []struct {
+		name                    string
+		compressed, encoded     int
+		bestCompressed, bestEnc int
+		want                    bool
+	}{
+		{"clearly smaller wins", 100, 50, 1000, 60, true},
+		{"clearly larger loses", 1000, 50, 100, 60, false},
+		{"same size, fewer encoded bytes wins", 1000, 50, 1000, 60, true},
+		{"same size, more encoded bytes loses", 1000, 60, 1000, 50, false},
+		{"same encoding, smaller codec wins", 900, 60, 1000, 60, true},
+		{"identical candidate does not displace", 1000, 60, 1000, 60, false},
+		{"noise sized win, larger encoded loses",
+			1133307, 2694716, 1133318, 2694708, false},
+		{"noise sized loss, smaller encoded wins",
+			1133329, 2694708, 1133318, 2694716, true},
+	}
+	for _, tc := range tests {
+		if got := improves(tc.compressed, tc.encoded, tc.bestCompressed, tc.bestEnc); got != tc.want {
+			t.Errorf("%s: improves(%d, %d, %d, %d) = %v, want %v",
+				tc.name, tc.compressed, tc.encoded, tc.bestCompressed, tc.bestEnc, got, tc.want)
+		}
+	}
+}
+
 func TestRowGroupMeta(t *testing.T) {
 	schema := []ColumnSchema{
 		{Name: "id", Type: TypeInt64, Nullable: true},
