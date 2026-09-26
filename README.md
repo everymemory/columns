@@ -218,9 +218,9 @@ Xeon X5687 with `go test -bench=BenchmarkComparison -count=3`:
 ```
 BenchmarkComparison
     15.07 bytes/row
-    write        92 ms   33 MB/s
-    read         25 ms   118 MB/s   32.7 MB   900 allocs
-    read scoped  12 ms   248 MB/s   137 KB    853 allocs
+    write        83 ms   36 MB/s   61.4 MB   57551 allocs
+    read         25 ms   121 MB/s  32.7 MB    900 allocs
+    read scoped  12 ms   256 MB/s   137 KB    853 allocs
 ```
 
 The scoped read returns typed slices into the reader's own buffers, so the
@@ -283,6 +283,17 @@ Parquet pays nothing to choose a layout: its encodings are compiled in. keine
 measures them per column, on a sample, and that measurement is inside the write
 time above, about 38ms of the 132ms the one-off comparison measured. It is what
 buys the size advantage over a format with a better compressor.
+
+A write's allocations were the same machinery, twice over. Each compressor owns a
+hash table and a sliding window, and the experiment compresses a column once per
+codec while the writer compresses each of its blocks, so one write built several
+hundred of them; they are now pooled and reset, which is what Reset is for, and
+the buffer a measurement landed in belongs to its column for the whole write
+rather than being grown per candidate. That took the comparison file's write from
+108 MB to 61 MB. What is left of it is the work itself: the dictionary encoder
+keying a value through `fmt` once per distinct entry, the canonical copy of the
+caller's `[]any`, and the compressed bytes the file is made of, which have to be
+somewhere until they are written.
 
 The read profile after the block split was roughly a third DEFLATE, a fifth GC and
 a seventh decoding. The decoding is no longer the cost it was: boxing every value
