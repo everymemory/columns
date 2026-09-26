@@ -33,12 +33,18 @@ type Writer struct {
 	// write below, so element i is only ever touched by column i's goroutine
 	// and needs no synchronisation.
 	measure []measureScratch
+
+	// sem bounds the compressors one write has in flight, across every column
+	// and every block of every column. It outlives a row group so the blocks of
+	// one share the machine with the blocks of the next rather than each row
+	// group sizing its own.
+	sem chan struct{}
 }
 
 // NewWriter writes the leading magic and the format version. If that write
 // fails, the error is returned by the first AddRowGroup or Close call.
 func NewWriter(w io.Writer, schema []ColumnSchema) *Writer {
-	wr := &Writer{w: w, schema: schema}
+	wr := &Writer{w: w, schema: schema, sem: make(chan struct{}, runtime.NumCPU())}
 	if _, err := w.Write([]byte(magic)); err != nil {
 		wr.writeErr = err
 		return wr
@@ -133,7 +139,7 @@ func (w *Writer) AddRowGroup(columns [][]any) error {
 	if len(w.measure) < len(columns) {
 		w.measure = make([]measureScratch, len(columns))
 	}
-	chunks := encodeColumns(typed, w.schema, w.measure)
+	chunks := encodeColumns(typed, w.schema, w.measure, w.sem)
 
 	for i := range columns {
 		meta := metas[i]
@@ -162,16 +168,19 @@ func (w *Writer) AddRowGroup(columns [][]any) error {
 // neither does compressing one block of it, so both spread across cores.
 // measure supplies one scratch buffer per column for the layout choice, whose
 // element i belongs to column i alone.
-func encodeColumns(typed []any, schema []ColumnSchema, measure []measureScratch) []ColumnChunk {
+//
+// sem is the one the blocks share, so a column takes a slot per block it is
+// compressing rather than for its whole run. Holding one while compressing
+// serially is what made a table's widest column the write's critical path on
+// its own, and a column waiting on its blocks holds none, so the semaphore
+// cannot be exhausted by columns waiting for work it is withholding.
+func encodeColumns(typed []any, schema []ColumnSchema, measure []measureScratch, sem chan struct{}) []ColumnChunk {
 	chunks := make([]ColumnChunk, len(typed))
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, runtime.NumCPU())
 	for i := range typed {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
 
 			best := experimentLayoutsTyped(typed[i], schema[i], &measure[i])
 			// Every value in the column has been canonicalized already, and the
@@ -182,7 +191,7 @@ func encodeColumns(typed []any, schema []ColumnSchema, measure []measureScratch)
 				Encoding:  best.Encoding,
 				Compress:  best.Compress,
 				RawLength: uint32(len(encoded)),
-				Blocks:    splitBlocks(encoded, best.Compress),
+				Blocks:    splitBlocks(encoded, best.Compress, sem),
 			}
 		}(i)
 	}

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sync"
 )
 
 // blockSize is the most encoded bytes a block holds. Blocks are byte ranges of
@@ -186,27 +187,49 @@ func ReadChunk(r io.Reader) (ColumnChunk, error) {
 // column shorter than a block stays one block, so a small column pays one block
 // header and no compression overhead for it.
 //
+// Compressing is where a wide column's write time goes, and one block's bytes
+// have nothing to do with another's or with any other column's, so the blocks
+// share one semaphore across the whole write rather than each column
+// compressing its own in order. A single long column otherwise holds one core
+// for its whole run while the rest of the machine waits for it, and a real
+// table's text column is most of the file. sem bounds the compressors in flight
+// across every column at once, so the machine fills before the column count
+// does. Block boundaries come from the encoded length alone and a block's
+// compressed form depends only on its own bytes, so the blocks are the same
+// ones a serial split would have produced, and the file does not depend on how
+// the work was scheduled.
+//
 // codec is one the writer has already measured, so Compress serves it. An
 // uncompressed block keeps its slice of encoded rather than copying, since
 // nothing in between can overwrite it before WriteChunk consumes it.
-func splitBlocks(encoded []byte, codec uint8) []ColumnBlock {
+func splitBlocks(encoded []byte, codec uint8, sem chan struct{}) []ColumnBlock {
 	n := (len(encoded) + blockSize - 1) / blockSize
 	if n == 0 {
 		n = 1
 	}
 	blocks := make([]ColumnBlock, n)
+	var wg sync.WaitGroup
 	for i := range blocks {
 		end := (i + 1) * blockSize
 		if end > len(encoded) {
 			end = len(encoded)
 		}
 		part := encoded[i*blockSize : end]
+		blocks[i].RawLength = uint32(len(part))
 		if codec == CompressNone {
-			blocks[i] = ColumnBlock{RawLength: uint32(len(part)), Data: part}
+			blocks[i].Data = part
 			continue
 		}
-		out, _ := Compress(part, codec)
-		blocks[i] = ColumnBlock{RawLength: uint32(len(part)), Data: out}
+		i, part := i, part
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			out, _ := Compress(part, codec)
+			blocks[i].Data = out
+		}()
 	}
+	wg.Wait()
 	return blocks
 }

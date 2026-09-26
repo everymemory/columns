@@ -218,7 +218,7 @@ Xeon X5687 with `go test -bench=BenchmarkComparison -count=3`:
 ```
 BenchmarkComparison
     15.07 bytes/row
-    write        83 ms   36 MB/s   61.4 MB   57551 allocs
+    write        69 ms   42 MB/s   62 MB    57568 allocs
     read         25 ms   121 MB/s  32.7 MB    900 allocs
     read scoped  12 ms   256 MB/s   137 KB    853 allocs
 ```
@@ -248,7 +248,7 @@ On 200000 rows in 5 columns:
 
 | | bytes/row | write | read all | read 1 column |
 | --- | --- | --- | --- | --- |
-| keine | 15.07 | 83 ms | 12 ms (scoped) | 1.9 ms |
+| keine | 15.07 | 69 ms | 12 ms (scoped) | 1.9 ms |
 | parquet zstd | 16.04 | 121 ms | 15 ms | 4.2 ms |
 | parquet snappy | 24.33 | 111 ms | 16 ms | 4.2 ms |
 | parquet none | 51.08 | 92–192 ms | 15 ms | 2.3 ms |
@@ -273,6 +273,34 @@ stable ecosystem, and readers in every language. keine has none of that, and the
 read gap this table used to show is closed only because the scoped read now
 exists to compare against Arrow's buffers rather than against a boxed `[]any`.
 
+The table is synthetic data, which is worth checking against the real thing. One
+monthly shard of `open-index/hacker-news` on HF — 255218 rows — was fed through
+both formats, taking the thirteen scalar columns and leaving the three list ones
+out, since keine has no nested type. This is the subset the format can express
+rather than a claim about the table:
+
+| | bytes/row | write | read all |
+| --- | --- | --- | --- |
+| keine | 158.98 | 953 ms | 211 ms (scoped) |
+| parquet zstd | 166.74 | 703 ms | 235 ms |
+| parquet snappy | 236.64 | 514 ms | 296 ms |
+| parquet none | 380.95 | 253 ms | 111 ms |
+
+Real data inverts the write conclusion. Synthetic data is mostly integers, and
+a text column of HTML comment bodies is most of this file: 86 MB of the 108 MB
+encoded, which flate turns into 36 MB. keine is still smaller than parquet's zstd
+by five percent and still reads a little faster, but it writes 35% slower,
+because DEFLATE at level 3 is what it has and zstd is what parquet has. Parquet's
+uncompressed file is the fastest both ways and 2.4 times the size, which is the
+trade that is actually being bought.
+
+The shard also found a bug the benchmark could not. Compressing a column's blocks
+used to be a serial loop inside one per-column goroutine, so that 330-block text
+column ran on a single core while fifteen sat idle, and the README's claim that
+the writer parallelises across blocks was not what the code did. Blocks now share
+one semaphore across the whole write, the way the reader already did, which took
+this shard's write from 2312 ms to 953 ms without changing a byte of the file.
+
 ## Where the time goes
 
 Encoding and compressing a column touches no other, so the writer runs them
@@ -295,8 +323,8 @@ the write.
 
 Parquet pays nothing to choose a layout: its encodings are compiled in. keine
 measures them per column, on a sample, and that measurement is inside the write
-time above, about 38ms of the 83ms. It is what buys the size advantage over a
-format with a better compressor.
+time above, about 26ms of the 69ms, against 35ms of compressing the blocks. It is
+what buys the size advantage over a format with a better compressor.
 
 A write's allocations were the same machinery, twice over. Each compressor owns a
 hash table and a sliding window, and the experiment compresses a column once per
