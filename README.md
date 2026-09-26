@@ -236,32 +236,42 @@ whole write and read paths, `BenchmarkTypedRead` the unboxed read path, and
 
 ## Compared with parquet
 
-The comparison below was taken once, against pyarrow, with both formats fed the
-same values from the same pseudo-random stream so neither saw easier data. The
-harness and the dataset are not in this repository, and the dataset is not the one
-`BenchmarkComparison` uses, so the 9.07 bytes/row there and the 15.07 above are
-two different files. Treat the table as a one-time measurement, not something to
-reproduce here.
+Measured against pyarrow 25.0.1, both formats fed the *same* values: the five
+columns `BenchmarkComparison` builds were dumped to raw files and handed to
+pyarrow, so neither saw easier data and the 15.07 bytes/row is the same file in
+both rows of the table. The harness is not in this repository — it needs a
+Python install, and the library does not — but it is a handful of lines around
+`pq.write_table` and `pq.ParquetFile.read`, and both sides were timed best of
+five on the same idle X5687.
 
 On 200000 rows in 5 columns:
 
-| | bytes/row | write | read all | read 1 column | read typed |
-| --- | --- | --- | --- | --- | --- |
-| keine | 9.07 | 132ms | 32ms | 10ms | 32ms |
-| parquet zstd | 12.86 | 104ms | 16ms | 9ms | — |
-| parquet snappy | 21.32 | 94ms | 16ms | 8ms | — |
-| parquet none | 43.71 | 80ms | 14ms | 8ms | — |
+| | bytes/row | write | read all | read 1 column |
+| --- | --- | --- | --- | --- |
+| keine | 15.07 | 83 ms | 12 ms (scoped) | 1.9 ms |
+| parquet zstd | 16.04 | 121 ms | 15 ms | 4.2 ms |
+| parquet snappy | 24.33 | 111 ms | 16 ms | 4.2 ms |
+| parquet none | 51.08 | 92–192 ms | 15 ms | 2.3 ms |
 
-keine is smaller than parquet at every compression level and within about a
-quarter of its write speed, and reading one column is level with it. Reading all
-five is where the table still shows keine behind, but the two sides of that
-number are different contracts. pyarrow reads into typed columnar buffers;
-`ReadRowGroup` hands the caller owned values in interfaces, which costs 16 bytes
-a value before any decoding, and no `[]any` return can go below that. The scoped
-read is the path that matches pyarrow's — typed slices, nothing boxed — and its
-11.5 ms is under the 16 ms the table measured for parquet zstd. That is a stale
-number read across a gap, not a rematch: the harness behind it is gone, so treat
-it as a reason to rebuild the harness rather than as a result.
+`read all` for parquet is `ParquetFile.read`, which returns an Arrow table of
+typed columnar buffers and never boxes a value. The fair keine counterpart is
+the scoped read, which hands back typed slices the same way; that is the 12 ms
+above, and it is faster than parquet's 15. The boxed read is a different
+contract — it returns owned values in interfaces, which costs 16 bytes a value
+before any decoding, and no `[]any` return can go below that. It measures about
+23 ms and is not in the table, because it is not the same operation parquet is
+doing.
+
+keine is now smaller than parquet at every compression level, faster to write at
+every one of them, and faster reading a single column by more than two times.
+Parquet's `none` write time was unstable across runs, between 92 and 192 ms, and
+is reported as a range rather than picked from; nothing else in the table moved
+by more than a few percent between runs.
+
+Where parquet still leads is not in the numbers above. It has nested types, a
+stable ecosystem, and readers in every language. keine has none of that, and the
+read gap this table used to show is closed only because the scoped read now
+exists to compare against Arrow's buffers rather than against a boxed `[]any`.
 
 ## Where the time goes
 
@@ -285,8 +295,8 @@ the write.
 
 Parquet pays nothing to choose a layout: its encodings are compiled in. keine
 measures them per column, on a sample, and that measurement is inside the write
-time above, about 38ms of the 132ms the one-off comparison measured. It is what
-buys the size advantage over a format with a better compressor.
+time above, about 38ms of the 83ms. It is what buys the size advantage over a
+format with a better compressor.
 
 A write's allocations were the same machinery, twice over. Each compressor owns a
 hash table and a sliding window, and the experiment compresses a column once per
@@ -330,6 +340,12 @@ Closing the rest is a codec question, not a parallelism one.
 
 With the allocations gone, DEFLATE is what a scoped read is: about 60% of its 12ms.
 The remainder is decoding and the parallel machinery around it.
+
+That 12ms is what parquet's typed read takes 15ms to do on the same values, which
+is the point the codec argument reaches: keine is slower at decompressing and
+still finishes first, because it decompresses less and does it across more cores.
+The gap that remains is not a codec gap but a contract one — the boxed read below
+costs its interface headers, and no `[]any` return can avoid them.
 
 The three read paths are for three callers. `ReadRowGroup` returns `[]any` and
 covers nulls, and its cost is the interface headers as much as the bytes.
