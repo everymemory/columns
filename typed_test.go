@@ -7,9 +7,9 @@ import (
 )
 
 // EncodePlain has a fast path for each of the thirteen column types and falls
-// back to reflection for everything else. The fast path is byte for byte what
-// the reflection path produces, which is what lets it replace it: a column
-// encoded either way reads back identically.
+// back to reflection for everything else. The fast path has to produce the same
+// bytes as the reflection path, so a column encoded either way reads back
+// identically.
 func TestEncodePlainFastPathMatchesReflection(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -87,10 +87,10 @@ func TestLayoutTypedInputs(t *testing.T) {
 	}
 }
 
-// boxValues has a fast path for each of the thirteen column types. Every value
-// it hands back must equal what a plain conversion would have produced, and
-// must still point at a value the caller can read back: the fast path shares
-// the source slice's backing array rather than copying each value out.
+// boxValues has a fast path for each of the thirteen column types. Every value it
+// returns must equal what a plain conversion produces. The fast path shares the
+// source slice's backing array rather than copying each value out, so the caller
+// can still read the values back.
 func TestBoxValuesMatchesConversion(t *testing.T) {
 	cases := []struct {
 		name  string

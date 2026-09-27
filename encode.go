@@ -201,11 +201,10 @@ func EncodeOffsetBytes(vals [][]byte) []byte {
 	return buf
 }
 
-// EncodeAffix writes the bytes every value in the column has at its start and at
-// its end, then each value with those bytes gone: a length-prefixed stream of
-// what is left between them. Values that share a domain, a path or a key share
-// that part once rather than per value, and the middles are that much shorter
-// for whatever codec follows.
+// EncodeAffix writes the bytes every value has at its start and at its end, then
+// each value with those bytes removed, as a length-prefixed stream of middles.
+// Columns that share a common domain, path or key store that part once instead
+// of per value, leaving less for the codec that follows.
 func EncodeAffix(vals any) ([]byte, error) {
 	switch s := vals.(type) {
 	case []string:
@@ -219,9 +218,9 @@ func EncodeAffix(vals any) ([]byte, error) {
 	}
 }
 
-// columnAffix is the longest prefix and suffix shared by every value. The two
-// are allowed to meet in the column's shortest value but not to overlap in it,
-// so a value is always its prefix, its middle and its suffix back to back.
+// columnAffix is the longest prefix and suffix shared by every value. They may
+// meet but not overlap inside the shortest value, so each value still splits
+// cleanly into prefix, middle and suffix.
 func columnAffix[T ~string | ~[]byte](s []T) (pre, suf T) {
 	if len(s) == 0 {
 		return
@@ -326,11 +325,11 @@ func EncodeDict(vals any) ([]byte, error) {
 	return buf, nil
 }
 
-// dictKeys returns the dictionary key of every element of vals. Strings key on
-// themselves and byte slices on their bytes; the fixed width types key on their
-// little-endian form, which is what the reader decodes back. Encoding a whole
-// column once into a flat buffer and slicing the keys out of it keeps them at
-// one allocation for the buffer rather than a formatted string per value.
+// dictKeys returns the dictionary key of every element of vals. Strings and byte
+// slices key on their own bytes; fixed width types key on their little-endian
+// form, which is the bytes the reader decodes back. Encoding the column once
+// into a flat buffer and slicing the keys out of it costs one allocation instead
+// of a formatted string per value.
 func dictKeys(vals any) ([]string, int, error) {
 	if s, ok := vals.([]string); ok {
 		return s, len(s), nil
@@ -371,8 +370,8 @@ func dictKeys(vals any) ([]string, int, error) {
 		return dictFlat(s, 8, func(v float64, b []byte) { binary.LittleEndian.PutUint64(b, math.Float64bits(v)) })
 	}
 
-	// A slice of interfaces has no one encoded form, so its elements key on
-	// themselves: strings and byte slices as their bytes, anything else as the
+	// A slice of interfaces has no single encoded form, so its elements key on
+	// their own bytes: strings and byte slices directly, anything else as the
 	// text the reader parses back.
 	rv := reflect.ValueOf(vals)
 	if rv.Kind() != reflect.Slice {
@@ -414,9 +413,8 @@ func dictFlat[T any](s []T, width int, put func(v T, b []byte)) ([]string, int, 
 }
 
 // bitpackIndices packs indices using nbits per value, most significant bit
-// first, padded to a byte boundary. The accumulator never holds more than
-// nbits + 7 bits, which fits in a uint64 for every width a uint32 index can
-// need, so one path handles all of them.
+// first, padded to a byte boundary. The accumulator holds at most nbits + 7
+// bits, which fits in a uint64 for every width a uint32 index can need.
 func bitpackIndices(indices []uint32, nbits uint) []byte {
 	if nbits == 0 {
 		return make([]byte, 0)
@@ -474,9 +472,9 @@ func encodeWith(enc uint8, typed any, typ uint8) ([]byte, error) {
 	}
 }
 
-// toInt64s widens an integer column to []int64, which is what Delta stores. It
-// is a bit cast rather than a range check because Delta already carries int64
-// differences for every integer width and the reader narrows back.
+// toInt64s widens an integer column to []int64, which is what Delta stores. No
+// range check is needed: Delta keeps int64 differences for every integer width
+// and the reader narrows back to the column's type.
 func toInt64s(typed any) ([]int64, error) {
 	switch s := typed.(type) {
 	case []int8:

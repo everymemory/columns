@@ -14,24 +14,22 @@ type Reader struct {
 	footer Footer
 
 	// rgbuf holds the chunks of the row group being read, one region per column.
-	// rawbufs holds one decompression buffer per column of that row group, and raw
-	// the decompressed bytes of the column the typed path decodes. Nothing a
-	// caller gets back points into any of them once decoding finishes, so all
-	// three are kept for the next read instead of being collected. A Reader holds
-	// the position of its ReadSeeker and is not safe to use from multiple
-	// goroutines, so they need no synchronisation; each is indexed by the job that
-	// owns it, and no two jobs share an index.
+	// rawbufs holds one decompression buffer per column, and raw the decompressed
+	// bytes of the column the typed path is decoding. Nothing handed back to a
+	// caller points into any of them once decoding finishes, so all three are kept
+	// for the next read. A Reader is not safe to use from multiple goroutines, so
+	// they need no synchronisation: each is indexed by the job that owns it, and no
+	// two jobs share an index.
 	rgbuf    []byte
 	raw      []byte
 	chunkbuf []byte
 	rawbufs  [][]byte
 
 	// dests holds one reusable decode destination per column of the row group the
-	// scoped path is reading. Nothing that path hands a caller points anywhere but
-	// into its own column's destination, and it hands them out only for the
-	// duration of its callback, so they can be reused rather than collected. The
-	// other read paths hand out values the caller keeps, so they decode into a
-	// fresh destination every time.
+	// scoped path reads. The values that path hands a caller point into the
+	// destination of their own column and are valid only for the duration of the
+	// callback, so the destinations can be reused. The other read paths hand out
+	// values the caller keeps, so they decode into a fresh destination each time.
 	dests []*dest
 }
 
@@ -166,15 +164,14 @@ func (rd *Reader) ReadRowGroup(index int, colIndexes []int) ([][]any, error) {
 }
 
 // ReadRowGroupScoped reads the requested columns of one row group and calls fn
-// with a view of them. The view hands back typed slices rather than []any, so no
-// value is boxed in an interface, but the slices point into buffers this Reader
-// owns and hands to its next read: fn must be finished with them before it
-// returns, because holding one past the call reads whatever the next read wrote
-// over it. The columns are decoded in parallel, same as ReadRowGroup, and only
-// the ones asked for.
+// with a view of them. The view returns typed slices rather than []any, so no
+// value is boxed in an interface. Those slices point into buffers this Reader
+// reuses for its next read, so fn must be finished with them before it returns.
+// The columns are decoded in parallel, as in ReadRowGroup, and only the ones
+// asked for.
 //
 // A nullable column has nowhere to put a nil in a typed slice, so it is an error
-// here and ReadRowGroup reads those.
+// here. ReadRowGroup reads those.
 func (rd *Reader) ReadRowGroupScoped(index int, cols []int, fn func(*Columns) error) error {
 	rg, err := rd.RowGroupMeta(index)
 	if err != nil {
@@ -218,9 +215,9 @@ type Columns struct {
 // match the type the column decodes to; asking for another is an error rather
 // than a silent mismatch.
 //
-// The one case that still allocates is a narrow integer column encoded with
-// Delta, whose differences decode as int64 no matter the declared width. It is
-// narrowed to the declared type, which is one slice the caller owns.
+// A narrow integer column encoded with Delta is the one case that allocates. Its
+// differences decode as int64 whatever the declared width, and narrowing them to
+// that width produces one slice the caller owns.
 func Column[T any](c *Columns, i int) ([]T, error) {
 	if i < 0 || i >= len(c.typed) {
 		return nil, fmt.Errorf("keine: column %d out of range (requested %d)", i, len(c.typed))
@@ -263,9 +260,9 @@ type readJob struct {
 	ci    int
 }
 
-// readJobs reads the chunks of the requested columns into one buffer, each in
-// its own region, and parses them. One buffer holds every requested chunk so a
-// chunk handed to a decode goroutine needs no copy: nothing a later column reads
+// readJobs reads the chunks of the requested columns into one buffer, each in its
+// own region, and parses them. One buffer for every requested chunk means a chunk
+// handed to a decode goroutine needs no copy, because nothing a later column reads
 // overlaps it. The buffer stays with the Reader for the next row group.
 func (rd *Reader) readJobs(rg RowGroupMeta, colIndexes []int) ([]readJob, error) {
 	total := int64(0)
@@ -296,22 +293,25 @@ func (rd *Reader) readJobs(rg RowGroupMeta, colIndexes []int) ([]readJob, error)
 }
 
 // decodeJobs decompresses and decodes each job's column into a slice of its
-// declared Go type, and leaves boxing and null expansion to the caller, so a
-// caller that wants typed slices does not pay for interfaces. A column's blocks
-// decompress into one buffer the size of the column, each into its own region of
-// it, so reassembly is placement rather than a copy; decoding waits for them and
-// then runs in parallel too. Each buffer is the Reader's own and indexed by job,
-// so it survives a garbage collection and keeps the widest column it has seen:
-// after the first row group the decompression allocates nothing. A sync.Pool
-// would have been cleared at the next collection, and this read path allocates
-// enough per call that the pool missed more often than it hit.
+// declared Go type, leaving boxing and null expansion to the caller, so a caller
+// that wants typed slices does not pay for interfaces.
 //
-// dests supplies each job's decode destination. A caller that keeps the values it
-// was given passes a fresh one per job, since every value a decoder returns
-// points into its destination; the scoped path hands the same destinations back
-// every read, which is what makes its second and later reads allocate nothing.
+// A column's blocks decompress into one buffer the size of the column, each into
+// its own region, so reassembly is placement rather than a copy. Decoding waits
+// for the blocks, then runs in parallel.
 //
-// The semaphore is taken around a goroutine's own work and released before it
+// Each buffer is the Reader's own and indexed by job, so it survives a garbage
+// collection and keeps the widest column it has seen: after the first row group
+// the decompression allocates nothing. A sync.Pool would have been cleared at the
+// next collection, and this path allocates enough per call that the pool missed
+// more often than it hit.
+//
+// dests supplies each job's decode destination. Every value a decoder returns
+// points into its destination, so a caller that keeps the values passes a fresh
+// one per job. The scoped path passes the same destinations back every read, which
+// is why its second and later reads allocate nothing.
+//
+// The semaphore is held only around a goroutine's own work and released before it
 // waits on anything, so a column waiting for its blocks never occupies a slot
 // another block needs.
 func (rd *Reader) decodeJobs(jobs []readJob, dests []*dest) ([]any, []error) {
@@ -380,8 +380,8 @@ func (rd *Reader) decodeJobs(jobs []readJob, dests []*dest) ([]any, []error) {
 // ReadColumn reads one column of one row group as a typed slice, so a TypeInt64
 // column comes back as []int64 and a TypeString column as []string rather than
 // []any, and no value is boxed in an interface. T must be the Go type the column
-// decodes to. The column must hold no nulls; ReadRowGroup covers those, since a
-// nil marker has nowhere to go in a []T of values.
+// decodes to. The column must hold no nulls, because a nil marker has nowhere to
+// go in a []T of values; ReadRowGroup reads those.
 func ReadColumn[T any](rd *Reader, index, col int) ([]T, error) {
 	rg, err := rd.RowGroupMeta(index)
 	if err != nil {
@@ -521,9 +521,9 @@ func decompressBlock(raw []byte, off uint32, blk ColumnBlock, codec uint8) error
 }
 
 // readChunk seeks to one column chunk, reads its recorded byte length into
-// region, and parses it. Reading the bytes and parsing them are split like this
-// because every column reads into its own region of one buffer, which is what
-// keeps a chunk alive while another goroutine decodes it.
+// region, and parses it. Reading the bytes and parsing them are separate steps so
+// every column can read into its own region of one buffer and stay alive there
+// while another goroutine decodes it.
 func (rd *Reader) readChunk(start int64, region []byte) (ColumnChunk, error) {
 	if _, err := rd.r.Seek(start, io.SeekStart); err != nil {
 		return ColumnChunk{}, fmt.Errorf("keine: cannot seek to column: %w", err)

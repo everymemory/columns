@@ -77,10 +77,10 @@ func codecName(codec uint8) string {
 }
 
 // layoutCodecs are the codecs considered for each column. CompressZstd is
-// absent because this toolchain does not ship compress/zstd. Gzip and Zlib wrap
-// the same DEFLATE core as Flate with extra framing, so they are strictly
-// larger and never win the size contest; they stay implemented for reading and
-// for callers that ask for them by name.
+// missing because this toolchain does not ship compress/zstd. Gzip and Zlib wrap
+// the same DEFLATE core as Flate in extra framing, so they are always larger and
+// never win on size. They stay implemented for reading and for callers that ask
+// for them by name.
 var layoutCodecs = []uint8{
 	CompressNone,
 	CompressFlate,
@@ -88,17 +88,15 @@ var layoutCodecs = []uint8{
 }
 
 // defaultLayout is the layout a writer uses for a column it has not been asked
-// to Optimize. It is what the type implies rather than what the values turn out
-// to be, so it costs nothing to choose and cannot be wrong about the shape of
-// the data the way a sample can, but it also cannot see that a column of sorted
-// integers is monotonic or that a column of repeated strings would rather be a
-// dictionary. Optimize trades the time for that knowledge.
+// to Optimize. It follows the column's type rather than its values, so it costs
+// nothing to choose and cannot be misled by a sample, but it also cannot tell
+// that a column of sorted integers is monotonic or that a column of repeated
+// strings belongs in a dictionary. Optimize spends the time to learn that.
 //
-// Bool packs to a bit and Delta costs one subtraction per value, so both are
-// what the type earns on any data at all; Plain is the honest answer for
-// floating point and for bytes, whose values this package will not assume
-// anything about. Flate is the codec, because it is what the stdlib has that
-// compresses, and these encodings are what it is applied to.
+// Bool always packs to a bit and Delta always costs one subtraction per value,
+// so both are right for any data of their type. Plain is the fallback for
+// floating point and bytes, whose values this package makes no assumption about.
+// Flate is the codec because it is the stdlib's general purpose compressor.
 func defaultLayout(typ uint8) (enc, codec uint8) {
 	switch typ {
 	case TypeBool:
@@ -113,10 +111,9 @@ func defaultLayout(typ uint8) (enc, codec uint8) {
 
 // BenchmarkLayouts measures every candidate encoding and codec for col at the
 // default compression level and returns them sorted by CompressedSize, breaking
-// ties by EncodedSize. The tiebreak never consults DecodeNs: that is measured
-// time, and consulting it would make two equally sized candidates win or lose on
-// noise, so the same column could pick a different layout on a different run and
-// the same input would not write the same file twice.
+// ties by EncodedSize. The tiebreak never looks at DecodeNs. Decode time is
+// measurement noise, so using it could flip two equally sized candidates between
+// runs and make the same input write two different files.
 func BenchmarkLayouts(col []any, schema ColumnSchema) []LayoutResult {
 	typed, err := canonicalColumnTyped(col, schema.Type)
 	if err != nil {
@@ -126,10 +123,10 @@ func BenchmarkLayouts(col []any, schema ColumnSchema) []LayoutResult {
 }
 
 // benchmarkLayoutsTyped is BenchmarkLayouts for an already canonical column, so
-// a writer that has already coerced the values measures them once rather than
-// twice. ms is the buffer the measurements land in, which a column keeps for the
-// whole pass. level is the level the column will be compressed at, since a
-// layout measured at another level is not the one the file will get.
+// a writer that has already coerced the values measures them once instead of
+// twice. ms is the scratch buffer the measurements reuse, held for the whole
+// pass. level is the level the column will actually be compressed at, since
+// measuring at another level would not rank the layout the file gets.
 func benchmarkLayoutsTyped(col any, schema ColumnSchema, ms *measureScratch, level int) []LayoutResult {
 	var results []LayoutResult
 	for _, enc := range layoutCandidates(schema.Type) {
@@ -159,10 +156,9 @@ func measureLayout(col any, schema ColumnSchema, enc, codec uint8, level int, ms
 }
 
 // measureEncoded measures one encoding and codec for a column already in its
-// encoded form. Every codec consumes the same bytes, so a column that is encoded
-// once can be measured against all of them through this entry point without
-// repeating the encode. The compressed bytes are borrowed from ms for the round
-// trip only; the decompressed column they are turned back into is its own.
+// encoded form. Every codec consumes the same bytes, so one encode serves all of
+// them through this entry point. The compressed bytes come from ms and are only
+// borrowed for the round trip; the decompressed column is allocated fresh.
 func measureEncoded(encoded []byte, enc, codec uint8, level, n int, typ uint8, ms *measureScratch) (LayoutResult, bool) {
 	encodeStart := time.Now().UnixNano()
 	compressed, err := ms.compress(encoded, codec, level)

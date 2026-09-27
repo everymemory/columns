@@ -9,12 +9,14 @@ import (
 
 // blockSize is the default most encoded bytes a block holds. Blocks are byte
 // ranges of the encoded stream, so this is a byte boundary rather than a value
-// boundary. It sits well above DEFLATE's 32KB window, so a block loses little
-// context to seeing only part of the column, and it is small enough that one
-// column still splits into several jobs: on the 200000-row comparison file, five
-// columns become about twenty. Larger blocks measured slightly smaller files and
-// no faster a read, since the reader runs out of columns before it runs out of
-// cores. A writer whose Options.BlockSize is zero uses this.
+// boundary.
+//
+// It sits well above DEFLATE's 32KB window, so a block loses little context to
+// seeing only part of the column, and it still splits one column into several
+// jobs: on the 200000-row comparison file, five columns become about twenty.
+// Larger blocks measured slightly smaller files and no faster a read, since the
+// reader runs out of columns before it runs out of cores. A writer whose
+// Options.BlockSize is zero uses this.
 const blockSize = 256 * 1024
 
 // ColumnBlock is one independently compressed range of a column's encoded bytes.
@@ -30,10 +32,9 @@ type ColumnChunk struct {
 	Encoding   uint8
 	Compress   uint8
 	NullBitmap []byte
-	// RawLength is the column's encoded length, which is the sum of every block's
+	// RawLength is the column's encoded length, the sum of every block's
 	// RawLength. A reader sizes its decompression buffer from it, so a chunk
-	// decompresses into one allocation instead of growing into its answer a piece
-	// at a time.
+	// decompresses into one allocation instead of growing as it goes.
 	RawLength uint32
 	Blocks    []ColumnBlock
 }
@@ -43,9 +44,9 @@ type ColumnChunk struct {
 const chunkHeaderLen = 18
 
 // parseChunk reads a chunk out of b, which must hold exactly the chunk's bytes.
-// c's slices point into b, so b has to outlive c: the reader reuses its buffer
+// c's slices point into b, so b has to outlive c. The reader reuses its buffer
 // for the next row group, and a chunk handed to another goroutine is decoded
-// before that happens.
+// before that reuse happens.
 func parseChunk(b []byte, c *ColumnChunk) error {
 	if len(b) < chunkHeaderLen {
 		return fmt.Errorf("keine: chunk is %d bytes, too small for a header", len(b))
@@ -182,28 +183,26 @@ func ReadChunk(r io.Reader) (ColumnChunk, error) {
 
 // splitBlocks divides encoded into blocks of at most blockSize bytes and
 // compresses each with codec. Blocks are byte ranges of the stream rather than
-// ranges of values, so a decoder reading the blocks concatenated back together
-// sees the same stream encodeWith produced, whichever encoding that was. A
-// column shorter than a block stays one block, so a small column pays one block
-// header and no compression overhead for it.
+// ranges of values, so a decoder reading the blocks back concatenated sees the
+// same stream encodeWith produced, whichever encoding that was. A column shorter
+// than a block stays one block, so a small column pays one block header and no
+// compression overhead for it.
 //
 // Compressing is where a wide column's write time goes, and one block's bytes
 // have nothing to do with another's or with any other column's, so the blocks
-// share one semaphore across the whole write rather than each column
-// compressing its own in order. A single long column otherwise holds one core
-// for its whole run while the rest of the machine waits for it, and a real
-// table's text column is most of the file. sem bounds the compressors in flight
-// across every column at once, so the machine fills before the column count
-// does. Block boundaries come from the encoded length alone and a block's
-// compressed form depends only on its own bytes, so the blocks are the same
-// ones a serial split would have produced, and the file does not depend on how
-// the work was scheduled.
+// share one semaphore across the whole write instead of each column compressing
+// its own in order. A single long column otherwise holds one core for its whole
+// run while the rest wait, and a real table's text column is most of the file.
+// sem bounds the compressors in flight across every column at once, so the cores
+// fill before the column count does. Block boundaries come from the encoded
+// length alone and a block's compressed form depends only on its own bytes, so
+// the file does not depend on how the work was scheduled.
 //
 // codec is one the writer has already measured, so Compress serves it. An
 // uncompressed block keeps its slice of encoded rather than copying, since
 // nothing in between can overwrite it before WriteChunk consumes it.
 //
-// blockSz is the block size the writer is configured with, and level the level
+// blockSz is the block size the writer is configured with and level the level
 // its codecs run at, so the blocks are the ones the configuration describes
 // rather than the package's defaults.
 func splitBlocks(encoded []byte, codec uint8, level, blockSz int, sem chan struct{}) []ColumnBlock {

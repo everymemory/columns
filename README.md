@@ -141,13 +141,16 @@ tiebreak is size alone, never measured time, so the same columns write the same
 file on any machine.
 
 That thoroughness is the cost. On the five-column, 200000-row comparison file
-below, `Optimize` takes the write from 43 ms to 1.26 s and the file from 15.56 to
-15.07 bytes per row — three percent of the size for thirty times the time. The
-defaults are already right for two of those five columns, and the pass pays for
-the other three by half a byte a row. It is the right call when the file is
-written once and read many times, and the wrong one when it is not; nothing
-between the two exists, because a sample that cheap is a guess the values did not
-get to answer.
+below, `Optimize` takes the write from 40 ms to 7.2 s and the file from 15.56 to
+14.55 bytes per row. The pass measures at the best level the codec offers, where a
+plain write stays at level 3, and that choice accounts for most of both numbers: a
+block compressed harder costs no more to read back, so the extra write time is the
+only price. The defaults are already right for two of those five columns, and the pass
+pays for the other three by a byte a row. It is the right call when the file is
+written once and read many times, and the wrong one when it is not; `OptimizeLevel`
+buys back part of the time without changing what the pass chooses, and nothing
+cheaper than the full walk exists, because a sample that cheap is a guess the
+values did not get to answer.
 
 ## Usage
 
@@ -185,7 +188,10 @@ w.AddRowGroup([][]any{ /* the same or later values */ })
 ```
 
 `Optimize` is a pass over the data and decides for every row group after it, so
-it goes before the first `AddRowGroup`. `Options` is also how a writer that has
+it goes before the first `AddRowGroup`. It measures and writes at the best level
+the codec offers, because a caller who runs the pass has already decided the data
+is worth walking in full and a harder block costs nothing to read back; set
+`OptimizeLevel` to spend less of the pass. `Options` is also how a writer that has
 not been Optimized is told what to do: `Encoding` zero means the type's own
 choice, and any other encoding is used for every column it can serve.
 
@@ -252,20 +258,20 @@ Xeon X5687 with `go test -bench=BenchmarkComparison -count=3`:
 ```
 BenchmarkComparison
     write             15.56 bytes/row
-    write             43 ms    72 MB/s   45 MB     728 allocs
-    write optimized   15.07 bytes/row
-    write optimized   1.26 s   2.4 MB/s  1.6 GB   ~7.2M allocs
-    read              23 ms   134 MB/s  36.7 MB    750 allocs
-    read scoped       10 ms   316 MB/s   295 KB    705 allocs
+    write             40 ms    78 MB/s   43 MB     710 allocs
+    write optimized   14.55 bytes/row
+    write optimized   7.2 s    0.4 MB/s  1.6 GB    7.2M allocs
+    read              24 ms   130 MB/s   37 MB     830 allocs
+    read scoped       10 ms   300 MB/s   300 KB    710 allocs
 ```
 
 The two write rows are the same values. The first stores each column the way its
 type implies and the second after `Optimize` has read them, so the difference
-between them is the pass and what it bought: 0.49 bytes a row, which is three
-percent of the file. Two of the five columns keep their default layout, and the
-pass's 1.2 seconds is almost entirely the encodings that do not win — the affix
-table over a near-distinct string column, and a dictionary over pseudo-random
-integers — measured because they are candidates, not because they are plausible.
+between them is the pass and what it bought: 1.01 bytes a row, about six percent of
+the file. Two of the five columns keep their default layout, and the pass's time is
+almost entirely the encodings that do not win, the affix table over a near-distinct
+string column and a dictionary over pseudo-random integers, measured because they
+are candidates rather than plausible winners.
 
 The scoped read returns typed slices into the reader's own buffers, so the
 memory it reports is transient: only the first read allocates the columns. The
@@ -292,24 +298,25 @@ On 200000 rows in 5 columns:
 
 | | bytes/row | write | read all | read 1 column |
 | --- | --- | --- | --- | --- |
-| keine | 15.56 | 43 ms | 10 ms (scoped) | 0.9 ms |
-| parquet zstd | 16.04 | 128 ms | 14 ms | 4.2 ms |
-| parquet snappy | 24.33 | 124 ms | 15 ms | 4.1 ms |
-| parquet none | 51.08 | 111 ms | 15 ms | 2.3 ms |
+| keine | 15.56 | 39 ms | 9.5 ms (scoped) | 0.8 ms |
+| parquet zstd | 19.57 | 114 ms | 14 ms | 5.4 ms |
+| parquet snappy | 28.66 | 98 ms | 15 ms | 5.9 ms |
+| parquet none | 54.98 | 96 ms | 15 ms | 2.3 ms |
 
 `read all` for parquet is `ParquetFile.read`, which returns an Arrow table of
 typed columnar buffers and never boxes a value. The fair keine counterpart is
-the scoped read, which hands back typed slices the same way; that is the 10 ms
+the scoped read, which hands back typed slices the same way; that is the 9.5 ms
 above, and it is faster than parquet's 14. The boxed read is a different
-contract — it returns owned values in interfaces, which costs 16 bytes a value
+contract: it returns owned values in interfaces, which costs 16 bytes a value
 before any decoding, and no `[]any` return can go below that. It measures about
-23 ms and is not in the table, because it is not the same operation parquet is
+24 ms and is not in the table, because it is not the same operation parquet is
 doing.
 
 keine's row is the default write, the one that stores each column the way its
-type implies. An `Optimize`d write of the same values is 15.07 bytes/row, which
-is what this table used to show; it costs 1.26 s instead of 43 ms, which is why
-the default is what the table reports now.
+type implies. An `Optimize`d write of the same values is 14.55 bytes/row, smaller
+than every parquet row here, and it costs 7.2 s rather than 40 ms: the pass reads
+every value and measures every candidate at the codec's best level, and the
+default is what the table reports because most callers do not want to pay that.
 
 keine is smaller than parquet at every compression level, three times faster to
 write at every one of them, and four times faster reading a single column.
@@ -327,25 +334,25 @@ rather than a claim about the table:
 
 | | bytes/row | write | read all |
 | --- | --- | --- | --- |
-| keine | 160.23 | 320 ms | 168 ms (scoped) |
-| parquet zstd | 166.74 | 834 ms | 243 ms |
-| parquet snappy | 236.64 | 868 ms | 298 ms |
-| parquet none | 380.95 | 721 ms | 112 ms |
+| keine | 160.23 | 310 ms | 161 ms (scoped) |
+| parquet zstd | 166.74 | 936 ms | 242 ms |
+| parquet snappy | 236.64 | 742 ms | 306 ms |
+| parquet none | 380.95 | 861 ms | 114 ms |
 
 Real data keeps the write conclusion the synthetic data reached. This file is
-mostly one text column of HTML comment bodies — 86 MB of the 108 MB encoded, which
-flate turns into 36 MB — and the rest is thirteen million integers and a few short
-strings. keine is four percent smaller than parquet's zstd, writes 2.6 times
-faster, and reads 45 percent faster scoped. Parquet's uncompressed file is the
+mostly one text column of HTML comment bodies, 86 MB of the 108 MB encoded, which
+flate turns into 36 MB, and the rest is thirteen million integers and a few short
+strings. keine is four percent smaller than parquet's zstd, writes three times
+faster, and reads 50 percent faster scoped. Parquet's uncompressed file is the
 fastest read of the four and 2.4 times the size, which is the trade being bought.
 
-`Optimize` on the same shard takes the write to 20.4 s and the file to 157.05
-bytes per row, so the pass costs sixty times the write and recovers two percent of
-the file. What it buys is visible per column: `by`, a string column whose values
+`Optimize` on the same shard takes the write to 35.4 s and the file to 144.75
+bytes per row, so the pass costs a hundred times the write and recovers ten percent
+of the file. What it buys is visible per column: `by`, a string column whose values
 cluster by author, becomes a dictionary; `title`, whose values share a site prefix
 and a suffix, becomes affix; `parent`, a mostly-sparse id column, stops paying for
 subtraction on values it does not have. The other nine columns keep the layout
-their type gave them. That is the honest shape of the trade — the pass is right
+their type gave them. That is the honest shape of the trade: the pass is right
 about which columns it changes and ruinously expensive for how little it changes.
 
 The shard also found a bug the benchmark could not. Compressing a column's blocks
@@ -368,22 +375,31 @@ fills the machine, which took the comparison file's read from 34ms to 27ms.
 What is left of the write gap is `compress/flate`. The standard library ships no
 zstd, so there is no faster codec to reach for, only a slower setting to stop
 using. DEFLATE's cost is not symmetric in what it is given, so the level is where
-the time lives. On this dataset's columns, measured at every level: the
-pseudo-random float64 column compresses 2.81x at level 6 in 200ms and 2.69x at
-level 3 in 35ms, and the near-distinct string column compresses 5.62x in 82ms and
-5.44x in 43ms. The last three levels buy four hundredths of a ratio for six times
-the time. Writing at level 3 costs about nine percent of the file size and halves
-the write.
+the time lives — but only on the write side. Decompression does not search, so a
+block compressed harder takes no longer to read back, which makes the level the
+one knob whose price is write time alone.
+
+That is why the default and `Optimize` part ways on it. A writer that has not been
+asked to scan the data writes at level 3, because the layout a type implies is
+free and the caller has not decided the data is worth a pass. `Optimize` has
+decided exactly that, so it measures and writes at level 9. On a 255000-row
+hacker-news shard the difference is eight percent of the file: 160.23 bytes per row
+at level 3, 153.31 at level 6, 147.43 at level 9. Reading any of the three costs
+about the same, because decompression does not search. The pass also picks its
+layouts at that level, so the encoding it reports is the one the file gets.
+`OptimizeLevel` sets it, and `CompressLevel` sets the level of every row group
+written without a pass.
 
 Parquet pays nothing to choose a layout: its encodings are compiled in. A keine
 write that has not been Optimized pays the same nothing, because the layout comes
-from the type. The 43 ms above is encoding and compressing the five columns and
+from the type. The 40 ms above is encoding and compressing the five columns and
 nothing else, which is what buys the size advantage over a format with a better
 compressor: keine has a worse one and spends the time it saved on not measuring.
 
-`Optimize` trades that back. Its 1.26 s is a full encode and compress pass per
-candidate per column — thirty-six measurements on this file — and only three of
-them change anything. A caller who wants it pays for the nine that do not, because
+`Optimize` trades that back. Its 7.2 s is a full encode and compress pass per
+candidate per column, thirty-six measurements on this file, each one now at the
+codec's best level rather than the write's default. Only three of them change
+anything. A caller who wants it pays for the thirty-three that do not, because
 there is no way to know which three without measuring all of them.
 
 A write's allocations were the same machinery, twice over. Each compressor owns a

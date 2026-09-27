@@ -9,28 +9,25 @@ import (
 	"unsafe"
 )
 
-// dest is the reusable destination for one column's decoded values. Fixed width
-// types need only vals: a decoder writes its result into it rather than
-// allocating one, so a column that repeats costs no allocation after the first
-// read. Strings and byte slices are slices of buf rather than a copy each, so
-// they need that too, and a dictionary column unpacks its indices into idx.
+// dest holds one column's decoded values, reused across reads. Decoders write
+// their results into vals instead of allocating, so a repeating column costs no
+// allocation after the first read. String and byte slice values point into buf,
+// and a dictionary column unpacks its indices into idx.
 //
-// The values a decoder returns alias these buffers, so a path that reuses them
-// hands them out only for as long as it can guarantee the caller is finished
-// with them. The boxing paths pass a fresh dest and let the caller keep what it
-// was given.
+// The returned values alias these buffers, so a path that reuses a dest may only
+// hand out its values while it knows the caller is done with them. The boxing
+// paths pass a fresh dest instead.
 type dest struct {
 	vals any
 	buf  []byte
 	idx  []uint32
 }
 
-// sizedSlice returns n elements, reusing have's capacity when it is already that
-// wide. A decoder that writes into its result instead of allocating one is what
-// keeps a repeating column free after its first read. A column of no values
-// still gets an empty slice rather than a nil one, because that is what it was
-// given before the buffers were reused and a caller comparing with
-// reflect.DeepEqual can tell them apart.
+// sizedSlice returns n elements, reusing have's capacity when it is already wide
+// enough. Writing into the result instead of allocating is what makes a repeated
+// column free after its first read. An empty column still gets an empty slice,
+// not a nil one, so a caller comparing with reflect.DeepEqual sees the same
+// value each time.
 func sizedSlice[T any](have []T, n int) []T {
 	if have != nil && cap(have) >= n {
 		return have[:n]
@@ -48,9 +45,9 @@ func DecodePlain(b []byte, typ uint8) ([]any, error) {
 	return boxValues(typed), nil
 }
 
-// decodePlainTyped decodes plain data into a slice of the Go type for typ, []int64
-// for TypeInt64 and so on, rather than []any. DecodePlain boxes it, and the typed
-// reader uses it to skip the boxing altogether.
+// decodePlainTyped decodes plain data as a slice of the Go type for typ, []int64
+// for TypeInt64 and so on, rather than []any. DecodePlain boxes the result; the
+// typed reader uses this to skip boxing.
 func decodePlainTyped(b []byte, typ uint8, d *dest) (any, error) {
 	switch typ {
 	case TypeBool:
@@ -98,12 +95,10 @@ func decodePlainTyped(b []byte, typ uint8, d *dest) (any, error) {
 }
 
 // decodePlainVarlen decodes the length-prefixed plain form used by strings and
-// byte slices. It takes the values' total length up front so it can size both
-// the result and its backing buffer in one pass: strings are slices of that
-// buffer rather than a copy each, which is what keeps a high cardinality string
-// column from allocating once per value. Byte slices still get their own copy
-// each, because they are mutable and a caller writing one would otherwise
-// clobber its neighbours.
+// byte slices. varlenStats supplies the value count and total length up front,
+// so the result and its backing buffer are sized in one pass. Strings point into
+// that shared buffer instead of copying, while byte slices still copy because
+// they are mutable and a caller writing one would clobber its neighbours.
 func decodePlainVarlen(b []byte, typ uint8, d *dest) (any, error) {
 	nvals, total, ok := varlenStats(b)
 	if !ok {
@@ -112,8 +107,8 @@ func decodePlainVarlen(b []byte, typ uint8, d *dest) (any, error) {
 
 	if typ == TypeString {
 		// One buffer holds every value's bytes and each string points into it.
-		// Strings are immutable, so sharing the buffer cannot corrupt a value,
-		// and N distinct strings cost two allocations instead of N+1.
+		// Strings are immutable, so sharing cannot corrupt a value, and N distinct
+		// strings cost two allocations instead of N+1.
 		text := sizedSlice(d.buf, total)
 		d.buf = text
 		out, _ := d.vals.([]string)
@@ -143,10 +138,10 @@ func decodePlainVarlen(b []byte, typ uint8, d *dest) (any, error) {
 	return out, nil
 }
 
-// varlenStats is the length prefix pass over a plain varlen chunk: the number
-// of values and how many bytes they occupy in total. Both are needed to size
-// the result and its backing buffer before any value is placed. When the chunk
-// is truncated, nvals is the index of the value it happened at.
+// varlenStats walks the length prefixes of a plain varlen chunk and returns the
+// number of values and how many bytes they occupy in total. Both are needed to
+// size the result and its backing buffer before any value is placed. On a
+// truncated chunk nvals is the index where it happened.
 func varlenStats(b []byte) (nvals, total int, ok bool) {
 	for len(b) > 0 {
 		if len(b) < 4 {
@@ -164,9 +159,9 @@ func varlenStats(b []byte) (nvals, total int, ok bool) {
 	return nvals, total, true
 }
 
-// stringAt is the string at b[off:off+n] without copying it. A zero length
-// string is empty and taking the address of an empty slice's first element
-// panics, so that case does not go near it.
+// stringAt is the string at b[off:off+n] without copying it. A zero length value
+// returns "" because taking the address of an empty slice's first element
+// panics.
 func stringAt(b []byte, off, n int) string {
 	if n == 0 {
 		return ""
@@ -193,8 +188,8 @@ func DecodeRLEBitpack(b []byte, n int) []bool {
 }
 
 // decodeRLEBitpack is DecodeRLEBitpack writing into d. The bitmap only sets the
-// true bits, so a reused destination has to be cleared first: the bits a
-// previous read left set are indistinguishable from ones this one wrote.
+// true bits, so a reused destination is cleared first; bits left set by a
+// previous read would be indistinguishable from the ones written now.
 func decodeRLEBitpack(b []byte, n int, d *dest) []bool {
 	out, _ := d.vals.([]bool)
 	out = sizedSlice(out, n)
@@ -249,8 +244,8 @@ func decodeOffsetBytes(b []byte, d *dest) ([][]byte, error) {
 	if len(b) < hdr {
 		return nil, fmt.Errorf("keine: offset bytes header truncated")
 	}
-	// An offset is read where it is used rather than unpacked ahead of the
-	// values, which is one slice a column long that nobody keeps.
+	// Read each offset where it is used rather than unpacking the whole column of
+	// them first, which would allocate a slice nobody keeps.
 	at := func(i int) int { return int(binary.LittleEndian.Uint32(b[4+4*i:])) }
 	raw := b[hdr:]
 
@@ -272,11 +267,10 @@ func decodeOffsetBytes(b []byte, d *dest) ([][]byte, error) {
 }
 
 // DecodeAffix is the inverse of EncodeAffix. Each value is its prefix, its
-// middle and its suffix, and the middles are a length-prefixed stream, so the
-// result and the buffer behind it are sized before the first value is read. As
-// in the plain path, strings are slices of that buffer and byte slices each get
-// their own copy, because a caller writing one would otherwise clobber its
-// neighbours.
+// middle and its suffix, and the middles form a length-prefixed stream, so the
+// result and its backing buffer are sized before the first value is read. As in
+// the plain path, strings are slices of that buffer and byte slices each get
+// their own copy, since a caller writing one would clobber its neighbours.
 func DecodeAffix(b []byte, typ uint8) (any, error) {
 	return decodeAffix(b, typ, &dest{})
 }
@@ -345,7 +339,7 @@ func decodeAffix(b []byte, typ uint8, d *dest) (any, error) {
 
 // DecodeDict is the inverse of EncodeDict. A dictionary carries its entries but
 // not the type of the values they encode, so the values come back as the bytes
-// they were keyed on; a reader that knows the column's type decodes them through
+// they were keyed on. A reader that knows the column's type decodes them through
 // the typed path instead.
 func DecodeDict(b []byte) ([][]byte, error) {
 	vals, err := decodeDictTyped(b, TypeBytes, &dest{})
@@ -355,11 +349,11 @@ func DecodeDict(b []byte) ([][]byte, error) {
 	return vals.([][]byte), nil
 }
 
-// decodeDictTyped decodes a dictionary chunk into the values of typ. Entries are
+// decodeDictTyped decodes a dictionary chunk into the values of typ. Entries hold
 // the encoded form of a value, little-endian for the fixed width types and raw
-// bytes for strings and byte slices, so a fixed width type's entries are laid
-// out in value order and decoded as one plain column, and the strings a string
-// column converts are the distinct entries rather than one per value.
+// bytes for strings and byte slices. A fixed width type's entries are laid out in
+// value order and decoded as one plain column; a string column converts each
+// distinct entry once rather than once per value.
 func decodeDictTyped(b []byte, typ uint8, d *dest) (any, error) {
 	if len(b) < 12 {
 		return nil, fmt.Errorf("keine: dict data truncated")
@@ -373,8 +367,8 @@ func decodeDictTyped(b []byte, typ uint8, d *dest) (any, error) {
 	}
 	indices := decodeBitunpack(b[12:12+idxBytes], nvals, uint(nbits), d)
 
-	// The entries are the dictionary's own values, which a caller of this chunk
-	// never sees, so they are decoded into a destination of their own.
+	// The entries are the dictionary's own values, never returned to the caller,
+	// so they go into a destination of their own.
 	entries, err := decodeOffsetBytes(b[12+idxBytes:], &dest{})
 	if err != nil {
 		return nil, err
@@ -385,8 +379,8 @@ func decodeDictTyped(b []byte, typ uint8, d *dest) (any, error) {
 
 	if fixedWidth(typ) == 0 {
 		// Strings and byte slices key on their own bytes, so the entries are the
-		// values already. A string column converts each distinct entry once and
-		// shares the headers across every value that repeats it.
+		// values already. A string column converts each distinct entry once, and
+		// every value that repeats it shares that string.
 		if typ == TypeString {
 			dict := make([]string, len(entries))
 			for i, e := range entries {
@@ -413,15 +407,15 @@ func indexDict[T any](dict []T, indices []uint32, d *dest) ([]T, error) {
 	return out, nil
 }
 
-// fixedDictEntries decodes a fixed width type's entries in value order, so the
-// chunk decodes as one plain column of the declared type. An entry that is not
-// exactly that wide is a file disagreeing with its own schema, and reading it
-// stops rather than letting a short entry shift every value after it.
+// fixedDictEntries lays a fixed width type's entries out in value order so the
+// chunk decodes as one plain column of the declared type. An entry of the wrong
+// width means the file disagrees with its own schema, so decoding stops rather
+// than letting a short entry shift every value after it.
 func fixedDictEntries(entries [][]byte, indices []uint32, typ uint8, d *dest) (any, error) {
 	width := fixedWidth(typ)
-	// The flat stream is the plain column this chunk decodes as, and the buffer
-	// is the one a string column would have used; a fixed width column never
-	// needs both in one decode.
+	// The flat stream is the plain column this chunk decodes as. It reuses d.buf,
+	// the buffer a string column would have needed, which a fixed width column
+	// never uses in the same decode.
 	flat := sizedSlice(d.buf, len(indices)*width)
 	d.buf = flat
 	off := 0
@@ -455,18 +449,18 @@ func fixedWidth(typ uint8) int {
 	return 0
 }
 
-// bitunpack is the inverse of bitpackIndices. b must hold n values at nbits
-// each, which the caller has already sized, so the loop assembles bytes into
-// values rather than testing one bit at a time. The accumulator never holds
-// more than nbits + 7 bits, which fits in a uint64 for every width a uint32
-// index can need, so one path handles all of them.
+// bitunpack is the inverse of bitpackIndices. b must hold n values at nbits each,
+// a length the caller has already checked, so the loop assembles bytes into
+// values instead of testing one bit at a time. The accumulator never holds more
+// than nbits + 7 bits, which fits in a uint64 for every width a uint32 index can
+// need.
 func bitunpack(b []byte, n int, nbits uint) []uint32 {
 	return decodeBitunpack(b, n, nbits, &dest{})
 }
 
-// decodeBitunpack is bitunpack writing into d. Every index is zero when the
-// values were all the dictionary's first entry, which is the early return, so a
-// reused destination is cleared first the same way the bitmap path is.
+// decodeBitunpack is bitunpack writing into d. As in the bitmap path, a reused
+// destination is cleared first, because nbits == 0 means every index is zero and
+// returns early without writing any of them.
 func decodeBitunpack(b []byte, n int, nbits uint, d *dest) []uint32 {
 	out := sizedSlice(d.idx, n)
 	d.idx = out
@@ -489,11 +483,10 @@ func decodeBitunpack(b []byte, n int, nbits uint, d *dest) []uint32 {
 	return out
 }
 
-// decodeTyped dispatches a chunk to the decoder for enc and returns the values
-// as a slice of the Go type that decoder produces, []int64 from EncDelta and
-// []string from EncDict. n is the number of values in the chunk. d is the
-// destination the decoders write into; pass a fresh one when the caller keeps
-// the result, since every value it gets back points into it.
+// decodeTyped dispatches a chunk to the decoder for enc and returns the values as
+// the Go type that decoder produces, []int64 from EncDelta and []string from
+// EncDict. n is the number of values in the chunk. Pass a fresh d when the caller
+// keeps the result, because every value returned points into it.
 func decodeTyped(enc uint8, data []byte, n int, typ uint8, d *dest) (any, error) {
 	switch enc {
 	case EncPlain:
@@ -546,15 +539,14 @@ func decodeWith(enc uint8, data []byte, n int, typ uint8) ([]any, error) {
 }
 
 // boxValues converts a typed slice, []int64, []string and so on, into []any
-// without copying a single value. Each interface header points at its element
-// where it already sits in the source slice, so a column costs one allocation
-// instead of one per value: converting a value type to an interface allocates a
-// box for it, and a column of those is a column of boxes.
+// without copying a value. Each interface header points at its element where it
+// already sits in the source slice, so a column costs one allocation instead of
+// one per value.
 //
-// Keeping interior pointers into s is safe because the decoders build a fresh
-// slice for every column and the caller takes ownership of it, so nothing
-// reuses that backing array. A type the format does not use has no values to
-// box, and the decoders only ever hand it one of the thirteen.
+// Interior pointers into s are safe because the decoders build a fresh slice for
+// every column and the caller takes ownership of it, so nothing reuses that
+// backing array. A type the format never uses has no values to box, and the
+// decoders only ever pass one of the thirteen.
 func boxValues(typed any) []any {
 	switch s := typed.(type) {
 	case []bool:
@@ -594,9 +586,9 @@ func boxSlice[T any](s []T) []any {
 		return out
 	}
 
-	// Converting the zero value once yields the exact type pointer this element
-	// type needs, which every interface in the column then shares. Converting a
-	// real element would do the same and cost the same one allocation.
+	// Converting the zero value once yields the type pointer every interface in
+	// the column then shares. Converting a real element would give the same
+	// pointer and cost the same single allocation.
 	var zero T
 	sample := any(zero)
 	tag := (*efaceHeader)(unsafe.Pointer(&sample)).typ
@@ -610,16 +602,16 @@ func boxSlice[T any](s []T) []any {
 }
 
 // efaceHeader is the layout of an empty interface, which is what a []any holds.
-// It is runtime.iface's empty counterpart, with a type pointer in place of an
-// itab.
+// It is the empty counterpart of runtime.iface, with a type pointer in place of
+// an itab.
 type efaceHeader struct {
 	typ  unsafe.Pointer
 	data unsafe.Pointer
 }
 
 // asValues converts a typed slice into []T. The second result is false when the
-// slice's element type is not T, so asking for the wrong type is an error
-// rather than a silent mismatch.
+// slice's element type is not T, so a wrong type is an error rather than a
+// silent mismatch.
 func asValues[T any](typed any) ([]T, bool) {
 	switch s := typed.(type) {
 	case []bool:
@@ -654,7 +646,7 @@ func asValues[T any](typed any) ([]T, bool) {
 
 func convertSlice[S any, T any](s []S) ([]T, bool) {
 	// A slice holds one element type, so the zero value settles whether T fits
-	// without checking every value.
+	// without checking each value.
 	var zero S
 	if _, ok := any(zero).(T); !ok {
 		return nil, false
@@ -927,8 +919,8 @@ func coerceString(v any) (string, error) {
 	return "", fmt.Errorf("keine: cannot coerce %T to string", v)
 }
 
-// coerceBytes returns the raw bytes of v. Strings holding the fmt "%v" form of
-// a byte slice, which is what dictionary encoded byte columns decode to, are
+// coerceBytes returns the raw bytes of v. A string holding the fmt "%v" form of
+// a byte slice, which is what a dictionary encoded byte column decodes to, is
 // parsed back into a slice.
 func coerceBytes(v any) ([]byte, error) {
 	switch x := v.(type) {

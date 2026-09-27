@@ -2,8 +2,10 @@ package keine
 
 import (
 	"bytes"
+	"compress/flate"
 	"errors"
 	"fmt"
+	"math/rand"
 	"reflect"
 	"testing"
 )
@@ -173,6 +175,19 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
+// benchmarkLayoutsAt is BenchmarkLayouts at a given level, for a test that has to
+// measure a column the way Optimize is about to measure it. BenchmarkLayouts
+// itself stays at the default level, which is what the writer does when it has not
+// been asked to optimise.
+func benchmarkLayoutsAt(t *testing.T, col []any, schema ColumnSchema, level int) []LayoutResult {
+	t.Helper()
+	typed, err := canonicalColumnTyped(col, schema.Type)
+	if err != nil {
+		t.Fatalf("canonicalColumnTyped(%s): %v", schema.Name, err)
+	}
+	return benchmarkLayoutsTyped(typed, schema, &measureScratch{}, level)
+}
+
 func TestBenchmarkLayouts(t *testing.T) {
 	// A boolean column separates the encodings sharply: RLEBitpack costs one
 	// bit per value, Plain one byte per value.
@@ -236,9 +251,9 @@ func TestBenchmarkLayouts(t *testing.T) {
 		t.Errorf("Dict+None won on an all-distinct column: %v", strResults[0])
 	}
 
-	// Compression is now in play: a repetitive string column must beat its
-	// uncompressed Plain layout by a wide margin, and the winner has to use a
-	// real codec rather than CompressNone.
+	// Compression is now in play. A repetitive string column must beat its
+	// uncompressed Plain layout by a wide margin, and the winner has to use a real
+	// codec rather than CompressNone.
 	var plainNone int
 	for _, r := range strResults {
 		if r.Encoding == EncPlain && r.Compress == CompressNone {
@@ -257,10 +272,10 @@ func TestBenchmarkLayouts(t *testing.T) {
 	}
 }
 
-// The layout a writer falls back on has to be a property of the type alone,
-// since it is chosen before any value is read. Whatever a column holds, this is
-// what it gets: bool packs to a bit, deltas cost a subtraction, and everything
-// else is stored plainly rather than assumed about.
+// The layout a writer falls back on has to be a property of the type alone, since
+// it is chosen before any value is read. Whatever a column holds, this is what it
+// gets: bool packs to a bit, deltas cost a subtraction, everything else is stored
+// plainly.
 func TestDefaultLayout(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -353,8 +368,8 @@ func TestWriterUsesDefaultLayouts(t *testing.T) {
 
 // Options overrides the layout the type implies and the codec the writer defaults
 // to, and the columns still have to round trip through what was asked for. The
-// codec's zero value is CompressNone, a valid codec, so an empty Options asks for
-// the type's default encoding stored uncompressed.
+// codec's zero value is CompressNone, which is a valid codec, so an empty Options
+// asks for the type's default encoding stored uncompressed.
 func TestWriterOptions(t *testing.T) {
 	schema := []ColumnSchema{
 		{Name: "i", Type: TypeInt64},
@@ -418,8 +433,8 @@ func TestWriterOptions(t *testing.T) {
 	}
 }
 
-// An option this build cannot serve has to be refused before anything is
-// written, rather than producing a file that is silently missing its data.
+// An option this build cannot serve has to be refused before anything is written,
+// rather than producing a file that is silently missing its data.
 func TestWriterOptionsRejected(t *testing.T) {
 	schema := []ColumnSchema{{Name: "i", Type: TypeInt64}}
 	cols := [][]any{{int64(1), int64(2)}}
@@ -463,8 +478,8 @@ func TestWriterEncodingWrongForType(t *testing.T) {
 
 // Optimize reads the whole column rather than trusting the type, so a column the
 // default serves badly has to come out smaller, and the file still has to read
-// back. Two hundred values repeated a hundred times each is what the encodings
-// that look at the values are for and what Plain pays for.
+// back. Two hundred values repeated a hundred times each is the input the
+// value-aware encodings are for, and what Plain pays for.
 func TestOptimizeBeatsDefault(t *testing.T) {
 	col := make([]any, 20000)
 	for i := range col {
@@ -472,16 +487,17 @@ func TestOptimizeBeatsDefault(t *testing.T) {
 	}
 	schema := []ColumnSchema{{Name: "s", Type: TypeString}}
 
-	// The default for a string column is Plain, which is what Optimize has to
-	// beat to have been worth the pass.
+	// The default for a string column is Plain, which is what Optimize has to beat
+	// to be worth the pass. Measured at the level the pass measures at, since a
+	// candidate compressed at another level is not the one it chose between.
 	var plain LayoutResult
-	for _, r := range BenchmarkLayouts(col, schema[0]) {
+	for _, r := range benchmarkLayoutsAt(t, col, schema[0], flate.BestCompression) {
 		if r.Encoding == EncPlain && r.Compress == CompressFlate {
 			plain = r
 		}
 	}
 	if plain.CompressedSize == 0 {
-		t.Fatal("BenchmarkLayouts omitted the Plain+Flate candidate")
+		t.Fatal("the column measured to no Plain+Flate candidate")
 	}
 
 	var buf bytes.Buffer
@@ -532,6 +548,58 @@ func TestOptimizeBeatsDefault(t *testing.T) {
 	}
 }
 
+// Optimize measures at OptimizeLevel and the row groups after it are written at
+// that level, so a writer whose CompressLevel is lower writes the optimised
+// columns at the pass's level rather than its own. A column written at a level
+// other than the one it was measured at is not the column the measurement picked.
+func TestOptimizeWritesAtItsOwnLevel(t *testing.T) {
+	// Sentences that agree on shape and disagree on the numbers, so a good match
+	// is long and a near miss is close. That is what DEFLATE searches harder for at
+	// the higher levels, and what makes the file respond to the level at all.
+	rng := rand.New(rand.NewSource(11))
+	col := make([]any, 3000)
+	for i := range col {
+		col[i] = fmt.Sprintf("row %d of the shard: the column store wrote %d blocks at level %d and read them back at level %d, which the benchmark then reported as %d bytes per row",
+			i, rng.Intn(64), rng.Intn(9)+1, rng.Intn(9)+1, rng.Intn(9000))
+	}
+	schema := []ColumnSchema{{Name: "s", Type: TypeString}}
+
+	write := func(optimize bool, compressLevel, optimizeLevel int) []byte {
+		var buf bytes.Buffer
+		w := NewWriterWithOptions(&buf, schema, Options{
+			Compress:      CompressFlate,
+			CompressLevel: compressLevel,
+			OptimizeLevel: optimizeLevel,
+		})
+		if optimize {
+			if err := w.Optimize([][]any{col}); err != nil {
+				t.Fatalf("Optimize: %v", err)
+			}
+		}
+		if err := w.AddRowGroup([][]any{col}); err != nil {
+			t.Fatalf("AddRowGroup: %v", err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		return buf.Bytes()
+	}
+
+	// The column has to cost the higher level something, or the rest of the test
+	// compares two identical files and says nothing.
+	low := len(write(false, 1, 0))
+	high := len(write(false, 9, 0))
+	if low <= high {
+		t.Fatalf("level 1 wrote %d bytes and level 9 wrote %d; this column does not respond to the level", low, high)
+	}
+
+	// CompressLevel is 1 and OptimizeLevel is 9, so the pass is the only thing
+	// that can put the file at level 9.
+	if got := len(write(true, 1, 9)); got > high {
+		t.Errorf("Optimize on a level 1 writer wrote %d bytes, more than the %d a plain level 9 write produced; the row group was not written at the level it was measured at", got, high)
+	}
+}
+
 // Optimize decides once and applies to every row group after it, since the
 // columns of a dataset share a shape across the groups it is split into.
 func TestOptimizeAppliesToLaterRowGroups(t *testing.T) {
@@ -543,9 +611,9 @@ func TestOptimizeAppliesToLaterRowGroups(t *testing.T) {
 	for i := range col {
 		col[i] = fmt.Sprintf("bucket-%d", i%32)
 	}
-	results := BenchmarkLayouts(col, schema[0])
+	results := benchmarkLayoutsAt(t, col, schema[0], flate.BestCompression)
 	if len(results) == 0 {
-		t.Fatal("BenchmarkLayouts returned no candidates")
+		t.Fatal("the column measured to no candidates")
 	}
 	if results[0].Encoding == EncPlain {
 		t.Fatalf("the test's column does not invite Plain, it chose %s", results[0].Name)
@@ -633,8 +701,8 @@ func TestOptimizeErrors(t *testing.T) {
 		var buf bytes.Buffer
 		w := NewWriter(&buf, schema)
 		_ = w.Optimize([][]any{{struct{}{}}, {"a"}})
-		// The header is written at construction, so the file starts at the magic
-		// and the version. Nothing after it: no chunk, no footer.
+		// The header is written at construction, so the file starts at the magic and
+		// the version. Nothing follows it: no chunk, no footer.
 		if got := buf.Len(); got != len(magic)+1 {
 			t.Errorf("wrote %d bytes while reporting an error, want the %d byte header only",
 				got, len(magic)+1)
@@ -923,7 +991,7 @@ func TestReadColumnNullableSchemaDense(t *testing.T) {
 	}
 }
 
-// TestReadRowGroupScoped covers the typed path: every type has to come back
+// TestReadRowGroupScoped covers the typed path. Every type has to come back
 // through it unchanged, a column has to be readable alongside its neighbours, and
 // the slices only stay valid inside the call. Asking for a type a column does not
 // hold, or a position that was not requested, is an error rather than a wrong
@@ -1145,8 +1213,8 @@ func TestReadRowGroupScopedNarrows(t *testing.T) {
 		if !reflect.DeepEqual(got, []int8{42, 43}) {
 			return fmt.Errorf("Column[int8] = %v, want [42 43]", got)
 		}
-		// Asking for the intermediate type is a mismatch: the column declares
-		// int8, so that is what it decodes to here.
+		// Asking for the intermediate type is a mismatch. The column declares int8,
+		// so that is what it decodes to here.
 		if _, err := Column[int64](c, 0); err == nil {
 			return errors.New("Column[int64] on an int8 column succeeded, want a type mismatch error")
 		}
@@ -1159,8 +1227,8 @@ func TestReadRowGroupScopedNarrows(t *testing.T) {
 
 // TestMultiBlockRoundTrip covers columns long enough to split into several
 // blocks. A block boundary is a byte offset into the encoded stream, so the
-// values a decoder reassembles have to be identical to the ones written, and a
-// column has to round trip through both read paths when it spans blocks.
+// decoder has to reassemble values identical to the ones written, and a column has
+// to round trip through both read paths when it spans blocks.
 func TestMultiBlockRoundTrip(t *testing.T) {
 	// Enough values for a little over two blocks at eight bytes each, so the
 	// last block is short and the first two are full.
@@ -1210,11 +1278,11 @@ func TestMultiBlockRoundTrip(t *testing.T) {
 }
 
 // TestReadRowGroupScopedReused reads the same columns over and over. The scoped
-// path decodes into destinations the Reader keeps, so a second read writes over
-// the first's values, and a decoder that only writes some of its elements would
-// leave the previous read's behind for the caller to see. The encodings that do
-// that are the ones with a zero or a run-length form: a bitmap, bit packed
-// indices and a dictionary whose values are all one entry.
+// path decodes into destinations the Reader keeps, so a second read overwrites the
+// first's values. A decoder that only writes some of its elements would leave the
+// previous read's behind for the caller to see. The encodings that do that are the
+// ones with a zero or a run-length form: a bitmap, bit packed indices and a
+// dictionary whose values are all one entry.
 func TestReadRowGroupScopedReused(t *testing.T) {
 	schema := []ColumnSchema{
 		{Name: "b", Type: TypeBool},
@@ -1249,8 +1317,8 @@ func TestReadRowGroupScopedReused(t *testing.T) {
 	}
 
 	// read returns the columns it asked for and copies them out of the Reader's
-	// buffers, so the values survive the next call. The whole point of the copy
-	// is that nothing else does.
+	// buffers, so the values survive the next call. The copy exists because nothing
+	// else does it.
 	read := func(cols []int) ([][]any, error) {
 		got := make([][]any, len(cols))
 		err := r.ReadRowGroupScoped(0, cols, func(c *Columns) error {

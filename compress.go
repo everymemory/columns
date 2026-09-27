@@ -11,18 +11,19 @@ import (
 	"sync"
 )
 
-// flateLevel is the DEFLATE level used by the flate, gzip and zlib codecs. It is
-// always valid for the three constructors below.
+// flateLevel is the DEFLATE level the flate, gzip and zlib codecs use when a
+// caller has not asked for one. It is always valid for the three constructors
+// below.
 //
-// Level 3 rather than the default 6. On two million bytes of pseudo-random
-// float64, level 6 compressed 3.80x in 109ms and level 3 compressed 3.75x in
-// 28ms; on four million bytes of repeated email strings, 7.93x in 44ms against
-// 7.88x in 25ms. The last three levels buy two tenths of a percent for four
-// times the time.
+// Level 3, not the default 6. On synthetic data the levels above it buy two
+// tenths of a percent of size for four times the time. Level 1 is worse still:
+// it writes a smaller file that costs more to read than the bytes it saved.
 //
-// Level 1 is not worth it either. On the 200000-row benchmark it wrote 9.69 B/row
-// in 93ms against level 3's 9.07 B/row in 107ms, but reading the larger file took
-// 34ms against 27ms. The bytes it saves going out come back as read time.
+// Real data tells a different story. On a 255000-row hacker-news shard, level 9
+// writes 147.43 bytes per row against level 3's 160.23, eight percent smaller,
+// while both read in about 160ms because decompression does not search. Optimize
+// writes at that level, and a caller who wants it without the pass can ask for it
+// directly.
 const flateLevel = 3
 
 // LZW is configured least significant bit first with eight bit literals.
@@ -32,24 +33,21 @@ const (
 )
 
 // flateReaders recycles a DEFLATE decompressor between blocks. The decompressor
-// owns the sliding window and the huffman scratch, which is where most of a
-// read's memory goes once the decoders stopped allocating; a column of a few
-// hundred blocks would build and drop that many of them otherwise. Reset is
-// what makes one reusable, and it discards the previous block's state
-// entirely, so a reader taken from the pool is indistinguishable from a new
-// one.
+// owns the sliding window and the huffman scratch, which is most of a read's
+// memory now that the decoders no longer allocate. Without the pool, a column of
+// a few hundred blocks would build and drop that many of them. Reset discards the
+// previous block's state entirely, so a pooled reader is indistinguishable from
+// a new one.
 //
-// Gzip and zlib validate their checksums when the reader closes, so a pooled
-// one would have to be closed before it is reused rather than reset in place;
-// the flate codec is what the writer picks, and the other two are rare enough
-// that they still allocate.
+// Gzip and zlib check their checksums when the reader closes, so a pooled one
+// would have to be closed rather than reset in place. The flate codec is what the
+// writer picks, and the other two are rare enough that they still allocate.
 var flateReaders sync.Pool
 
-// compressLevel is the level a codec is asked for, with the zero value meaning
-// flateLevel and out of range values pulled back to the nearest valid one. Go's
-// own sentinels are inside that range and pass through: DefaultCompression is
-// the standard library's default and HuffmanOnly its fastest, and neither is
-// what this package picks but both are what a caller might ask for.
+// compressLevel maps a requested level onto a valid one. The zero value means
+// flateLevel and out of range values clamp to the nearest end. Go's own
+// sentinels are inside that range and pass through, so a caller can ask for
+// DefaultCompression or HuffmanOnly.
 func compressLevel(level int) int {
 	switch {
 	case level == 0:
@@ -62,12 +60,22 @@ func compressLevel(level int) int {
 	return level
 }
 
+// optimizeLevel is the level the Optimize pass measures and writes at. Zero
+// means the best a codec offers, not the best it can be asked for. A caller who
+// runs the pass has decided the data is worth a full walk over, and compressing
+// harder costs write time without costing read time.
+func optimizeLevel(level int) int {
+	if level == 0 {
+		return flate.BestCompression
+	}
+	return compressLevel(level)
+}
+
 // codecWriters recycles one DEFLATE compressor per codec and level. The level is
 // fixed when a writer is built and Reset does not change it, so a writer made
-// for one level cannot serve another: pooling them together would compress at
-// whichever level happened to be asked for first and say nothing about it. A
-// pool is built for each pair a write actually uses, and one made twice is
-// harmless, since only the pool stored first is ever drawn from.
+// for one level cannot serve another. Pooling them together would compress at
+// whichever level was asked for first and say nothing about it. A pool built
+// twice is harmless, since only the first one stored is ever drawn from.
 var codecWriters sync.Map
 
 // poolKey is the codec and level a pool's writers were built for.
@@ -76,8 +84,8 @@ type poolKey struct {
 	level int
 }
 
-// codecPool is the pool of writers for one codec at one level, making them with
-// make when the pair has not been used before.
+// codecPool returns the pool of writers for one codec at one level. It builds
+// the pool with make when the pair has not been used before.
 func codecPool(codec uint8, level int, make func() any) *sync.Pool {
 	key := poolKey{codec: codec, level: level}
 	if p, ok := codecWriters.Load(key); ok {
@@ -94,9 +102,8 @@ func Compress(data []byte, codec uint8) ([]byte, error) {
 }
 
 // compressAt is Compress at level, which the codecs that take one are built at
-// and the rest ignore. A writer has to compress a block at the level it measured
-// the candidates at, or the layout it picked on the measurements is not the one
-// the file gets.
+// and the rest ignore. A block has to be compressed at the level its layout was
+// measured at, or the file gets a different layout than the one that was chosen.
 func compressAt(data []byte, codec uint8, level int) ([]byte, error) {
 	level = compressLevel(level)
 	switch codec {
@@ -120,10 +127,10 @@ func compressAt(data []byte, codec uint8, level int) ([]byte, error) {
 // allocation. One stays with a column for the whole pass, and a column is the
 // unit of parallelism, so nothing else reaches it.
 //
-// compress hands back a slice of that buffer, which the next call overwrites,
-// so a caller has to be finished with one result before it asks for the next.
-// The two that use it only read a length and decompress into a buffer of their
-// own, so neither keeps anything.
+// compress hands back a slice of that buffer, which the next call overwrites, so
+// a caller has to be finished with one result before it asks for the next. The
+// two callers only read a length or decompress into a buffer of their own, so
+// neither keeps anything.
 type measureScratch struct {
 	buf bytes.Buffer
 }
@@ -141,15 +148,15 @@ func (ms *measureScratch) compress(data []byte, codec uint8, level int) ([]byte,
 	return ms.buf.Bytes(), nil
 }
 
-// compressStream writes the compressed form of data to w. Errors from Close are
-// reported only when Write succeeded, since a Write error is the more useful
-// one to surface. Close runs either way to flush the codec's buffers, after
-// which the writer goes back to its pool; Reset clears whatever state a failed
-// write left behind, so nothing about an erroring stream reaches the next one.
+// compressStream writes the compressed form of data to w. Close runs to flush
+// the codec's buffers either way, and its error is reported only when Write
+// succeeded, since a Write error is the more useful one to surface. The writer
+// then goes back to its pool; Reset clears whatever state a failed write left
+// behind, so nothing about an erroring stream reaches the next one.
 //
-// level has been through compressLevel, so the constructors below cannot reject
-// it. LZW has no level of its own and no Reset either, so it is still built
-// fresh per call and still allocates.
+// level has already been through compressLevel, so the constructors below cannot
+// reject it. LZW has no level of its own and no Reset either, so it is still
+// built fresh per call and still allocates.
 func compressStream(w io.Writer, data []byte, codec uint8, level int) error {
 	switch codec {
 	case CompressFlate:
@@ -209,8 +216,8 @@ func Decompress(data []byte, codec uint8) ([]byte, error) {
 }
 
 // decompressInto appends the decompressed form of data to dst and returns the
-// result, so a caller decoding many chunks can reuse one buffer. A reader
-// returns values that never point into that buffer, so recycling it is safe.
+// result, so a caller decoding many chunks can reuse one buffer. A reader's
+// values never point into that buffer, so recycling it is safe.
 func decompressInto(dst, data []byte, codec uint8) ([]byte, error) {
 	switch codec {
 	case CompressNone:
@@ -220,9 +227,8 @@ func decompressInto(dst, data []byte, codec uint8) ([]byte, error) {
 		if r == nil {
 			r = flate.NewReader(bytes.NewReader(nil))
 		}
-		// Reset reads nothing, so it cannot fail for a decompressor of this
-		// codec. Whatever reports otherwise is not a reader to hand back to the
-		// next block.
+		// Reset reads nothing, so it cannot fail for a decompressor of this codec.
+		// A reader that reports otherwise is not one to hand back to the next block.
 		if err := r.(flate.Resetter).Reset(bytes.NewReader(data), nil); err != nil {
 			return nil, err
 		}
@@ -257,14 +263,13 @@ func decompressInto(dst, data []byte, codec uint8) ([]byte, error) {
 // readAllInto is io.ReadAll appending into dst, which it grows as needed and
 // hands back with its capacity intact.
 //
-// Growth is checked rather than assumed. Every block on the read path hands
-// this a destination sized to its exact decompressed length, so a full buffer
-// means the reader is finished, not that it ran out of room. Growing the moment
-// the buffer filled allocated a copy of the whole column once per block and
-// discarded it on the next read, which was the read path's single biggest
-// allocation. Reading into scratch once the destination is full tells the two
-// apart: nothing more to read means the result already fits, and whatever it
-// does return is placed by the append that grows.
+// Growth is checked rather than assumed. Every block on the read path hands this
+// a destination sized to its exact decompressed length, so a full buffer means
+// the reader is finished, not that it ran out of room. Growing the moment the
+// buffer filled allocated a copy of the whole column once per block and
+// discarded it on the next read, which was the read path's biggest allocation.
+// Reading into scratch once the destination is full tells the two apart, and
+// whatever the reader still returns is placed by the append that grows.
 func readAllInto(dst []byte, r io.Reader) ([]byte, error) {
 	var scratch [4096]byte
 	for {

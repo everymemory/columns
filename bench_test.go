@@ -86,9 +86,9 @@ var benchColumns = []benchColumn{
 
 const benchRows = 10000
 
-// BenchmarkOptimize measures what scanning a whole column costs, which Optimize
-// pays once per dataset to stop guessing from the type. BenchmarkSizes next to it
-// shows what the scan buys.
+// BenchmarkOptimize measures the cost of scanning a whole column, which Optimize
+// pays once per dataset to stop guessing from the type. BenchmarkSizes shows what
+// that scan buys.
 func BenchmarkOptimize(b *testing.B) {
 	for _, c := range benchColumns {
 		col := c.build(benchRows)
@@ -105,8 +105,8 @@ func BenchmarkOptimize(b *testing.B) {
 	}
 }
 
-// BenchmarkSizes reports what each candidate costs, since the choice Optimize
-// makes is only meaningful next to the alternatives.
+// BenchmarkSizes reports the cost of each candidate. The choice Optimize makes is
+// only meaningful next to the alternatives.
 func BenchmarkSizes(b *testing.B) {
 	for _, c := range benchColumns {
 		col := c.build(benchRows)
@@ -186,8 +186,8 @@ func BenchmarkRead(b *testing.B) {
 }
 
 // BenchmarkTypedRead reads a column into []int64 through ReadColumn, which skips
-// the interface boxing ReadRowGroup pays for. Set against BenchmarkRead on the
-// same column, it shows what that boxing costs.
+// the interface boxing ReadRowGroup pays for. Against BenchmarkRead on the same
+// column it shows what that boxing costs.
 func BenchmarkTypedRead(b *testing.B) {
 	for _, c := range benchColumns {
 		if c.schema.Type != TypeInt64 {
@@ -226,8 +226,8 @@ func BenchmarkTypedRead(b *testing.B) {
 
 // comparisonColumns are the shapes a columnar workload actually sees: a
 // monotonic key, a random key, a low entropy float, a low cardinality string and
-// a high cardinality string that shares a suffix. comparisonRows is the row
-// count the whole-file numbers in the README are reported at.
+// a high cardinality string that shares a suffix. comparisonRows is the row count
+// the README's whole-file numbers are reported at.
 var comparisonColumns = []*benchColumn{
 	&benchColumns[1], // int64-run
 	&benchColumns[2], // int64-random
@@ -239,10 +239,10 @@ var comparisonColumns = []*benchColumn{
 const comparisonRows = 200000
 
 // BenchmarkComparison writes and reads one row group of all five comparison
-// columns in a single file, which is how a workload actually uses the format:
-// the columns are encoded in parallel and share one footer. It reports the file
-// size and both directions of the transfer, so the README's numbers are
-// reproducible with `go test -bench=BenchmarkComparison`.
+// columns in a single file, which is how a workload uses the format: the columns
+// are encoded in parallel and share one footer. It reports the file size and both
+// directions of the transfer, so the README's numbers reproduce with
+// `go test -bench=BenchmarkComparison`.
 func BenchmarkComparison(b *testing.B) {
 	schema := make([]ColumnSchema, len(comparisonColumns))
 	columns := make([][]any, len(comparisonColumns))
@@ -282,9 +282,9 @@ func BenchmarkComparison(b *testing.B) {
 		}
 	})
 	b.Run("write optimized", func(b *testing.B) {
-		// The default layouts are the type's, and Optimize is what it costs to
-		// trade them for the column's. Reported next to the default write, the
-		// difference is the price of the pass and what it bought.
+		// The default layouts are the type's, and Optimize is what it costs to trade
+		// them for the column's. Next to the default write, the difference is the
+		// price of the pass and what it bought.
 		optimized := func() []byte {
 			buf := &bytes.Buffer{}
 			w := NewWriter(buf, schema)
@@ -300,9 +300,9 @@ func BenchmarkComparison(b *testing.B) {
 			return buf.Bytes()
 		}
 		first := optimized()
-		b.ReportMetric(float64(len(first))/float64(comparisonRows), "B/row")
 
 		b.ResetTimer()
+		b.ReportMetric(float64(len(first))/float64(comparisonRows), "B/row")
 		for i := 0; i < b.N; i++ {
 			optimized()
 		}
@@ -344,8 +344,8 @@ func BenchmarkComparison(b *testing.B) {
 	})
 }
 
-// BenchmarkPartialRead measures skipping the columns a query does not want,
-// which is what ColMeta.ByteLength exists for.
+// BenchmarkPartialRead measures skipping the columns a query does not want. That
+// is what ColMeta.ByteLength exists for.
 func BenchmarkPartialRead(b *testing.B) {
 	const cols = 8
 	schema := make([]ColumnSchema, cols)

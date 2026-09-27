@@ -90,10 +90,10 @@ func TestReadChunkTruncated(t *testing.T) {
 	}
 }
 
-// TestReadChunkLyingHeader covers the chunk a corrupt or hostile file describes:
-// its block table asks for more bytes than the chunk has, and for a raw length
-// the blocks cannot match. Both have to fail rather than read past the chunk or
-// hand the decoder a column that is part zeros.
+// TestReadChunkLyingHeader covers a corrupt or hostile chunk header: the block
+// table asks for more bytes than the chunk has, and the raw length does not
+// match the blocks. Both must fail rather than read past the chunk or return a
+// column that is partly zeros.
 func TestReadChunkLyingHeader(t *testing.T) {
 	encode := func(raw, stored, blockRaw, blockStored uint32) []byte {
 		b := []byte{byte(EncPlain), byte(CompressNone)}
@@ -133,10 +133,10 @@ func TestReadChunkLyingHeader(t *testing.T) {
 	}
 }
 
-// TestDecompressBlock covers the two guards a well-formed file never trips: a
-// block that runs past the column's buffer, and one that decompresses to
-// something other than its recorded length. Both have to fail rather than leave
-// the decoder reading part of a column.
+// TestDecompressBlock covers two checks a well-formed file never trips: a block
+// that runs past the column's buffer, and one that does not decompress to its
+// recorded length. Both must fail rather than leave the decoder reading part of
+// a column.
 func TestDecompressBlock(t *testing.T) {
 	raw := make([]byte, 8)
 
@@ -160,16 +160,16 @@ func TestDecompressBlock(t *testing.T) {
 }
 
 // TestDecompressBlockTruncated reaches the read failure inside readAllInto. A
-// stream cut short fails once part of it is already placed, which is a different
-// branch from a stream that ends cleanly short of the space set aside for it, so
-// the bounds and length checks in decompressBlock do not cover it.
+// stream cut mid-decompress fails differently from one that ends cleanly short
+// of the space set aside for it, so the bounds and length checks in
+// decompressBlock do not cover it.
 func TestDecompressBlockTruncated(t *testing.T) {
 	data := bytes.Repeat([]byte{1, 2, 3, 4}, 2000)
 	compressed, err := Compress(data, CompressFlate)
 	if err != nil {
 		t.Fatalf("Compress: %v", err)
 	}
-	// Removing the tail takes the stream's terminating block with it, so the
+	// Cutting the stream in half takes the terminating block with it, so the
 	// reader fails rather than reporting an early end.
 	cut := compressed[:len(compressed)/2]
 
@@ -190,9 +190,9 @@ func TestCompressCodecs(t *testing.T) {
 		t.Errorf("Decompress(None) = %v, %v, want %v, nil", got, err, data)
 	}
 
-	// Every stdlib codec that can both write and read must round trip, and
-	// must actually transform the data: a codec that copies its input would
-	// silently mask a broken implementation.
+	// Every stdlib codec that can read and write must round trip, and must
+	// change the bytes: a codec that returned its input would hide a broken
+	// implementation.
 	for _, codec := range []uint8{CompressFlate, CompressGzip, CompressZlib, CompressLzw} {
 		compressed, err := Compress(data, codec)
 		if err != nil {
@@ -232,9 +232,9 @@ func TestCompressCodecs(t *testing.T) {
 }
 
 // TestPooledFlateReaderResetError reaches the one failure a pooled decompressor
-// can report. A flate reader never fails a reset, so the reader in the pool has
-// to be one that does: decompressInto has to hand the error on and keep that
-// reader out of the pool, where it would poison every read after it.
+// can report. A real flate reader never fails a reset, so the test puts one in
+// the pool that does. decompressInto must return that error and keep that reader
+// out of the pool, where it would fail every read after it.
 func TestPooledFlateReaderResetError(t *testing.T) {
 	flateReaders.Put(&failingResetReader{})
 	if _, err := decompressInto(nil, []byte{1, 2, 3}, CompressFlate); err == nil {
@@ -253,11 +253,10 @@ func (failingResetReader) Reset(io.Reader, []byte) error {
 	return fmt.Errorf("keine test: reset refused")
 }
 
-// TestCompressStreamErrors reaches each write failure inside compressStream.
-// Collecting into a failing writer is what makes those branches observable.
-// Each codec buffers and flushes on its own schedule, so the sweep tries every
-// failure point: a flush during Write hits the Write error path, and the final
-// flush at Close hits the Close error path.
+// TestCompressStreamErrors reaches each write failure inside compressStream by
+// collecting into a writer that fails. Each codec buffers and flushes on its own
+// schedule, so the sweep tries every failure point: a flush during Write hits
+// the Write error path, and the final flush at Close hits the Close error path.
 func TestCompressStreamErrors(t *testing.T) {
 	data := bytes.Repeat([]byte{1, 2, 3, 4}, 1<<18)
 	for _, codec := range []uint8{CompressFlate, CompressGzip, CompressZlib, CompressLzw} {
@@ -477,8 +476,8 @@ func TestDictSingleEntry(t *testing.T) {
 }
 
 // TestDictTypedRoundTrip covers the dictionary over every fixed width type,
-// where the entries are the values' little-endian form rather than their text,
-// and over the two variable length types, where they are the values' bytes.
+// where entries hold the values' little-endian form, and over the two variable
+// length types, where they hold the values' bytes.
 func TestDictTypedRoundTrip(t *testing.T) {
 	cases := []struct {
 		name string
@@ -513,9 +512,8 @@ func TestDictTypedRoundTrip(t *testing.T) {
 		}
 	}
 
-	// The same chunk read as part of a file comes back through the reader's
-	// narrowing path, and ReadColumn reads it into the declared type rather than
-	// failing on it.
+	// The same chunk read as part of a file goes through the reader's narrowing
+	// path, which reads it into the declared type rather than rejecting it.
 	int32vals := []int32{10, 20, 10, 20}
 	data, err := EncodeDict(int32vals)
 	if err != nil {
@@ -549,8 +547,8 @@ func TestDictTypedRoundTrip(t *testing.T) {
 	}
 }
 
-// TestDictTypedErrors covers the dictionary reads a file disagreeing with its
-// own schema reaches on a fixed width column: an index with no entry, and an
+// TestDictTypedErrors covers the dictionary reads a chunk that disagrees with
+// its own schema reaches on a fixed width column: an index with no entry, and an
 // entry that is not the width the type declares.
 func TestDictTypedErrors(t *testing.T) {
 	// One entry, two indices, the second pointing past it.
@@ -585,10 +583,10 @@ func TestBitpackRoundTrip(t *testing.T) {
 	}
 }
 
-// TestBitunpackClearsDestination covers a destination reused by two calls. The
-// first fills it with nonzero indices, the second decodes a dictionary of one
-// entry, which takes no bits per index and so writes nothing: without a clear,
-// every index is the one the previous column left behind.
+// TestBitunpackClearsDestination decodes twice into the same destination. The
+// first call fills it with nonzero indices, the second decodes a one-entry
+// dictionary that takes no bits per index and so writes nothing: without a
+// clear, every index keeps the value the first call left behind.
 func TestBitunpackClearsDestination(t *testing.T) {
 	indices := []uint32{0, 1, 2, 3, 4, 5, 6, 7, 0, 7, 3}
 	d := &dest{}
@@ -604,9 +602,9 @@ func TestBitunpackClearsDestination(t *testing.T) {
 	}
 }
 
-// TestRLEBitpackClearsDestination is the same check for the bitmap decoder,
+// TestRLEBitpackClearsDestination makes the same check for the bitmap decoder,
 // which sets only the true bits and leaves the false ones at whatever the
-// destination held.
+// destination already held.
 func TestRLEBitpackClearsDestination(t *testing.T) {
 	const n = 16
 	d := &dest{}
@@ -1023,10 +1021,10 @@ func TestLayoutHelpers(t *testing.T) {
 		t.Error("measureLayout with a column of the wrong Go type: want not ok")
 	}
 
-	// Dictionary encoding accepts any value (it keys on the fmt form), but the
-	// decoded strings must convert back to the column type. Strings that do
-	// not parse as integers make the round trip fail, which is what the decode
-	// check in measureLayout exists to catch.
+	// Dictionary encoding accepts any value because it keys on the fmt form, but
+	// the decoded strings must convert back to the column type. Strings that do
+	// not parse as integers fail the round trip, which is the decode check
+	// measureLayout exists to catch.
 	if _, ok := measureLayout([]string{"abc", "def"}, ColumnSchema{Name: "x", Type: TypeInt32}, EncDict, CompressNone, flateLevel, &measureScratch{}); ok {
 		t.Error("measureLayout with values that cannot be decoded back: want not ok")
 	}
@@ -1133,14 +1131,35 @@ func TestCompressLevel(t *testing.T) {
 	}
 }
 
+// optimizeLevel is compressLevel for the Optimize pass rather than the write.
+// Zero means the best a codec offers, since a caller running Optimize has
+// already decided the data is worth the cost. Anything else stays a level a
+// codec accepts.
+func TestOptimizeLevel(t *testing.T) {
+	for _, tc := range []struct {
+		level int
+		want  int
+	}{
+		{0, flate.BestCompression},
+		{-3, flate.HuffmanOnly},
+		{flate.BestSpeed, flate.BestSpeed},
+		{6, 6},
+		{100, flate.BestCompression},
+	} {
+		if got := optimizeLevel(tc.level); got != tc.want {
+			t.Errorf("optimizeLevel(%d) = %d, want %d", tc.level, got, tc.want)
+		}
+	}
+}
+
 // DEFLATE bakes its level into the writer at construction, so a pooled writer
-// only serves the level it was made for. The pools are keyed by both, and a
-// writer asked for level 9 has to compress at level 9 rather than at whatever
-// level happened to fill the pool first.
+// only serves the level it was made for. The pools are keyed by codec and level
+// both, and a writer asked for level 9 has to compress at level 9 rather than at
+// whatever level filled the pool first.
 func TestCodecPoolIsKeyedByLevel(t *testing.T) {
 	// The pools are process global, so the test uses a codec no writer asks for
-	// and drops its keys on the way out: a mock in a pool real code reads is
-	// worse than no test at all.
+	// and drops its keys on the way out: a mock left in a pool real code reads
+	// is worse than no test at all.
 	t.Cleanup(func() {
 		codecWriters.Delete(poolKey{codec: 99, level: 1})
 		codecWriters.Delete(poolKey{codec: 99, level: 9})
@@ -1157,17 +1176,17 @@ func TestCodecPoolIsKeyedByLevel(t *testing.T) {
 	}
 }
 
-// mockCompressor is a placeholder a pool can hold; nothing ever writes through
-// it, it is only there to be one pool's occupant rather than another's.
+// mockCompressor is a placeholder for a pool to hold. Nothing writes through
+// it; it only has to be one pool's occupant rather than another's.
 type mockCompressor struct{}
 
 func (*mockCompressor) Write([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
 func (*mockCompressor) Close() error              { return nil }
 func (*mockCompressor) Reset(io.Writer) error     { return nil }
 
-// Affix encoding is built on shared prefixes and suffixes, and both take the
-// shorter of the two values before the comparison, or a long value next to a
-// short one reads past its end.
+// Affix encoding is built on shared prefixes and suffixes. Both compare only
+// the shorter of the two values, or a long value next to a short one reads past
+// its end.
 func TestSharedAffixBounds(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
@@ -1356,8 +1375,8 @@ func craftFile(chunk []byte, meta ColMeta, schema []ColumnSchema, numRows uint32
 }
 
 // TestCanonicalReadErrors covers the read paths that narrow decoded values to
-// the declared type, which only a file whose chunk disagrees with its schema
-// can reach: a dictionary holding a value the column cannot hold.
+// the declared type. Only a chunk that disagrees with its schema reaches them:
+// here, a dictionary holding a value the column cannot hold.
 func TestCanonicalReadErrors(t *testing.T) {
 	dictData, err := EncodeDict([]any{"not a number"})
 	if err != nil {
@@ -1408,8 +1427,8 @@ func TestCanonicalReadErrors(t *testing.T) {
 
 // TestAffixRoundTrip covers the shapes affix has to get right: a shared prefix,
 // a shared suffix, both at once, a prefix and suffix that would overlap in the
-// column's shortest value, and the degenerate cases where there is nothing to
-// share or nothing to write.
+// column's shortest value, and the cases with nothing to share or nothing to
+// write.
 func TestAffixRoundTrip(t *testing.T) {
 	cases := []struct {
 		name string
@@ -1479,7 +1498,7 @@ func TestAffixRoundTrip(t *testing.T) {
 
 // TestAffixTruncated covers the header and middle reads a short chunk reaches.
 // A cut inside the middle stream may still land on a value boundary, in which
-// case the chunk decodes as fewer values, so that is what is asked of it.
+// case the chunk decodes as fewer values than it holds.
 func TestAffixTruncated(t *testing.T) {
 	vals := []string{"u1@x", "u2@x"}
 	full, err := EncodeAffix(vals)
@@ -1550,9 +1569,9 @@ func TestZeroRowGroup(t *testing.T) {
 	}
 }
 
-// Empty strings are a column the writer and reader both have to handle: a
-// decoder that points a string at its buffer takes the address of a zero length
-// slice for one, which used to panic.
+// Empty strings are a case the writer and reader both have to handle. A decoder
+// that points a string at its buffer takes the address of a zero length slice
+// for one, which used to panic.
 func TestEmptyStringColumn(t *testing.T) {
 	for _, vals := range [][]string{
 		{""},
@@ -1597,8 +1616,8 @@ func toAnySlice[T any](s []T) []any {
 
 // TestNarrowingReadErrors covers the reads that fail when a chunk's encoding
 // produces values its column's declared type cannot hold. Delta widens every
-// integer column to int64, so a column that declares itself bytes has no place
-// to put an int64: the reader has to refuse the file rather than panic.
+// integer column to int64, so a column declared bytes has nowhere to put an
+// int64: the reader must refuse the file rather than panic.
 func TestNarrowingReadErrors(t *testing.T) {
 	bytesSchema := []ColumnSchema{{Name: "b", Type: TypeBytes}}
 	chunk := craftChunk(EncDelta, CompressNone, nil, EncodeDelta([]int64{42, 43}))
@@ -1776,9 +1795,9 @@ func TestReaderErrors(t *testing.T) {
 	}
 }
 
-// TestChunkTruncation covers the chunk reads that a file disagreeing with its
-// own metadata reaches: a recorded byte length too small for the chunk it
-// describes, and one too large for the file behind it.
+// TestChunkTruncation covers the chunk reads a file disagreeing with its own
+// metadata reaches: a recorded byte length too small for the chunk it describes,
+// and one too large for the file behind it.
 func TestChunkTruncation(t *testing.T) {
 	schema := []ColumnSchema{{Name: "i", Type: TypeInt16}}
 	data := []byte{1, 0, 2, 0}
