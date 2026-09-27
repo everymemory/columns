@@ -319,7 +319,11 @@ every value and measures every candidate at the codec's best level, and the
 default is what the table reports because most callers do not want to pay that.
 
 keine is smaller than parquet at every compression level, three times faster to
-write at every one of them, and four times faster reading a single column.
+write at every one of them, and four times faster reading a single column. The
+`parquet zstd` row is pyarrow's default, which is zstd level 1; turning it up on
+this table does not close the size gap either, since level 19 writes 15.80 bytes
+per row against keine's 15.56 and costs 3.1 s to do it. Real data does not behave
+this way, and the shard below says which way.
 
 Where parquet still leads is not in the numbers above. It has nested types, a
 stable ecosystem, and readers in every language. keine has none of that, and the
@@ -339,12 +343,31 @@ rather than a claim about the table:
 | parquet snappy | 236.64 | 742 ms | 306 ms |
 | parquet none | 380.95 | 861 ms | 114 ms |
 
-Real data keeps the write conclusion the synthetic data reached. This file is
-mostly one text column of HTML comment bodies, 86 MB of the 108 MB encoded, which
-flate turns into 36 MB, and the rest is thirteen million integers and a few short
-strings. keine is four percent smaller than parquet's zstd, writes three times
-faster, and reads faster scoped. Parquet's uncompressed file is the fastest read
-of the four and 2.4 times the size, which is the trade being bought.
+`parquet zstd` above is pyarrow's default, which asks zstd for level 1 — the
+weakest of its levels, and the only one keine outsizes. Turning it up costs
+parquet write time and buys file size, at a rate worth seeing next to the row
+above:
+
+| | bytes/row | write | read all |
+| --- | --- | --- | --- |
+| keine | 160.23 | 310 ms | 140 ms (scoped) |
+| parquet zstd 1 | 166.74 | 885 ms | 223 ms |
+| parquet zstd 3 | 144.77 | 1314 ms | 278 ms |
+| parquet zstd 6 | 137.07 | 2950 ms | 273 ms |
+| parquet zstd 9 | 134.11 | 5787 ms | 269 ms |
+| parquet zstd 19 | 122.31 | 39389 ms | 258 ms |
+
+Real data keeps the write and read conclusions the synthetic data reached. This
+file is mostly one text column of HTML comment bodies, 86 MB of the 108 MB encoded,
+which flate turns into 36 MB, and the rest is thirteen million integers and a few
+short strings. keine writes three times faster than parquet's default and reads
+faster scoped at every zstd level, because zstd's decompression cost barely rises
+with the level while flate's is already spread across blocks. The size conclusion
+does not survive the comparison: from level 3 up parquet is the smaller file, by
+ten percent there and by a quarter at level 19. That is the trade stdlib-only
+buys — Go's `compress` has no zstd, and a column of HTML comment bodies is exactly
+the data zstd's longer match search was built for. Parquet's uncompressed file is
+the fastest read of the four and 2.4 times the size, which is the other end of it.
 
 `Optimize` on the same shard takes the write to 35.4 s and the file to 144.75
 bytes per row, so the pass costs a hundred times the write and recovers ten percent
@@ -354,6 +377,10 @@ and a suffix, becomes affix; `parent`, a mostly-sparse id column, stops paying f
 subtraction on values it does not have. The other nine columns keep the layout
 their type gave them. That is the honest shape of the trade: the pass is right
 about which columns it changes and ruinously expensive for how little it changes.
+It also arrives somewhere parquet already was: 144.75 bytes per row is parquet's
+zstd level 3 to within a byte, which parquet reaches in 1.3 s rather than 35.4 s.
+The pass buys knowledge the format can carry forward to every later row group, and
+it costs twenty-seven times what the same size costs parquet once.
 
 The shard also found a bug the benchmark could not. Compressing a column's blocks
 used to be a serial loop inside one per-column goroutine, so that 330-block text
