@@ -2,6 +2,7 @@ package keine
 
 import (
 	"bytes"
+	"compress/flate"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -262,7 +263,7 @@ func TestCompressStreamErrors(t *testing.T) {
 	for _, codec := range []uint8{CompressFlate, CompressGzip, CompressZlib, CompressLzw} {
 		errored := false
 		for n := 0; n <= 24; n++ {
-			if err := compressStream(&failAfter{n: n}, data, codec); err != nil {
+			if err := compressStream(&failAfter{n: n}, data, codec, flateLevel); err != nil {
 				errored = true
 			}
 		}
@@ -270,7 +271,7 @@ func TestCompressStreamErrors(t *testing.T) {
 			t.Errorf("compressStream(%s): no write failure observed across the sweep", codecName(codec))
 		}
 	}
-	if err := compressStream(&failAfter{n: 0}, data, 99); err == nil {
+	if err := compressStream(&failAfter{n: 0}, data, 99, flateLevel); err == nil {
 		t.Error("compressStream with an unknown codec: want error, got nil")
 	}
 }
@@ -1009,23 +1010,16 @@ func TestLayoutHelpers(t *testing.T) {
 		t.Errorf("codecName(99) = %q, want %q", got, "Codec99")
 	}
 
-	// No candidate is valid for an unknown type, so ExperimentLayouts falls
-	// back to Plain+None.
-	best := ExperimentLayouts([]any{}, ColumnSchema{Name: "x", Type: 0xFF})
-	if best.Encoding != EncPlain || best.Compress != CompressNone {
-		t.Errorf("ExperimentLayouts fallback = %+v, want Plain+None", best)
-	}
-
-	if _, ok := measureLayout([]any{int8(1)}, ColumnSchema{Name: "x", Type: TypeInt8}, EncPlain, CompressZstd, &measureScratch{}); ok {
+	if _, ok := measureLayout([]any{int8(1)}, ColumnSchema{Name: "x", Type: TypeInt8}, EncPlain, CompressZstd, flateLevel, &measureScratch{}); ok {
 		t.Error("measureLayout with a codec that cannot compress: want not ok")
 	}
-	if _, ok := measureLayout([]any{int8(1)}, ColumnSchema{Name: "x", Type: TypeInt8}, EncPlain, CompressFlate, &measureScratch{}); !ok {
+	if _, ok := measureLayout([]any{int8(1)}, ColumnSchema{Name: "x", Type: TypeInt8}, EncPlain, CompressFlate, flateLevel, &measureScratch{}); !ok {
 		t.Error("measureLayout with CompressFlate: want ok")
 	}
 	if _, err := canonicalColumnTyped([]any{struct{}{}}, TypeBool); err == nil {
 		t.Error("canonicalColumnTyped of an uncoercible value: want error, got nil")
 	}
-	if _, ok := measureLayout([]string{"x"}, ColumnSchema{Name: "x", Type: TypeBool}, EncRLEBitpack, CompressNone, &measureScratch{}); ok {
+	if _, ok := measureLayout([]string{"x"}, ColumnSchema{Name: "x", Type: TypeBool}, EncRLEBitpack, CompressNone, flateLevel, &measureScratch{}); ok {
 		t.Error("measureLayout with a column of the wrong Go type: want not ok")
 	}
 
@@ -1033,13 +1027,13 @@ func TestLayoutHelpers(t *testing.T) {
 	// decoded strings must convert back to the column type. Strings that do
 	// not parse as integers make the round trip fail, which is what the decode
 	// check in measureLayout exists to catch.
-	if _, ok := measureLayout([]string{"abc", "def"}, ColumnSchema{Name: "x", Type: TypeInt32}, EncDict, CompressNone, &measureScratch{}); ok {
+	if _, ok := measureLayout([]string{"abc", "def"}, ColumnSchema{Name: "x", Type: TypeInt32}, EncDict, CompressNone, flateLevel, &measureScratch{}); ok {
 		t.Error("measureLayout with values that cannot be decoded back: want not ok")
 	}
 
 	// An empty column gives every candidate a size of zero, so the ordering the
 	// sort falls back to is the encoded size.
-	results := benchmarkLayoutsTyped([]bool{}, ColumnSchema{Name: "x", Type: TypeBool}, &measureScratch{})
+	results := benchmarkLayoutsTyped([]bool{}, ColumnSchema{Name: "x", Type: TypeBool}, &measureScratch{}, flateLevel)
 	if len(results) != 6 {
 		t.Fatalf("benchmarkLayoutsTyped of an empty bool column: got %d results, want 6", len(results))
 	}
@@ -1050,6 +1044,166 @@ func TestLayoutHelpers(t *testing.T) {
 		if results[i].CompressedSize < results[i-1].CompressedSize {
 			t.Errorf("benchmarkLayoutsTyped result %d is larger than result %d: %+v then %+v", i-1, i, results[i-1], results[i])
 		}
+	}
+}
+
+// The candidates a type can choose among are fixed, so the table is the whole
+// contract: a type either has candidates or it has none, and the ones it has are
+// the encodings that can read it back.
+func TestLayoutCandidates(t *testing.T) {
+	for _, tc := range []struct {
+		typ  uint8
+		name string
+		want []uint8
+	}{
+		{TypeBool, "bool", []uint8{EncRLEBitpack, EncPlain}},
+		{TypeInt8, "int8", []uint8{EncPlain, EncDelta, EncDict}},
+		{TypeInt64, "int64", []uint8{EncPlain, EncDelta, EncDict}},
+		{TypeUint32, "uint32", []uint8{EncPlain, EncDelta, EncDict}},
+		{TypeFloat32, "float32", []uint8{EncPlain, EncDict}},
+		{TypeFloat64, "float64", []uint8{EncPlain, EncDict}},
+		{TypeBytes, "bytes", []uint8{EncOffsetBytes, EncDict, EncAffix}},
+		{TypeString, "string", []uint8{EncPlain, EncOffsetBytes, EncDict, EncAffix}},
+		{0xFF, "unknown", nil},
+	} {
+		got := layoutCandidates(tc.typ)
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("layoutCandidates(%s) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// encName and codecName only exist for messages a person reads, but every name
+// has to resolve, since a candidate the table omits is one a failure message
+// cannot describe.
+func TestEncAndCodecNames(t *testing.T) {
+	for _, tc := range []struct {
+		enc  uint8
+		name string
+	}{
+		{EncPlain, "Plain"},
+		{EncRLEBitpack, "RLEBitpack"},
+		{EncDelta, "Delta"},
+		{EncDict, "Dict"},
+		{EncOffsetBytes, "OffsetBytes"},
+		{EncAffix, "Affix"},
+		{99, "Enc99"},
+	} {
+		if got := encName(tc.enc); got != tc.name {
+			t.Errorf("encName(%d) = %q, want %q", tc.enc, got, tc.name)
+		}
+	}
+	for _, tc := range []struct {
+		codec uint8
+		name  string
+	}{
+		{CompressNone, "None"},
+		{CompressZstd, "Zstd"},
+		{CompressFlate, "Flate"},
+		{CompressGzip, "Gzip"},
+		{CompressZlib, "Zlib"},
+		{CompressLzw, "Lzw"},
+		{99, "Codec99"},
+	} {
+		if got := codecName(tc.codec); got != tc.name {
+			t.Errorf("codecName(%d) = %q, want %q", tc.codec, got, tc.name)
+		}
+	}
+}
+
+// compressLevel pulls a level back into the range the codecs accept, and treats
+// zero as the default, since that is what an empty Options means. Go's own
+// sentinels pass through: DefaultCompression is a level the stdlib understands.
+func TestCompressLevel(t *testing.T) {
+	for _, tc := range []struct {
+		level int
+		want  int
+	}{
+		{0, flateLevel},
+		{-3, flate.HuffmanOnly},
+		{flate.HuffmanOnly, flate.HuffmanOnly},
+		{-1, -1},
+		{flate.BestSpeed, flate.BestSpeed},
+		{flate.BestCompression, flate.BestCompression},
+		{100, flate.BestCompression},
+	} {
+		if got := compressLevel(tc.level); got != tc.want {
+			t.Errorf("compressLevel(%d) = %d, want %d", tc.level, got, tc.want)
+		}
+	}
+}
+
+// DEFLATE bakes its level into the writer at construction, so a pooled writer
+// only serves the level it was made for. The pools are keyed by both, and a
+// writer asked for level 9 has to compress at level 9 rather than at whatever
+// level happened to fill the pool first.
+func TestCodecPoolIsKeyedByLevel(t *testing.T) {
+	// The pools are process global, so the test uses a codec no writer asks for
+	// and drops its keys on the way out: a mock in a pool real code reads is
+	// worse than no test at all.
+	t.Cleanup(func() {
+		codecWriters.Delete(poolKey{codec: 99, level: 1})
+		codecWriters.Delete(poolKey{codec: 99, level: 9})
+	})
+
+	newWriter := func() any { return &mockCompressor{} }
+	one := codecPool(99, 1, newWriter)
+	nine := codecPool(99, 9, newWriter)
+	if one == nine {
+		t.Error("levels 1 and 9 share a pool, so a writer would compress at the wrong level")
+	}
+	if got := codecPool(99, 1, newWriter); got != one {
+		t.Error("codecPool did not return the same pool for a level it has seen")
+	}
+}
+
+// mockCompressor is a placeholder a pool can hold; nothing ever writes through
+// it, it is only there to be one pool's occupant rather than another's.
+type mockCompressor struct{}
+
+func (*mockCompressor) Write([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+func (*mockCompressor) Close() error              { return nil }
+func (*mockCompressor) Reset(io.Writer) error     { return nil }
+
+// Affix encoding is built on shared prefixes and suffixes, and both take the
+// shorter of the two values before the comparison, or a long value next to a
+// short one reads past its end.
+func TestSharedAffixBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		a, b         string
+		prefix, suff int
+	}{
+		{"identical", "keine", "keine", 5, 5},
+		{"nothing shared", "abc", "xyz", 0, 0},
+		{"prefix only", "prefix-suffix", "prefix-other", 7, 0},
+		{"suffix only", "one-suffix", "two-suffix", 0, 7},
+		{"first shorter", "keine", "keine-longer", 5, 0},
+		{"second shorter", "longer-keine", "keine", 0, 5},
+	} {
+		if got := sharedPrefix(tc.a, tc.b); got != tc.prefix {
+			t.Errorf("%s: sharedPrefix(%q, %q) = %d, want %d", tc.name, tc.a, tc.b, got, tc.prefix)
+		}
+		if got := sharedSuffix(tc.a, tc.b); got != tc.suff {
+			t.Errorf("%s: sharedSuffix(%q, %q) = %d, want %d", tc.name, tc.a, tc.b, got, tc.suff)
+		}
+	}
+}
+
+// encodeWith reports a type it cannot encode rather than encoding something
+// close to it, and every encoding it offers has to accept the column it is for.
+func TestEncodeWith(t *testing.T) {
+	if _, err := encodeWith(EncOffsetBytes, []string{"a"}, TypeBytes); err == nil {
+		t.Error("encodeWith of a string column as offset bytes: want error, got nil")
+	}
+	if _, err := encodeWith(99, []int64{1}, TypeInt64); err == nil {
+		t.Error("encodeWith of an unknown encoding: want error, got nil")
+	}
+	if _, err := canonicalColumnTyped([]any{int64(1)}, 99); err == nil {
+		t.Error("canonicalColumnTyped of an unknown type: want error, got nil")
+	}
+	if _, err := encodeWith(EncOffsetBytes, [][]byte{{1, 2}, {3}}, TypeBytes); err != nil {
+		t.Errorf("encodeWith of a bytes column as offset bytes: %v", err)
 	}
 }
 

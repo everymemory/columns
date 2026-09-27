@@ -82,26 +82,8 @@ func TestLayoutTypedInputs(t *testing.T) {
 	if results := BenchmarkLayouts([]any{struct{}{}}, ColumnSchema{Name: "b", Type: TypeBool}); results != nil {
 		t.Errorf("BenchmarkLayouts of an uncoercible column = %v, want nil", results)
 	}
-	sample := make([]int64, 2*maxExperimentRows)
-	for i := range sample {
-		sample[i] = int64(i)
-	}
-	if got := experimentSampleTyped(sample); len(got.([]int64)) >= len(sample) {
-		t.Errorf("experimentSampleTyped kept %d of %d values", len(got.([]int64)), len(sample))
-	}
-	// A type the sampler has no case for passes through untouched, so it is
-	// still measured rather than dropped.
-	in := []int{1, 2, 3}
-	if got := sampleDispatch(in, 2); !reflect.DeepEqual(got, in) {
-		t.Errorf("sampleDispatch of an unsupported type = %v, want it unchanged", got)
-	}
-	if _, ok := measureLayout([]string{"x"}, ColumnSchema{Name: "b", Type: TypeBool}, EncRLEBitpack, CompressNone, &measureScratch{}); ok {
+	if _, ok := measureLayout([]string{"x"}, ColumnSchema{Name: "b", Type: TypeBool}, EncRLEBitpack, CompressNone, flateLevel, &measureScratch{}); ok {
 		t.Error("measureLayout of a bool encoding on strings: want not ok")
-	}
-	// A type with no candidate encodings falls back to Plain+None.
-	best := experimentLayoutsTyped([]int{1, 2, 3}, ColumnSchema{Name: "x", Type: 0xFF}, &measureScratch{})
-	if best.Encoding != EncPlain || best.Compress != CompressNone {
-		t.Errorf("experimentLayoutsTyped fallback = %s, want Plain+None", best.Name)
 	}
 }
 

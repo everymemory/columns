@@ -45,33 +45,67 @@ const (
 // that they still allocate.
 var flateReaders sync.Pool
 
-// The writer pools recycle the codec machinery on the write side. A compressor
-// carries the hash table and the window, which is what a write's memory is made
-// of once the encoders stopped allocating: the layout experiment compresses a
-// column once per codec, and every block of every column after that, so a write
-// builds and drops hundreds of these. Reset makes one reusable, and none of the
-// three writes anything to its destination before the first Write call, so a
-// writer created against io.Discard and reset onto the real one produces the
-// same bytes a fresh one would.
-//
-// LZW has no Reset, so it still allocates. It never wins on real data, so the
-// experiment reaches it but the writer does not.
-var (
-	flateWriters sync.Pool
-	gzipWriters  sync.Pool
-	zlibWriters  sync.Pool
-)
+// compressLevel is the level a codec is asked for, with the zero value meaning
+// flateLevel and out of range values pulled back to the nearest valid one. Go's
+// own sentinels are inside that range and pass through: DefaultCompression is
+// the standard library's default and HuffmanOnly its fastest, and neither is
+// what this package picks but both are what a caller might ask for.
+func compressLevel(level int) int {
+	switch {
+	case level == 0:
+		return flateLevel
+	case level < flate.HuffmanOnly:
+		return flate.HuffmanOnly
+	case level > flate.BestCompression:
+		return flate.BestCompression
+	}
+	return level
+}
 
-// Compress applies codec to data. CompressNone returns data unchanged. The
-// result is the caller's to keep.
+// codecWriters recycles one DEFLATE compressor per codec and level. The level is
+// fixed when a writer is built and Reset does not change it, so a writer made
+// for one level cannot serve another: pooling them together would compress at
+// whichever level happened to be asked for first and say nothing about it. A
+// pool is built for each pair a write actually uses, and one made twice is
+// harmless, since only the pool stored first is ever drawn from.
+var codecWriters sync.Map
+
+// poolKey is the codec and level a pool's writers were built for.
+type poolKey struct {
+	codec uint8
+	level int
+}
+
+// codecPool is the pool of writers for one codec at one level, making them with
+// make when the pair has not been used before.
+func codecPool(codec uint8, level int, make func() any) *sync.Pool {
+	key := poolKey{codec: codec, level: level}
+	if p, ok := codecWriters.Load(key); ok {
+		return p.(*sync.Pool)
+	}
+	actual, _ := codecWriters.LoadOrStore(key, &sync.Pool{New: make})
+	return actual.(*sync.Pool)
+}
+
+// Compress applies codec to data at the default level. CompressNone returns data
+// unchanged. The result is the caller's to keep.
 func Compress(data []byte, codec uint8) ([]byte, error) {
+	return compressAt(data, codec, flateLevel)
+}
+
+// compressAt is Compress at level, which the codecs that take one are built at
+// and the rest ignore. A writer has to compress a block at the level it measured
+// the candidates at, or the layout it picked on the measurements is not the one
+// the file gets.
+func compressAt(data []byte, codec uint8, level int) ([]byte, error) {
+	level = compressLevel(level)
 	switch codec {
 	case CompressNone:
 		return data, nil
 	case CompressFlate, CompressGzip, CompressZlib, CompressLzw:
 		var buf bytes.Buffer
 		// A bytes.Buffer never rejects a write.
-		compressStream(&buf, data, codec)
+		compressStream(&buf, data, codec, level)
 		return buf.Bytes(), nil
 	case CompressZstd:
 		return nil, fmt.Errorf("keine: zstd compression is not available in this build")
@@ -80,11 +114,11 @@ func Compress(data []byte, codec uint8) ([]byte, error) {
 	}
 }
 
-// measureScratch is the reusable destination for a layout measurement. The
-// experiment compresses a column once per codec and discards nearly every
-// result the moment it has measured it, so the buffer each one landed in was
-// most of a write's allocation. One stays with a column for the whole write,
-// and a column is the unit of parallelism, so nothing else reaches it.
+// measureScratch is the reusable destination for a layout measurement. Optimize
+// compresses a column once per codec and discards nearly every result the moment
+// it has measured it, so the buffer each one landed in was most of its
+// allocation. One stays with a column for the whole pass, and a column is the
+// unit of parallelism, so nothing else reaches it.
 //
 // compress hands back a slice of that buffer, which the next call overwrites,
 // so a caller has to be finished with one result before it asks for the next.
@@ -96,12 +130,12 @@ type measureScratch struct {
 
 // compress is Compress into the buffer this scratch keeps. The result is
 // borrowed from it, not owned.
-func (ms *measureScratch) compress(data []byte, codec uint8) ([]byte, error) {
+func (ms *measureScratch) compress(data []byte, codec uint8, level int) ([]byte, error) {
 	if codec == CompressNone {
 		return data, nil
 	}
 	ms.buf.Reset()
-	if err := compressStream(&ms.buf, data, codec); err != nil {
+	if err := compressStream(&ms.buf, data, codec, compressLevel(level)); err != nil {
 		return nil, err
 	}
 	return ms.buf.Bytes(), nil
@@ -112,43 +146,50 @@ func (ms *measureScratch) compress(data []byte, codec uint8) ([]byte, error) {
 // one to surface. Close runs either way to flush the codec's buffers, after
 // which the writer goes back to its pool; Reset clears whatever state a failed
 // write left behind, so nothing about an erroring stream reaches the next one.
-func compressStream(w io.Writer, data []byte, codec uint8) error {
+//
+// level has been through compressLevel, so the constructors below cannot reject
+// it. LZW has no level of its own and no Reset either, so it is still built
+// fresh per call and still allocates.
+func compressStream(w io.Writer, data []byte, codec uint8, level int) error {
 	switch codec {
 	case CompressFlate:
-		fw, _ := flateWriters.Get().(*flate.Writer)
-		if fw == nil {
-			fw, _ = flate.NewWriter(io.Discard, flateLevel)
-		}
+		p := codecPool(CompressFlate, level, func() any {
+			fw, _ := flate.NewWriter(io.Discard, level)
+			return fw
+		})
+		fw, _ := p.Get().(*flate.Writer)
 		fw.Reset(w)
 		_, err := fw.Write(data)
 		if cerr := fw.Close(); err == nil {
 			err = cerr
 		}
-		flateWriters.Put(fw)
+		p.Put(fw)
 		return err
 	case CompressGzip:
-		gw, _ := gzipWriters.Get().(*gzip.Writer)
-		if gw == nil {
-			gw, _ = gzip.NewWriterLevel(io.Discard, flateLevel)
-		}
+		p := codecPool(CompressGzip, level, func() any {
+			gw, _ := gzip.NewWriterLevel(io.Discard, level)
+			return gw
+		})
+		gw, _ := p.Get().(*gzip.Writer)
 		gw.Reset(w)
 		_, err := gw.Write(data)
 		if cerr := gw.Close(); err == nil {
 			err = cerr
 		}
-		gzipWriters.Put(gw)
+		p.Put(gw)
 		return err
 	case CompressZlib:
-		zw, _ := zlibWriters.Get().(*zlib.Writer)
-		if zw == nil {
-			zw, _ = zlib.NewWriterLevel(io.Discard, flateLevel)
-		}
+		p := codecPool(CompressZlib, level, func() any {
+			zw, _ := zlib.NewWriterLevel(io.Discard, level)
+			return zw
+		})
+		zw, _ := p.Get().(*zlib.Writer)
 		zw.Reset(w)
 		_, err := zw.Write(data)
 		if cerr := zw.Close(); err == nil {
 			err = cerr
 		}
-		zlibWriters.Put(zw)
+		p.Put(zw)
 		return err
 	case CompressLzw:
 		lw := lzw.NewWriter(w, lzwOrder, lzwWidth)

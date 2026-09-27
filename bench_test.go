@@ -86,21 +86,27 @@ var benchColumns = []benchColumn{
 
 const benchRows = 10000
 
-// BenchmarkLayouts measures how long layout selection costs per column, which
-// the writer pays for every chunk it writes.
-func BenchmarkExperiment(b *testing.B) {
+// BenchmarkOptimize measures what scanning a whole column costs, which Optimize
+// pays once per dataset to stop guessing from the type. BenchmarkSizes next to it
+// shows what the scan buys.
+func BenchmarkOptimize(b *testing.B) {
 	for _, c := range benchColumns {
 		col := c.build(benchRows)
+		schema := []ColumnSchema{c.schema}
 		b.Run(c.name, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				ExperimentLayouts(col, c.schema)
+				buf := &bytes.Buffer{}
+				w := NewWriter(buf, schema)
+				if err := w.Optimize([][]any{col}); err != nil {
+					b.Fatal(err)
+				}
 			}
 		})
 	}
 }
 
-// BenchmarkSizes reports what each candidate costs, since the choice
-// ExperimentLayouts makes is only meaningful next to the alternatives.
+// BenchmarkSizes reports what each candidate costs, since the choice Optimize
+// makes is only meaningful next to the alternatives.
 func BenchmarkSizes(b *testing.B) {
 	for _, c := range benchColumns {
 		col := c.build(benchRows)
@@ -273,6 +279,32 @@ func BenchmarkComparison(b *testing.B) {
 		b.ReportMetric(float64(len(data))/float64(comparisonRows), "B/row")
 		for i := 0; i < b.N; i++ {
 			file()
+		}
+	})
+	b.Run("write optimized", func(b *testing.B) {
+		// The default layouts are the type's, and Optimize is what it costs to
+		// trade them for the column's. Reported next to the default write, the
+		// difference is the price of the pass and what it bought.
+		optimized := func() []byte {
+			buf := &bytes.Buffer{}
+			w := NewWriter(buf, schema)
+			if err := w.Optimize(columns); err != nil {
+				b.Fatal(err)
+			}
+			if err := w.AddRowGroup(columns); err != nil {
+				b.Fatal(err)
+			}
+			if err := w.Close(); err != nil {
+				b.Fatal(err)
+			}
+			return buf.Bytes()
+		}
+		first := optimized()
+		b.ReportMetric(float64(len(first))/float64(comparisonRows), "B/row")
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			optimized()
 		}
 	})
 	b.Run("read", func(b *testing.B) {

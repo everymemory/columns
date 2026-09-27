@@ -87,126 +87,54 @@ var layoutCodecs = []uint8{
 	CompressLzw,
 }
 
-// BenchmarkLayouts measures every candidate encoding and codec for col and
-// returns them sorted by CompressedSize, breaking ties by EncodedSize and then
-// by candidate order. The tiebreak never consults DecodeNs: that is measured
-// time, and consulting it would make two equally sized candidates win or lose
-// on noise, so the same column could pick a different layout on a different run
-// and the same input would not write the same file twice.
+// defaultLayout is the layout a writer uses for a column it has not been asked
+// to Optimize. It is what the type implies rather than what the values turn out
+// to be, so it costs nothing to choose and cannot be wrong about the shape of
+// the data the way a sample can, but it also cannot see that a column of sorted
+// integers is monotonic or that a column of repeated strings would rather be a
+// dictionary. Optimize trades the time for that knowledge.
+//
+// Bool packs to a bit and Delta costs one subtraction per value, so both are
+// what the type earns on any data at all; Plain is the honest answer for
+// floating point and for bytes, whose values this package will not assume
+// anything about. Flate is the codec, because it is what the stdlib has that
+// compresses, and these encodings are what it is applied to.
+func defaultLayout(typ uint8) (enc, codec uint8) {
+	switch typ {
+	case TypeBool:
+		return EncRLEBitpack, CompressFlate
+	case TypeInt8, TypeInt16, TypeInt32, TypeInt64,
+		TypeUint8, TypeUint16, TypeUint32, TypeUint64:
+		return EncDelta, CompressFlate
+	default:
+		return EncPlain, CompressFlate
+	}
+}
+
+// BenchmarkLayouts measures every candidate encoding and codec for col at the
+// default compression level and returns them sorted by CompressedSize, breaking
+// ties by EncodedSize. The tiebreak never consults DecodeNs: that is measured
+// time, and consulting it would make two equally sized candidates win or lose on
+// noise, so the same column could pick a different layout on a different run and
+// the same input would not write the same file twice.
 func BenchmarkLayouts(col []any, schema ColumnSchema) []LayoutResult {
 	typed, err := canonicalColumnTyped(col, schema.Type)
 	if err != nil {
 		return nil
 	}
-	return benchmarkLayoutsTyped(typed, schema, &measureScratch{})
+	return benchmarkLayoutsTyped(typed, schema, &measureScratch{}, flateLevel)
 }
 
-// maxExperimentRows caps how many values ExperimentLayouts measures. Layout
-// choice depends on the shape of a column, not its length: cardinality,
-// monotonicity and value lengths all stabilise well below this many values, so
-// a sample costs a fraction of the encode and decode passes while picking the
-// same winner.
-//
-// The count is not free to shrink, because striding does not preserve the
-// cardinality of a periodic column. A column of 200000 rows whose values repeat
-// every 200 is sampled at stride 25 here, which collapses it to 8 distinct
-// values and flatters a dictionary into looking 12 times better than it is;
-// the encoding the whole column wants still wins, but by accident. Halving the
-// cap moves the stride to 49, which is coprime to 200, and the sample then sees
-// all 200 values honestly and picks a different encoding than the column wants,
-// which made the comparison file 0.3 percent larger. The experiment costs what
-// it costs because that agreement is what makes the sample trustworthy.
-const maxExperimentRows = 8192
-
-// experimentSample returns up to maxExperimentRows evenly spaced values from
-// col. Even spacing rather than a prefix keeps the sample representative when a
-// column is sorted or clustered.
-func experimentSample(col []any) []any {
-	return sampleTyped(col, maxExperimentRows)
-}
-
-// experimentSampleTyped is experimentSample for an already typed column.
-func experimentSampleTyped(typed any) any {
-	return sampleDispatch(typed, maxExperimentRows)
-}
-
-// sampleTyped strides through s, keeping up to max evenly spaced values.
-func sampleTyped[T any](s []T, max int) []T {
-	if len(s) <= max {
-		return s
-	}
-	stride := (len(s) + max - 1) / max
-	out := make([]T, 0, max)
-	for i := 0; i < len(s); i += stride {
-		out = append(out, s[i])
-	}
-	return out
-}
-
-// sampleDispatch is sampleTyped without a statically known element type, since
-// a canonical column arrives as an any holding a []T.
-func sampleDispatch(typed any, max int) any {
-	switch s := typed.(type) {
-	case []bool:
-		return sampleTyped(s, max)
-	case []int8:
-		return sampleTyped(s, max)
-	case []int16:
-		return sampleTyped(s, max)
-	case []int32:
-		return sampleTyped(s, max)
-	case []int64:
-		return sampleTyped(s, max)
-	case []uint8:
-		return sampleTyped(s, max)
-	case []uint16:
-		return sampleTyped(s, max)
-	case []uint32:
-		return sampleTyped(s, max)
-	case []uint64:
-		return sampleTyped(s, max)
-	case []float32:
-		return sampleTyped(s, max)
-	case []float64:
-		return sampleTyped(s, max)
-	case []string:
-		return sampleTyped(s, max)
-	case [][]byte:
-		return sampleTyped(s, max)
-	default:
-		return typed
-	}
-}
-
-// ExperimentLayouts returns the BenchmarkLayouts entry with the smallest
-// CompressedSize, or Plain+None when no candidate works. It measures a sample
-// of the column rather than every value, so the cost does not grow with the
-// row count.
-func ExperimentLayouts(col []any, schema ColumnSchema) LayoutResult {
-	typed, err := canonicalColumnTyped(col, schema.Type)
-	if err != nil {
-		return LayoutResult{Name: encName(EncPlain) + "+" + codecName(CompressNone), Encoding: EncPlain, Compress: CompressNone}
-	}
-	return experimentLayoutsTyped(typed, schema, &measureScratch{})
-}
-
-// experimentLayoutsTyped is ExperimentLayouts for an already canonical column,
-// so a writer that has already coerced the values measures them once more
-// rather than twice. ms is the buffer the measurements land in, which a column
-// keeps across the whole write.
-func experimentLayoutsTyped(typed any, schema ColumnSchema, ms *measureScratch) LayoutResult {
-	best, ok := rankLayouts(experimentSampleTyped(typed), schema, ms)
-	if !ok {
-		return LayoutResult{Name: encName(EncPlain) + "+" + codecName(CompressNone), Encoding: EncPlain, Compress: CompressNone}
-	}
-	return best
-}
-
-func benchmarkLayoutsTyped(col any, schema ColumnSchema, ms *measureScratch) []LayoutResult {
+// benchmarkLayoutsTyped is BenchmarkLayouts for an already canonical column, so
+// a writer that has already coerced the values measures them once rather than
+// twice. ms is the buffer the measurements land in, which a column keeps for the
+// whole pass. level is the level the column will be compressed at, since a
+// layout measured at another level is not the one the file will get.
+func benchmarkLayoutsTyped(col any, schema ColumnSchema, ms *measureScratch, level int) []LayoutResult {
 	var results []LayoutResult
 	for _, enc := range layoutCandidates(schema.Type) {
 		for _, codec := range layoutCodecs {
-			r, ok := measureLayout(col, schema, enc, codec, ms)
+			r, ok := measureLayout(col, schema, enc, codec, level, ms)
 			if ok {
 				results = append(results, r)
 			}
@@ -221,103 +149,13 @@ func benchmarkLayoutsTyped(col any, schema ColumnSchema, ms *measureScratch) []L
 	return results
 }
 
-// rankLayouts picks the layout ExperimentLayouts reports, the candidate encoding
-// and codec that compress this column smallest. Every codec consumes the same
-// encoded bytes, so each encoding is done once rather than once per codec, and
-// only the winner is round tripped, since that is the one the writer encodes
-// again without checking. Compression is measured at flateLevel, the level the
-// file is written at, so the choice this makes and the size it reports are the
-// ones a full benchmark would have reached. Each measurement lands in ms, which
-// the next one overwrites, and the only thing kept from one is its length.
-func rankLayouts(col any, schema ColumnSchema, ms *measureScratch) (LayoutResult, bool) {
-	best := LayoutResult{}
-	bestRaw := []byte(nil)
-	found := false
-	n := sliceLen(col)
-	for _, enc := range layoutCandidates(schema.Type) {
-		encStart := time.Now().UnixNano()
-		raw, err := encodeWith(enc, col, schema.Type)
-		if err != nil {
-			continue
-		}
-		encNs := time.Now().UnixNano() - encStart
-
-		for _, codec := range layoutCodecs {
-			out, err := ms.compress(raw, codec)
-			// A codec this build cannot serve is passed over, not reported. The
-			// scratch is a bytes.Buffer, which cannot fail a write, so the error
-			// half of this is here for the codecs that can.
-			if err == nil && (!found || improves(len(out), len(raw), best.CompressedSize, best.EncodedSize)) {
-				found = true
-				best = LayoutResult{
-					Name:           encName(enc) + "+" + codecName(codec),
-					EncodedSize:    len(raw),
-					CompressedSize: len(out),
-					EncodeNs:       encNs,
-					Encoding:       enc,
-					Compress:       codec,
-				}
-				bestRaw = raw
-			}
-		}
-	}
-	if !found {
-		return LayoutResult{}, false
-	}
-
-	// Report the winner as the writer will produce it, so the decode time is the
-	// one that matters and the reader is confirmed able to read it back.
-	full, ok := measureEncoded(bestRaw, best.Encoding, best.Compress, n, schema.Type, ms)
-	full.EncodeNs += best.EncodeNs
-	return full, ok
-}
-
-// improves reports whether one candidate should replace another. Candidates are
-// tried in layoutCandidates order, so a later one has to earn its place.
-//
-// Compressed size is not monotonic in the bytes handed to a codec. Adding a few
-// highly compressible bytes at the head of a stream moves where the codec's
-// blocks fall, and the compressed length moves with them by a handful of bytes
-// either way. A candidate can therefore measure a few bytes smaller while being
-// a few bytes larger uncompressed, and on a sample that is a small fraction of
-// the column that sign can flip when the whole column is encoded: a real column
-// spans many more blocks, so the alignment that helped on the sample is not the
-// alignment the file gets. A win that small is not a win, so it counts as a tie
-// and the tie goes to the encoding that produced fewer bytes, which costs less
-// to write, costs less to read, and does not depend on how the codec blocked the
-// sample.
-//
-// The margin is a fraction of the incumbent's compressed size, so it scales with
-// the column and is still generous on a tiny one. Neither input is timing, so
-// this keeps the choice a function of the values alone and the file stays
-// reproducible.
-const tieFraction = 512
-
-func improves(compressed, encoded, bestCompressed, bestEncoded int) bool {
-	margin := bestCompressed / tieFraction
-	switch {
-	case compressed > bestCompressed+margin:
-		return false
-	case compressed < bestCompressed-margin:
-		return true
-	}
-	// Inside the margin the two are indistinguishable, so the encoded size
-	// decides, and where the encoding is the same one the codec that came out
-	// smaller does.
-	if encoded != bestEncoded {
-		return encoded < bestEncoded
-	}
-	return compressed < bestCompressed
-}
-
-// measureLayout measures one encoding and codec for a column, the combination
-// path BenchmarkLayouts takes.
-func measureLayout(col any, schema ColumnSchema, enc, codec uint8, ms *measureScratch) (LayoutResult, bool) {
+// measureLayout measures one encoding and codec for a column.
+func measureLayout(col any, schema ColumnSchema, enc, codec uint8, level int, ms *measureScratch) (LayoutResult, bool) {
 	encoded, err := encodeWith(enc, col, schema.Type)
 	if err != nil {
 		return LayoutResult{}, false
 	}
-	return measureEncoded(encoded, enc, codec, sliceLen(col), schema.Type, ms)
+	return measureEncoded(encoded, enc, codec, level, sliceLen(col), schema.Type, ms)
 }
 
 // measureEncoded measures one encoding and codec for a column already in its
@@ -325,9 +163,9 @@ func measureLayout(col any, schema ColumnSchema, enc, codec uint8, ms *measureSc
 // once can be measured against all of them through this entry point without
 // repeating the encode. The compressed bytes are borrowed from ms for the round
 // trip only; the decompressed column they are turned back into is its own.
-func measureEncoded(encoded []byte, enc, codec uint8, n int, typ uint8, ms *measureScratch) (LayoutResult, bool) {
+func measureEncoded(encoded []byte, enc, codec uint8, level, n int, typ uint8, ms *measureScratch) (LayoutResult, bool) {
 	encodeStart := time.Now().UnixNano()
-	compressed, err := ms.compress(encoded, codec)
+	compressed, err := ms.compress(encoded, codec, level)
 	if err != nil {
 		return LayoutResult{}, false
 	}

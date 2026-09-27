@@ -6,7 +6,8 @@ standard library.
 A file is a sequence of row groups. Each row group stores its columns as separate
 chunks, so a reader only decodes the columns a query asks for. Every column chunk
 records the encoding and compression codec it was written with; the writer picks
-both by measuring the alternatives on the data itself.
+both from the column's type, or from a measurement of its values if it is asked
+to.
 
 ## File layout
 
@@ -98,8 +99,8 @@ Four codecs from the standard library are wired up: flate, gzip, zlib and lzw.
 unimplemented, because this toolchain does not ship `compress/zstd`; using it
 returns an error rather than silently writing uncompressed data.
 
-Compression is applied after encoding, so the layout experiment measures the
-combination. On 5000 rows of synthetic data:
+Compression is applied after encoding, and a layout is the pair of them, so what
+is measured is the combination. On 5000 rows of synthetic data:
 
 | Column | Plain | Chosen | Bytes |
 | --- | --- | --- | --- |
@@ -116,24 +117,37 @@ pay for itself.
 
 ## Choosing a layout
 
-`ExperimentLayouts` is what the writer calls per column. Encoding and compression
-are measured against each other on the actual values, so a sorted id column lands
-on Delta and a low-cardinality string column lands on Dict without anyone
-hard-coding that.
+What a column is laid out as is decided once, and there are two ways to decide it.
 
-Which layout wins depends on the shape of a column, its cardinality, whether it is
-monotonic, how long its values are, and not on how many rows it has. The
-experiment measures a bounded, evenly spaced sample rather than every value, so
-its cost stops scaling with the file. On a 200000-row, 5-column dataset the full
-experiment took 9.7s and the sampled one 0.21s, and every column chose the same
-encoding and codec, producing a byte-identical file.
+`NewWriter` decides from the type. Bool packs to bits, integers are stored as
+deltas, and floating point, bytes and strings are stored plainly, each compressed
+with Flate. These are properties of the type rather than of the values, so they
+cost nothing to choose and cannot be wrong the way a guess at the data's shape
+can. They are also what an empty `Options` means: the defaults are documented by
+the zero value rather than beside it.
 
-The sample is not infallible. A column of 200000 floats with 10000 distinct
-values looks like 8192 distinct values to an 8192-row sample, so dictionary
-encoding looks useless and plain wins on the sample. Measured on the whole
-column, dictionary would have taken the column from 446KB to 80KB. A full
-cardinality pass over every column costs more than the 0.15 bytes/row it would
-save, so the sample stands and the floor is known rather than chased.
+`NewWriterWithOptions` changes any of it: the encoding, the codec, its level, and
+the block size. An encoding that cannot serve a column's type fails the write
+rather than being substituted, and a codec this build does not have fails before
+any bytes are written.
+
+`Optimize` decides from the values. It reads every column once, encodes it with
+each candidate encoding and compresses each with each codec, at the level the file
+will be written at, and keeps the smallest. Call it once for a dataset and every
+row group after it is stored the way the whole column earns: a column of repeated
+strings becomes a dictionary, a column of same-domain strings shares its affixes,
+and a column the type serves well keeps the layout it would have had anyway. The
+tiebreak is size alone, never measured time, so the same columns write the same
+file on any machine.
+
+That thoroughness is the cost. On the five-column, 200000-row comparison file
+below, `Optimize` takes the write from 43 ms to 1.26 s and the file from 15.56 to
+15.07 bytes per row — three percent of the size for thirty times the time. The
+defaults are already right for two of those five columns, and the pass pays for
+the other three by half a byte a row. It is the right call when the file is
+written once and read many times, and the wrong one when it is not; nothing
+between the two exists, because a sample that cheap is a guess the values did not
+get to answer.
 
 ## Usage
 
@@ -154,6 +168,26 @@ w.Close()
 r, _ := keine.NewReader(bytes.NewReader(buf.Bytes()))
 cols, _ := r.ReadRowGroup(0, []int{1}) // email only; id is never read
 ```
+
+The columns above are stored the way their type implies. Scanning the data first
+chooses the layout from the values instead:
+
+```go
+w := keine.NewWriterWithOptions(&buf, schema, keine.Options{
+    Compress:      keine.CompressFlate,
+    CompressLevel: 6,
+})
+w.Optimize([][]any{
+    {int64(1), int64(2), int64(3)},
+    {"a@example.com", nil, "c@example.com"},
+})
+w.AddRowGroup([][]any{ /* the same or later values */ })
+```
+
+`Optimize` is a pass over the data and decides for every row group after it, so
+it goes before the first `AddRowGroup`. `Options` is also how a writer that has
+not been Optimized is told what to do: `Encoding` zero means the type's own
+choice, and any other encoding is used for every column it can serve.
 
 `AddRowGroup` accepts `[][]any` with one slice per column, all the same length.
 Values are coerced to the schema's Go types, so passing an `int` for a
@@ -195,10 +229,10 @@ column is an error here for the same reason it is in `ReadColumn`.
 v0.2.0. The format is stable enough to write and read real data, but it is not a
 production storage engine. There is no schema evolution, no concurrency control,
 and no way to append to an existing file. Round-trip tests cover every type,
-encoding and codec, columns long enough to span several blocks, and the layout
-experiment is exercised against columns chosen to favour each one. The writer is
-deterministic: two writes of the same values produce the same bytes, which a
-golden file test pins.
+encoding and codec, columns long enough to span several blocks, the default
+layouts, and `Optimize` on columns chosen to favour each encoding it can pick.
+The writer is deterministic: two writes of the same values produce the same bytes,
+which a golden file test pins.
 
 The byte after the leading magic is the format version, currently 1. A reader that
 meets another version refuses the file rather than misreading it, so a layout
@@ -217,30 +251,40 @@ Xeon X5687 with `go test -bench=BenchmarkComparison -count=3`:
 
 ```
 BenchmarkComparison
-    15.07 bytes/row
-    write        69 ms   42 MB/s   62 MB    57568 allocs
-    read         25 ms   121 MB/s  32.7 MB    900 allocs
-    read scoped  12 ms   256 MB/s   137 KB    853 allocs
+    write             15.56 bytes/row
+    write             43 ms    72 MB/s   45 MB     728 allocs
+    write optimized   15.07 bytes/row
+    write optimized   1.26 s   2.4 MB/s  1.6 GB   ~7.2M allocs
+    read              23 ms   134 MB/s  36.7 MB    750 allocs
+    read scoped       10 ms   316 MB/s   295 KB    705 allocs
 ```
+
+The two write rows are the same values. The first stores each column the way its
+type implies and the second after `Optimize` has read them, so the difference
+between them is the pass and what it bought: 0.49 bytes a row, which is three
+percent of the file. Two of the five columns keep their default layout, and the
+pass's 1.2 seconds is almost entirely the encodings that do not win — the affix
+table over a near-distinct string column, and a dictionary over pseudo-random
+integers — measured because they are candidates, not because they are plausible.
 
 The scoped read returns typed slices into the reader's own buffers, so the
 memory it reports is transient: only the first read allocates the columns. The
 boxed read hands every value to the caller, and 16 bytes of that per value is
 the interface header itself, which is the floor for a `[]any` return.
 
-`BenchmarkExperiment` is the layout choice cost the writer pays per column.
-`BenchmarkSizes` reports every candidate's size, since the winner is only
-meaningful next to what it beat. `BenchmarkWriter` and `BenchmarkRead` cover the
-whole write and read paths, `BenchmarkTypedRead` the unboxed read path, and
-`BenchmarkPartialRead` the cost of skipping columns.
+`BenchmarkOptimize` is the pass cost per column, and `BenchmarkSizes` reports
+every candidate's size, since a winner is only meaningful next to what it beat.
+`BenchmarkWriter` and `BenchmarkRead` cover the whole write and read paths,
+`BenchmarkTypedRead` the unboxed read path, and `BenchmarkPartialRead` the cost
+of skipping columns.
 
 ## Compared with parquet
 
 Measured against pyarrow 25.0.1, both formats fed the *same* values: the five
 columns `BenchmarkComparison` builds were dumped to raw files and handed to
-pyarrow, so neither saw easier data and the 15.07 bytes/row is the same file in
-both rows of the table. The harness is not in this repository — it needs a
-Python install, and the library does not — but it is a handful of lines around
+pyarrow, so neither saw easier data and the bytes/row is the same file in both
+rows of the table. The harness is not in this repository — it needs a Python
+install, and the library does not — but it is a handful of lines around
 `pq.write_table` and `pq.ParquetFile.read`, and both sides were timed best of
 five on the same idle X5687.
 
@@ -248,25 +292,27 @@ On 200000 rows in 5 columns:
 
 | | bytes/row | write | read all | read 1 column |
 | --- | --- | --- | --- | --- |
-| keine | 15.07 | 69 ms | 12 ms (scoped) | 1.9 ms |
-| parquet zstd | 16.04 | 121 ms | 15 ms | 4.2 ms |
-| parquet snappy | 24.33 | 111 ms | 16 ms | 4.2 ms |
-| parquet none | 51.08 | 92–192 ms | 15 ms | 2.3 ms |
+| keine | 15.56 | 43 ms | 10 ms (scoped) | 0.9 ms |
+| parquet zstd | 16.04 | 128 ms | 14 ms | 4.2 ms |
+| parquet snappy | 24.33 | 124 ms | 15 ms | 4.1 ms |
+| parquet none | 51.08 | 111 ms | 15 ms | 2.3 ms |
 
 `read all` for parquet is `ParquetFile.read`, which returns an Arrow table of
 typed columnar buffers and never boxes a value. The fair keine counterpart is
-the scoped read, which hands back typed slices the same way; that is the 12 ms
-above, and it is faster than parquet's 15. The boxed read is a different
+the scoped read, which hands back typed slices the same way; that is the 10 ms
+above, and it is faster than parquet's 14. The boxed read is a different
 contract — it returns owned values in interfaces, which costs 16 bytes a value
 before any decoding, and no `[]any` return can go below that. It measures about
 23 ms and is not in the table, because it is not the same operation parquet is
 doing.
 
-keine is now smaller than parquet at every compression level, faster to write at
-every one of them, and faster reading a single column by more than two times.
-Parquet's `none` write time was unstable across runs, between 92 and 192 ms, and
-is reported as a range rather than picked from; nothing else in the table moved
-by more than a few percent between runs.
+keine's row is the default write, the one that stores each column the way its
+type implies. An `Optimize`d write of the same values is 15.07 bytes/row, which
+is what this table used to show; it costs 1.26 s instead of 43 ms, which is why
+the default is what the table reports now.
+
+keine is smaller than parquet at every compression level, three times faster to
+write at every one of them, and four times faster reading a single column.
 
 Where parquet still leads is not in the numbers above. It has nested types, a
 stable ecosystem, and readers in every language. keine has none of that, and the
@@ -281,18 +327,26 @@ rather than a claim about the table:
 
 | | bytes/row | write | read all |
 | --- | --- | --- | --- |
-| keine | 158.98 | 770 ms | 195 ms (scoped) |
-| parquet zstd | 166.74 | 703 ms | 235 ms |
-| parquet snappy | 236.64 | 514 ms | 296 ms |
-| parquet none | 380.95 | 253 ms | 111 ms |
+| keine | 160.23 | 320 ms | 168 ms (scoped) |
+| parquet zstd | 166.74 | 834 ms | 243 ms |
+| parquet snappy | 236.64 | 868 ms | 298 ms |
+| parquet none | 380.95 | 721 ms | 112 ms |
 
-Real data inverts the write conclusion. Synthetic data is mostly integers, and
-a text column of HTML comment bodies is most of this file: 86 MB of the 108 MB
-encoded, which flate turns into 36 MB. keine is still smaller than parquet's zstd
-by five percent and still reads a little faster, but it writes about ten percent
-slower, because DEFLATE at level 3 is what it has and zstd is what parquet has.
-Parquet's uncompressed file is the fastest both ways and 2.4 times the size,
-which is the trade that is actually being bought.
+Real data keeps the write conclusion the synthetic data reached. This file is
+mostly one text column of HTML comment bodies — 86 MB of the 108 MB encoded, which
+flate turns into 36 MB — and the rest is thirteen million integers and a few short
+strings. keine is four percent smaller than parquet's zstd, writes 2.6 times
+faster, and reads 45 percent faster scoped. Parquet's uncompressed file is the
+fastest read of the four and 2.4 times the size, which is the trade being bought.
+
+`Optimize` on the same shard takes the write to 20.4 s and the file to 157.05
+bytes per row, so the pass costs sixty times the write and recovers two percent of
+the file. What it buys is visible per column: `by`, a string column whose values
+cluster by author, becomes a dictionary; `title`, whose values share a site prefix
+and a suffix, becomes affix; `parent`, a mostly-sparse id column, stops paying for
+subtraction on values it does not have. The other nine columns keep the layout
+their type gave them. That is the honest shape of the trade — the pass is right
+about which columns it changes and ruinously expensive for how little it changes.
 
 The shard also found a bug the benchmark could not. Compressing a column's blocks
 used to be a serial loop inside one per-column goroutine, so that 330-block text
@@ -300,17 +354,6 @@ column ran on a single core while fifteen sat idle, and the README's claim that
 the writer parallelises across blocks was not what the code did. Blocks now share
 one semaphore across the whole write, the way the reader already did, which took
 this shard's write from 2312 ms to 953 ms without changing a byte of the file.
-
-The same shard then found a second problem, this time in the layout experiment. On
-the 8192-row sample, Affix compressed eleven bytes smaller than Plain on the text
-column — 1133307 against 1133318 — while encoding eight bytes larger, and on the
-full column that sign flips and Affix comes out twenty-six bytes larger. Eleven
-bytes is less than flate's block alignment moves on any change to the head of a
-stream, so it was noise, and the experiment was buying it with 350 ms of Affix
-encoding that made the file bigger. A win inside that margin is now a tie, and the
-tie goes to the encoding that produced fewer bytes, which took the same write to
-about 770 ms. Neither side of the comparison is timing, so the choice stays a
-function of the values alone and the file stays reproducible.
 
 ## Where the time goes
 
@@ -332,20 +375,26 @@ level 3 in 35ms, and the near-distinct string column compresses 5.62x in 82ms an
 the time. Writing at level 3 costs about nine percent of the file size and halves
 the write.
 
-Parquet pays nothing to choose a layout: its encodings are compiled in. keine
-measures them per column, on a sample, and that measurement is inside the write
-time above, about 26ms of the 69ms, against 35ms of compressing the blocks. It is
-what buys the size advantage over a format with a better compressor.
+Parquet pays nothing to choose a layout: its encodings are compiled in. A keine
+write that has not been Optimized pays the same nothing, because the layout comes
+from the type. The 43 ms above is encoding and compressing the five columns and
+nothing else, which is what buys the size advantage over a format with a better
+compressor: keine has a worse one and spends the time it saved on not measuring.
+
+`Optimize` trades that back. Its 1.26 s is a full encode and compress pass per
+candidate per column — thirty-six measurements on this file — and only three of
+them change anything. A caller who wants it pays for the nine that do not, because
+there is no way to know which three without measuring all of them.
 
 A write's allocations were the same machinery, twice over. Each compressor owns a
-hash table and a sliding window, and the experiment compresses a column once per
-codec while the writer compresses each of its blocks, so one write built several
-hundred of them; they are now pooled and reset, which is what Reset is for, and
-the buffer a measurement landed in belongs to its column for the whole write
-rather than being grown per candidate. That took the comparison file's write from
-108 MB to 61 MB. What is left of it is the work itself: the dictionary encoder
-keying a value through `fmt` once per distinct entry, the canonical copy of the
-caller's `[]any`, and the compressed bytes the file is made of, which have to be
+hash table and a sliding window, and a writer that measures a candidate per codec
+while also compressing each of its blocks builds several hundred of them; they are
+pooled and reset, which is what Reset is for, and the buffer a measurement lands
+in belongs to its column for the whole write rather than being grown per
+candidate. That took the comparison file's write from 108 MB to 61 MB. What is
+left of it is the work itself: the dictionary encoder keying a value through `fmt`
+once per distinct entry, the canonical copy of the caller's `[]any`, and the
+compressed bytes the file is made of, which have to be
 somewhere until they are written.
 
 The read profile after the block split was roughly a third DEFLATE, a fifth GC and

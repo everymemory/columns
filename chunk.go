@@ -7,14 +7,14 @@ import (
 	"sync"
 )
 
-// blockSize is the most encoded bytes a block holds. Blocks are byte ranges of
-// the encoded stream, so this is a byte boundary rather than a value boundary.
-// It sits well above DEFLATE's 32KB window, so a block loses little context to
-// seeing only part of the column, and it is small enough that one column still
-// splits into several jobs: on the 200000-row comparison file, five columns
-// become about twenty. Larger blocks measured slightly smaller files and no
-// faster a read, since the reader runs out of columns before it runs out of
-// cores.
+// blockSize is the default most encoded bytes a block holds. Blocks are byte
+// ranges of the encoded stream, so this is a byte boundary rather than a value
+// boundary. It sits well above DEFLATE's 32KB window, so a block loses little
+// context to seeing only part of the column, and it is small enough that one
+// column still splits into several jobs: on the 200000-row comparison file, five
+// columns become about twenty. Larger blocks measured slightly smaller files and
+// no faster a read, since the reader runs out of columns before it runs out of
+// cores. A writer whose Options.BlockSize is zero uses this.
 const blockSize = 256 * 1024
 
 // ColumnBlock is one independently compressed range of a column's encoded bytes.
@@ -202,19 +202,23 @@ func ReadChunk(r io.Reader) (ColumnChunk, error) {
 // codec is one the writer has already measured, so Compress serves it. An
 // uncompressed block keeps its slice of encoded rather than copying, since
 // nothing in between can overwrite it before WriteChunk consumes it.
-func splitBlocks(encoded []byte, codec uint8, sem chan struct{}) []ColumnBlock {
-	n := (len(encoded) + blockSize - 1) / blockSize
+//
+// blockSz is the block size the writer is configured with, and level the level
+// its codecs run at, so the blocks are the ones the configuration describes
+// rather than the package's defaults.
+func splitBlocks(encoded []byte, codec uint8, level, blockSz int, sem chan struct{}) []ColumnBlock {
+	n := (len(encoded) + blockSz - 1) / blockSz
 	if n == 0 {
 		n = 1
 	}
 	blocks := make([]ColumnBlock, n)
 	var wg sync.WaitGroup
 	for i := range blocks {
-		end := (i + 1) * blockSize
+		end := (i + 1) * blockSz
 		if end > len(encoded) {
 			end = len(encoded)
 		}
-		part := encoded[i*blockSize : end]
+		part := encoded[i*blockSz : end]
 		blocks[i].RawLength = uint32(len(part))
 		if codec == CompressNone {
 			blocks[i].Data = part
@@ -226,7 +230,7 @@ func splitBlocks(encoded []byte, codec uint8, sem chan struct{}) []ColumnBlock {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			out, _ := Compress(part, codec)
+			out, _ := compressAt(part, codec, level)
 			blocks[i].Data = out
 		}()
 	}

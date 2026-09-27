@@ -173,7 +173,7 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
-func TestLayoutExperiment(t *testing.T) {
+func TestBenchmarkLayouts(t *testing.T) {
 	// A boolean column separates the encodings sharply: RLEBitpack costs one
 	// bit per value, Plain one byte per value.
 	const n = 10000
@@ -217,11 +217,6 @@ func TestLayoutExperiment(t *testing.T) {
 			float64(plain.CompressedSize)/float64(rle.CompressedSize))
 	}
 
-	best := ExperimentLayouts(boolCol, ColumnSchema{Name: "b", Type: TypeBool})
-	if best.Encoding != EncRLEBitpack {
-		t.Errorf("ExperimentLayouts picked %s, want RLEBitpack", best.Name)
-	}
-
 	// High cardinality strings: every value is distinct, so dictionary
 	// encoding only adds index overhead and cannot be the best layout.
 	strCol := make([]any, n)
@@ -262,94 +257,389 @@ func TestLayoutExperiment(t *testing.T) {
 	}
 }
 
-func TestExperimentSample(t *testing.T) {
-	small := make([]any, maxExperimentRows)
-	for i := range small {
-		small[i] = i
-	}
-	if got := experimentSample(small); !reflect.DeepEqual(got, small) {
-		t.Errorf("experimentSample of a column at the cap returned a different slice")
-	}
-
-	big := make([]any, maxExperimentRows*4)
-	for i := range big {
-		big[i] = i
-	}
-	got := experimentSample(big)
-	if len(got) > maxExperimentRows {
-		t.Fatalf("experimentSample returned %d values, cap is %d", len(got), maxExperimentRows)
-	}
-	if len(got) <= 1 {
-		t.Fatal("experimentSample returned too few values to compare shapes")
-	}
-	if got[0] != big[0] {
-		t.Errorf("sample starts at %v, want the first value %v", got[0], big[0])
-	}
-	// Even spacing lands on multiples of the stride, so the last sampled value
-	// is within one stride of the end rather than exactly the last value.
-	stride := (len(big) + maxExperimentRows - 1) / maxExperimentRows
-	last := got[len(got)-1].(int)
-	if last < len(big)-stride {
-		t.Errorf("sample ends at index %d, want within stride %d of %d", last, stride, len(big))
-	}
-	for i := 1; i < len(got); i++ {
-		if got[i].(int) <= got[i-1].(int) {
-			t.Errorf("sample is not in increasing order at %d", i)
-		}
-	}
-}
-
-// ExperimentLayouts measures a sample of a long column. The layout it picks has
-// to match what measuring the whole column would have picked, otherwise writing
-// a bigger file would change its encoding.
-func TestExperimentLayoutSampleMatches(t *testing.T) {
-	const n = maxExperimentRows * 4
-	full := make([]any, n)
-	for i := range full {
-		full[i] = fmt.Sprintf("bucket-%d", i%64)
-	}
-	schema := ColumnSchema{Name: "b", Type: TypeString}
-
-	sampled := ExperimentLayouts(full, schema)
-	measured := BenchmarkLayouts(full, schema)[0]
-	if sampled.Encoding != measured.Encoding || sampled.Compress != measured.Compress {
-		t.Errorf("ExperimentLayouts picked %s on the sample but %s on the full column",
-			sampled.Name, measured.Name)
-	}
-	if sampled.CompressedSize == 0 {
-		t.Error("ExperimentLayouts returned a zero size")
-	}
-}
-
-// improves decides whether one candidate layout displaces another, and the rule
-// is subtle enough that measuring it through a column leaves the interesting
-// cases to luck. The margins below are the columns the rule was written for: two
-// candidates within flate's block alignment noise of each other, where the one
-// that compressed a hair smaller is also the one that encoded larger.
-func TestImproves(t *testing.T) {
+// The layout a writer falls back on has to be a property of the type alone,
+// since it is chosen before any value is read. Whatever a column holds, this is
+// what it gets: bool packs to a bit, deltas cost a subtraction, and everything
+// else is stored plainly rather than assumed about.
+func TestDefaultLayout(t *testing.T) {
 	tests := []struct {
-		name                    string
-		compressed, encoded     int
-		bestCompressed, bestEnc int
-		want                    bool
+		name       string
+		typ        uint8
+		enc, codec uint8
 	}{
-		{"clearly smaller wins", 100, 50, 1000, 60, true},
-		{"clearly larger loses", 1000, 50, 100, 60, false},
-		{"same size, fewer encoded bytes wins", 1000, 50, 1000, 60, true},
-		{"same size, more encoded bytes loses", 1000, 60, 1000, 50, false},
-		{"same encoding, smaller codec wins", 900, 60, 1000, 60, true},
-		{"identical candidate does not displace", 1000, 60, 1000, 60, false},
-		{"noise sized win, larger encoded loses",
-			1133307, 2694716, 1133318, 2694708, false},
-		{"noise sized loss, smaller encoded wins",
-			1133329, 2694708, 1133318, 2694716, true},
+		{"bool", TypeBool, EncRLEBitpack, CompressFlate},
+		{"int8", TypeInt8, EncDelta, CompressFlate},
+		{"int16", TypeInt16, EncDelta, CompressFlate},
+		{"int32", TypeInt32, EncDelta, CompressFlate},
+		{"int64", TypeInt64, EncDelta, CompressFlate},
+		{"uint8", TypeUint8, EncDelta, CompressFlate},
+		{"uint16", TypeUint16, EncDelta, CompressFlate},
+		{"uint32", TypeUint32, EncDelta, CompressFlate},
+		{"uint64", TypeUint64, EncDelta, CompressFlate},
+		{"float32", TypeFloat32, EncPlain, CompressFlate},
+		{"float64", TypeFloat64, EncPlain, CompressFlate},
+		{"bytes", TypeBytes, EncPlain, CompressFlate},
+		{"string", TypeString, EncPlain, CompressFlate},
+		// A type no schema carries gets Plain, the encoding everything accepts.
+		{"unknown", 0xFF, EncPlain, CompressFlate},
 	}
 	for _, tc := range tests {
-		if got := improves(tc.compressed, tc.encoded, tc.bestCompressed, tc.bestEnc); got != tc.want {
-			t.Errorf("%s: improves(%d, %d, %d, %d) = %v, want %v",
-				tc.name, tc.compressed, tc.encoded, tc.bestCompressed, tc.bestEnc, got, tc.want)
+		enc, codec := defaultLayout(tc.typ)
+		if enc != tc.enc || codec != tc.codec {
+			t.Errorf("defaultLayout(%s) = %s+%s, want %s+%s",
+				tc.name, encName(enc), codecName(codec), encName(tc.enc), codecName(tc.codec))
 		}
 	}
+}
+
+// A writer that has not been Optimized stores each column the way its type
+// implies, and the metadata it writes back says so. The default has to survive a
+// round trip, since it is what a caller gets for doing nothing.
+func TestWriterUsesDefaultLayouts(t *testing.T) {
+	schema := []ColumnSchema{
+		{Name: "b", Type: TypeBool},
+		{Name: "i", Type: TypeInt64},
+		{Name: "s", Type: TypeString},
+	}
+	cols := [][]any{
+		{true, false, true, true, false},
+		{int64(1), int64(3), int64(6), int64(10), int64(15)},
+		{"alpha", "beta", "gamma", "delta", "epsilon"},
+	}
+
+	var buf bytes.Buffer
+	w := NewWriter(&buf, schema)
+	if err := w.AddRowGroup(cols); err != nil {
+		t.Fatalf("AddRowGroup: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	r, err := NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	rg, err := r.RowGroupMeta(0)
+	if err != nil {
+		t.Fatalf("RowGroupMeta: %v", err)
+	}
+	want := []struct {
+		name       string
+		enc, codec uint8
+	}{
+		{"b", EncRLEBitpack, CompressFlate},
+		{"i", EncDelta, CompressFlate},
+		{"s", EncPlain, CompressFlate},
+	}
+	for i, wnt := range want {
+		got := rg.Columns[i]
+		if got.Encoding != wnt.enc || got.Compress != wnt.codec {
+			t.Errorf("column %s encoded %s+%s, want %s+%s", wnt.name,
+				encName(got.Encoding), codecName(got.Compress),
+				encName(wnt.enc), codecName(wnt.codec))
+		}
+	}
+	back, err := r.ReadRowGroup(0, []int{0, 1, 2})
+	if err != nil {
+		t.Fatalf("ReadRowGroup: %v", err)
+	}
+	for i, col := range cols {
+		if len(back[i]) != len(col) {
+			t.Errorf("column %d read back %d values, wrote %d", i, len(back[i]), len(col))
+		}
+	}
+}
+
+// Options overrides the layout the type implies and the codec the writer defaults
+// to, and the columns still have to round trip through what was asked for. The
+// codec's zero value is CompressNone, a valid codec, so an empty Options asks for
+// the type's default encoding stored uncompressed.
+func TestWriterOptions(t *testing.T) {
+	schema := []ColumnSchema{
+		{Name: "i", Type: TypeInt64},
+		{Name: "s", Type: TypeString},
+	}
+	cols := [][]any{
+		{int64(1), int64(2), int64(3), int64(4)},
+		{"a", "b", "c", "d"},
+	}
+
+	opts := []struct {
+		name string
+		opts Options
+		want [][2]uint8
+	}{
+		{name: "empty options", opts: Options{}, want: [][2]uint8{{EncDelta, CompressNone}, {EncPlain, CompressNone}}},
+		{name: "plain encoding", opts: Options{Encoding: EncPlain}, want: [][2]uint8{{EncPlain, CompressNone}, {EncPlain, CompressNone}}},
+		{name: "no compression", opts: Options{Compress: CompressNone}, want: [][2]uint8{{EncDelta, CompressNone}, {EncPlain, CompressNone}}},
+		{name: "lzw", opts: Options{Compress: CompressLzw}, want: [][2]uint8{{EncDelta, CompressLzw}, {EncPlain, CompressLzw}}},
+		{name: "plain on flate", opts: Options{Encoding: EncPlain, Compress: CompressFlate}, want: [][2]uint8{{EncPlain, CompressFlate}, {EncPlain, CompressFlate}}},
+		{name: "level and block size", opts: Options{Compress: CompressFlate, CompressLevel: 9, BlockSize: 64}, want: [][2]uint8{{EncDelta, CompressFlate}, {EncPlain, CompressFlate}}},
+	}
+	for _, o := range opts {
+		t.Run(o.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			w := NewWriterWithOptions(&buf, schema, o.opts)
+			if err := w.AddRowGroup(cols); err != nil {
+				t.Fatalf("AddRowGroup: %v", err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+
+			r, err := NewReader(bytes.NewReader(buf.Bytes()))
+			if err != nil {
+				t.Fatalf("NewReader: %v", err)
+			}
+			rg, err := r.RowGroupMeta(0)
+			if err != nil {
+				t.Fatalf("RowGroupMeta: %v", err)
+			}
+			for i, wnt := range o.want {
+				if got := rg.Columns[i]; got.Encoding != wnt[0] || got.Compress != wnt[1] {
+					t.Errorf("column %d stored %s+%s, want %s+%s", i,
+						encName(got.Encoding), codecName(got.Compress),
+						encName(wnt[0]), codecName(wnt[1]))
+				}
+			}
+			back, err := r.ReadRowGroup(0, []int{0, 1})
+			if err != nil {
+				t.Fatalf("ReadRowGroup: %v", err)
+			}
+			for i, col := range cols {
+				for j, v := range col {
+					if back[i][j] != v {
+						t.Errorf("column %d row %d read back %v, wrote %v", i, j, back[i][j], v)
+					}
+				}
+			}
+		})
+	}
+}
+
+// An option this build cannot serve has to be refused before anything is
+// written, rather than producing a file that is silently missing its data.
+func TestWriterOptionsRejected(t *testing.T) {
+	schema := []ColumnSchema{{Name: "i", Type: TypeInt64}}
+	cols := [][]any{{int64(1), int64(2)}}
+
+	for _, o := range []struct {
+		name string
+		opts Options
+	}{
+		{"zstd codec", Options{Compress: CompressZstd}},
+		{"unknown codec", Options{Compress: 99}},
+		{"unknown encoding", Options{Encoding: 99}},
+	} {
+		t.Run(o.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			w := NewWriterWithOptions(&buf, schema, o.opts)
+			if buf.Len() != 0 {
+				t.Errorf("wrote %d bytes for options the writer refuses", buf.Len())
+			}
+			if err := w.AddRowGroup(cols); err == nil {
+				t.Error("AddRowGroup with unusable options: want error, got nil")
+			}
+			if err := w.Close(); err == nil {
+				t.Error("Close with unusable options: want error, got nil")
+			}
+		})
+	}
+}
+
+// An encoding that cannot serve a column's type is the caller's choice, so the
+// write reports it instead of substituting something else.
+func TestWriterEncodingWrongForType(t *testing.T) {
+	schema := []ColumnSchema{{Name: "s", Type: TypeString}}
+	cols := [][]any{{"a", "b", "c"}}
+
+	var buf bytes.Buffer
+	w := NewWriterWithOptions(&buf, schema, Options{Encoding: EncRLEBitpack, Compress: CompressFlate})
+	if err := w.AddRowGroup(cols); err == nil {
+		t.Error("AddRowGroup of a bool encoding on strings: want error, got nil")
+	}
+}
+
+// Optimize reads the whole column rather than trusting the type, so a column the
+// default serves badly has to come out smaller, and the file still has to read
+// back. Two hundred values repeated a hundred times each is what the encodings
+// that look at the values are for and what Plain pays for.
+func TestOptimizeBeatsDefault(t *testing.T) {
+	col := make([]any, 20000)
+	for i := range col {
+		col[i] = fmt.Sprintf("customer-%d@example.com", i%200)
+	}
+	schema := []ColumnSchema{{Name: "s", Type: TypeString}}
+
+	// The default for a string column is Plain, which is what Optimize has to
+	// beat to have been worth the pass.
+	var plain LayoutResult
+	for _, r := range BenchmarkLayouts(col, schema[0]) {
+		if r.Encoding == EncPlain && r.Compress == CompressFlate {
+			plain = r
+		}
+	}
+	if plain.CompressedSize == 0 {
+		t.Fatal("BenchmarkLayouts omitted the Plain+Flate candidate")
+	}
+
+	var buf bytes.Buffer
+	w := NewWriter(&buf, schema)
+	if err := w.AddRowGroup([][]any{col}); err != nil {
+		t.Fatalf("AddRowGroup: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	defaultLen := buf.Len()
+
+	buf.Reset()
+	w = NewWriter(&buf, schema)
+	if err := w.Optimize([][]any{col}); err != nil {
+		t.Fatalf("Optimize: %v", err)
+	}
+	picked := w.layouts[0]
+	if picked.Encoding == EncPlain {
+		t.Errorf("Optimize kept Plain on 200 repeated values, want an encoding that reads them")
+	}
+	if picked.CompressedSize >= plain.CompressedSize {
+		t.Errorf("Optimize picked %s at %d bytes, Plain+Flate is %d",
+			picked.Name, picked.CompressedSize, plain.CompressedSize)
+	}
+	if err := w.AddRowGroup([][]any{col}); err != nil {
+		t.Fatalf("AddRowGroup: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := buf.Len(); got >= defaultLen {
+		t.Errorf("optimized file is %d bytes, the default layout wrote %d", got, defaultLen)
+	}
+
+	r, err := NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	back, err := r.ReadRowGroup(0, []int{0})
+	if err != nil {
+		t.Fatalf("ReadRowGroup: %v", err)
+	}
+	for i, v := range col {
+		if back[0][i] != v {
+			t.Fatalf("value %d read back %v, wrote %v", i, back[0][i], v)
+		}
+	}
+}
+
+// Optimize decides once and applies to every row group after it, since the
+// columns of a dataset share a shape across the groups it is split into.
+func TestOptimizeAppliesToLaterRowGroups(t *testing.T) {
+	schema := []ColumnSchema{{Name: "s", Type: TypeString}}
+
+	// Thirty-two buckets over three thousand values: Plain is not the answer,
+	// whichever encoding wins.
+	col := make([]any, 3000)
+	for i := range col {
+		col[i] = fmt.Sprintf("bucket-%d", i%32)
+	}
+	results := BenchmarkLayouts(col, schema[0])
+	if len(results) == 0 {
+		t.Fatal("BenchmarkLayouts returned no candidates")
+	}
+	if results[0].Encoding == EncPlain {
+		t.Fatalf("the test's column does not invite Plain, it chose %s", results[0].Name)
+	}
+	want := results[0].Encoding
+
+	var buf bytes.Buffer
+	w := NewWriter(&buf, schema)
+	for g := 0; g < 3; g++ {
+		group := make([]any, 3000)
+		for i := range group {
+			group[i] = fmt.Sprintf("bucket-%d", (i+g*17)%32)
+		}
+		if g == 0 {
+			if err := w.Optimize([][]any{col}); err != nil {
+				t.Fatalf("Optimize: %v", err)
+			}
+			if got := w.layouts[0].Encoding; got != want {
+				t.Errorf("Optimize picked %s on the first group, the column measures %s", encName(got), encName(want))
+			}
+		}
+		if err := w.AddRowGroup([][]any{group}); err != nil {
+			t.Fatalf("AddRowGroup(%d): %v", g, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	r, err := NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	if got := r.RowGroupCount(); got != 3 {
+		t.Fatalf("RowGroupCount = %d, want 3", got)
+	}
+	for g := 0; g < 3; g++ {
+		rg, err := r.RowGroupMeta(g)
+		if err != nil {
+			t.Fatalf("RowGroupMeta(%d): %v", g, err)
+		}
+		if got := rg.Columns[0]; got.Encoding != want {
+			t.Errorf("row group %d encoded %s, Optimize chose %s", g, encName(got.Encoding), encName(want))
+		}
+	}
+}
+
+// Optimize validates its input the way AddRowGroup does, since it reads the same
+// columns.
+func TestOptimizeErrors(t *testing.T) {
+	schema := []ColumnSchema{
+		{Name: "i", Type: TypeInt64},
+		{Name: "s", Type: TypeString},
+	}
+	good := [][]any{{int64(1)}, {"a"}}
+
+	t.Run("wrong column count", func(t *testing.T) {
+		var buf bytes.Buffer
+		w := NewWriter(&buf, schema)
+		if err := w.Optimize([][]any{{int64(1)}}); err == nil {
+			t.Error("Optimize with one column of a two column schema: want error, got nil")
+		}
+	})
+	t.Run("ragged rows", func(t *testing.T) {
+		var buf bytes.Buffer
+		w := NewWriter(&buf, schema)
+		if err := w.Optimize([][]any{{int64(1), int64(2)}, {"a"}}); err == nil {
+			t.Error("Optimize with columns of different lengths: want error, got nil")
+		}
+	})
+	t.Run("uncoercible values", func(t *testing.T) {
+		var buf bytes.Buffer
+		w := NewWriter(&buf, schema)
+		if err := w.Optimize([][]any{{struct{}{}}, {"a"}}); err == nil {
+			t.Error("Optimize of a value no type accepts: want error, got nil")
+		}
+	})
+	t.Run("after a failing writer", func(t *testing.T) {
+		w := NewWriterWithOptions(&bytes.Buffer{}, schema, Options{Compress: CompressZstd})
+		if err := w.Optimize(good); err == nil {
+			t.Error("Optimize on a writer that cannot write: want error, got nil")
+		}
+	})
+	t.Run("writes no data on error", func(t *testing.T) {
+		var buf bytes.Buffer
+		w := NewWriter(&buf, schema)
+		_ = w.Optimize([][]any{{struct{}{}}, {"a"}})
+		// The header is written at construction, so the file starts at the magic
+		// and the version. Nothing after it: no chunk, no footer.
+		if got := buf.Len(); got != len(magic)+1 {
+			t.Errorf("wrote %d bytes while reporting an error, want the %d byte header only",
+				got, len(magic)+1)
+		}
+	})
 }
 
 func TestRowGroupMeta(t *testing.T) {
