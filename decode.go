@@ -36,9 +36,10 @@ func sizedSlice[T any](have []T, n int) []T {
 }
 
 // DecodePlain is the inverse of EncodePlain. typ is required because the bytes
-// alone do not say how many values they hold.
+// alone do not say how many values they hold, and the count is walked out of
+// the data because the caller has no other source for it.
 func DecodePlain(b []byte, typ uint8) ([]any, error) {
-	typed, err := decodePlainTyped(b, typ, &dest{})
+	typed, err := decodePlainTyped(b, typ, &dest{}, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -48,7 +49,11 @@ func DecodePlain(b []byte, typ uint8) ([]any, error) {
 // decodePlainTyped decodes plain data as a slice of the Go type for typ, []int64
 // for TypeInt64 and so on, rather than []any. DecodePlain boxes the result; the
 // typed reader uses this to skip boxing.
-func decodePlainTyped(b []byte, typ uint8, d *dest) (any, error) {
+//
+// n is the number of values in the data when the caller already knows it, which
+// a reader gets from the row group's row count. Zero means the data is the only
+// authority and the count has to be walked out of it first.
+func decodePlainTyped(b []byte, typ uint8, d *dest, n int) (any, error) {
 	switch typ {
 	case TypeBool:
 		out, _ := d.vals.([]bool)
@@ -88,21 +93,36 @@ func decodePlainTyped(b []byte, typ uint8, d *dest) (any, error) {
 	case TypeFloat64:
 		return decodeFixedT(b, 8, func(s []byte) float64 { return math.Float64frombits(binary.LittleEndian.Uint64(s)) }, d)
 	case TypeString, TypeBytes:
-		return decodePlainVarlen(b, typ, d)
+		return decodePlainVarlen(b, typ, d, n)
 	default:
 		return nil, fmt.Errorf("keine: unknown type %d", typ)
 	}
 }
 
 // decodePlainVarlen decodes the length-prefixed plain form used by strings and
-// byte slices. varlenStats supplies the value count and total length up front,
-// so the result and its backing buffer are sized in one pass. Strings point into
-// that shared buffer instead of copying, while byte slices still copy because
-// they are mutable and a caller writing one would clobber its neighbours.
-func decodePlainVarlen(b []byte, typ uint8, d *dest) (any, error) {
-	nvals, total, ok := varlenStats(b)
-	if !ok {
-		return nil, fmt.Errorf("keine: plain data truncated at value %d", nvals)
+// byte slices. n is the value count the caller already knows, which a reader has
+// from the row group's row count; zero means the data is the only authority and
+// the count has to be walked out of it. Either source gives the byte total up
+// front, so the result and its backing buffer are sized before any value is
+// placed. Strings point into that shared buffer instead of copying, while byte
+// slices still copy because they are mutable and a caller writing one would
+// clobber its neighbours.
+func decodePlainVarlen(b []byte, typ uint8, d *dest, n int) (any, error) {
+	var total int
+	if n > 0 {
+		// Each value costs four bytes of prefix plus its own bytes, so the count
+		// and the stream length settle the total between them. A stream too short
+		// for the count cannot hold it; one too long holds values the count does
+		// not admit, and the walk below reports that rather than this check.
+		if total = len(b) - 4*n; total < 0 {
+			return nil, fmt.Errorf("keine: plain data is %d bytes, too few for %d values", len(b), n)
+		}
+	} else {
+		var ok bool
+		n, total, ok = varlenStats(b)
+		if !ok {
+			return nil, fmt.Errorf("keine: plain data truncated at value %d", n)
+		}
 	}
 
 	if typ == TypeString {
@@ -112,30 +132,61 @@ func decodePlainVarlen(b []byte, typ uint8, d *dest) (any, error) {
 		text := sizedSlice(d.buf, total)
 		d.buf = text
 		out, _ := d.vals.([]string)
-		out = sizedSlice(out, nvals)
+		out = sizedSlice(out, n)
 		d.vals = out
 		var off int
-		for i := 0; i < nvals; i++ {
-			n := int(binary.LittleEndian.Uint32(b[:4]))
-			b = b[4:]
-			copy(text[off:off+n], b[:n])
-			out[i] = stringAt(text, off, n)
-			off += n
-			b = b[n:]
+		for i := 0; i < n; i++ {
+			val, rest, err := plainValue(b, i)
+			if err != nil {
+				return nil, err
+			}
+			// The byte budget was settled by the count rather than by the prefixes,
+			// so a value that spends more of it than the count allows is what a
+			// stream holding fewer values than n claims looks like.
+			if off+len(val) > total {
+				return nil, fmt.Errorf("keine: plain data truncated at value %d", i)
+			}
+			b = rest
+			copy(text[off:off+len(val)], val)
+			out[i] = stringAt(text, off, len(val))
+			off += len(val)
+		}
+		if len(b) > 0 {
+			return nil, fmt.Errorf("keine: plain data holds more than the %d values expected", n)
 		}
 		return out, nil
 	}
 
 	out, _ := d.vals.([][]byte)
-	out = sizedSlice(out, nvals)
+	out = sizedSlice(out, n)
 	d.vals = out
-	for i := 0; i < nvals; i++ {
-		n := int(binary.LittleEndian.Uint32(b[:4]))
-		b = b[4:]
-		out[i] = append([]byte(nil), b[:n]...)
-		b = b[n:]
+	for i := 0; i < n; i++ {
+		val, rest, err := plainValue(b, i)
+		if err != nil {
+			return nil, err
+		}
+		b = rest
+		out[i] = append([]byte(nil), val...)
+	}
+	if len(b) > 0 {
+		return nil, fmt.Errorf("keine: plain data holds more than the %d values expected", n)
 	}
 	return out, nil
+}
+
+// plainValue is the length-prefixed value at the start of b along with the bytes
+// that follow it. i is the value's position, which is all the truncation error
+// has to report.
+func plainValue(b []byte, i int) (val, rest []byte, err error) {
+	if len(b) < 4 {
+		return nil, nil, fmt.Errorf("keine: plain data truncated at value %d", i)
+	}
+	n := int(binary.LittleEndian.Uint32(b[:4]))
+	b = b[4:]
+	if len(b) < n {
+		return nil, nil, fmt.Errorf("keine: plain data truncated at value %d", i)
+	}
+	return b[:n], b[n:], nil
 }
 
 // varlenStats walks the length prefixes of a plain varlen chunk and returns the
@@ -430,7 +481,7 @@ func fixedDictEntries(entries [][]byte, indices []uint32, typ uint8, d *dest) (a
 		copy(flat[off:off+width], e)
 		off += width
 	}
-	return decodePlainTyped(flat, typ, d)
+	return decodePlainTyped(flat, typ, d, len(indices))
 }
 
 // fixedWidth is the encoded width of a fixed width type, and zero for the types
@@ -490,7 +541,7 @@ func decodeBitunpack(b []byte, n int, nbits uint, d *dest) []uint32 {
 func decodeTyped(enc uint8, data []byte, n int, typ uint8, d *dest) (any, error) {
 	switch enc {
 	case EncPlain:
-		return decodePlainTyped(data, typ, d)
+		return decodePlainTyped(data, typ, d, n)
 	case EncRLEBitpack:
 		return decodeRLEBitpack(data, n, d), nil
 	case EncDelta:

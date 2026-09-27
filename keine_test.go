@@ -3,6 +3,7 @@ package keine
 import (
 	"bytes"
 	"compress/flate"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -1476,14 +1477,14 @@ func TestReadRowGroupScopedAcrossRowGroups(t *testing.T) {
 }
 
 func TestTypedDecodeErrors(t *testing.T) {
-	if _, err := decodePlainTyped([]byte{0x01}, TypeBytes, &dest{}); err == nil {
+	if _, err := decodePlainTyped([]byte{0x01}, TypeBytes, &dest{}, 0); err == nil {
 		t.Error("decodePlainTyped with a truncated byte length prefix: want error, got nil")
 	}
 	prefix := []byte{0xff, 0xff, 0xff, 0xff}
-	if _, err := decodePlainTyped(append(prefix, 1, 2), TypeBytes, &dest{}); err == nil {
+	if _, err := decodePlainTyped(append(prefix, 1, 2), TypeBytes, &dest{}, 0); err == nil {
 		t.Error("decodePlainTyped with a byte length beyond the data: want error, got nil")
 	}
-	if _, err := decodePlainTyped(nil, 0xFF, &dest{}); err == nil {
+	if _, err := decodePlainTyped(nil, 0xFF, &dest{}, 0); err == nil {
 		t.Error("decodePlainTyped with an unknown type: want error, got nil")
 	}
 	if _, err := decodeTyped(0xFF, nil, 0, TypeInt64, &dest{}); err == nil {
@@ -1510,6 +1511,71 @@ var typeEncodingMatch = map[uint8]uint8{
 	EncDict:        TypeString,
 	EncOffsetBytes: TypeBytes,
 	EncAffix:       TypeString,
+}
+
+// A reader knows how many values a chunk holds before it decodes them, from the
+// row group's row count, so decodePlainTyped takes the count and does not have to
+// walk the length prefixes first. The count sizes the buffers, and the data still
+// has to agree with it: a stream that holds fewer values than the count claims, or
+// more, is refused.
+func TestPlainValueCount(t *testing.T) {
+	prefix := func(n int) []byte {
+		var p [4]byte
+		binary.LittleEndian.PutUint32(p[:], uint32(n))
+		return p[:]
+	}
+	enc := func(vals ...string) []byte {
+		var b []byte
+		for _, v := range vals {
+			b = append(b, prefix(len(v))...)
+			b = append(b, v...)
+		}
+		return b
+	}
+	one := enc("ab")
+	cutShort := append(enc("ab"), 0x01, 0x02)
+	tooLong := append(prefix(5), 1)
+	for _, tc := range []struct {
+		name string
+		data []byte
+		n    int
+		typ  uint8
+	}{
+		{"count beyond the data", one[:1], 1, TypeString},
+		{"fewer values than the count", cutShort, 2, TypeString},
+		{"a value longer than the count leaves room for", tooLong, 1, TypeString},
+		{"a value longer than the count leaves room for", tooLong, 1, TypeBytes},
+		{"a prefix the data cuts short", cutShort, 2, TypeBytes},
+		{"a value the count leaves out", enc("", ""), 1, TypeString},
+		{"a value the byte count leaves out", enc("", ""), 1, TypeBytes},
+	} {
+		if _, err := decodePlainTyped(tc.data, tc.typ, &dest{}, tc.n); err == nil {
+			t.Errorf("decodePlainTyped with %s: want error, got nil", tc.name)
+		}
+	}
+
+	// A count that fits decodes the same values a walk of the data would have found.
+	strs, err := decodePlainTyped(enc("ab", "", "cdef"), TypeString, &dest{}, 3)
+	if err != nil {
+		t.Fatalf("decodePlainTyped(strings, n=3): %v", err)
+	}
+	if got, _ := strs.([]string); !reflect.DeepEqual(got, []string{"ab", "", "cdef"}) {
+		t.Errorf("decodePlainTyped(strings, n=3) = %v, want [ab  cdef]", got)
+	}
+	byts, err := decodePlainTyped(enc("ab", "", "cdef"), TypeBytes, &dest{}, 3)
+	if err != nil {
+		t.Fatalf("decodePlainTyped(bytes, n=3): %v", err)
+	}
+	got, _ := byts.([][]byte)
+	want := [][]byte{[]byte("ab"), nil, []byte("cdef")}
+	if len(got) != len(want) {
+		t.Fatalf("decodePlainTyped(bytes, n=3) returned %d values, want %d", len(got), len(want))
+	}
+	for k := range want {
+		if string(got[k]) != string(want[k]) {
+			t.Errorf("decodePlainTyped(bytes, n=3)[%d] = %q, want %q", k, got[k], want[k])
+		}
+	}
 }
 
 func TestBitmap(t *testing.T) {

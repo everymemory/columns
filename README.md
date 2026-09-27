@@ -334,7 +334,7 @@ rather than a claim about the table:
 
 | | bytes/row | write | read all |
 | --- | --- | --- | --- |
-| keine | 160.23 | 310 ms | 161 ms (scoped) |
+| keine | 160.23 | 310 ms | 140 ms (scoped) |
 | parquet zstd | 166.74 | 936 ms | 242 ms |
 | parquet snappy | 236.64 | 742 ms | 306 ms |
 | parquet none | 380.95 | 861 ms | 114 ms |
@@ -343,8 +343,8 @@ Real data keeps the write conclusion the synthetic data reached. This file is
 mostly one text column of HTML comment bodies, 86 MB of the 108 MB encoded, which
 flate turns into 36 MB, and the rest is thirteen million integers and a few short
 strings. keine is four percent smaller than parquet's zstd, writes three times
-faster, and reads 50 percent faster scoped. Parquet's uncompressed file is the
-fastest read of the four and 2.4 times the size, which is the trade being bought.
+faster, and reads faster scoped. Parquet's uncompressed file is the fastest read
+of the four and 2.4 times the size, which is the trade being bought.
 
 `Optimize` on the same shard takes the write to 35.4 s and the file to 144.75
 bytes per row, so the pass costs a hundred times the write and recovers ten percent
@@ -361,6 +361,13 @@ column ran on a single core while fifteen sat idle, and the README's claim that
 the writer parallelises across blocks was not what the code did. Blocks now share
 one semaphore across the whole write, the way the reader already did, which took
 this shard's write from 2312 ms to 953 ms without changing a byte of the file.
+
+The same shard found a read-side version of it. A plain string column used to walk
+its length prefixes twice: once to size the result, once to place the values. The
+row group already records the value count, so the first walk was measuring
+something the file already said. Passing the count through took the shard's scoped
+read from 161 ms to 140 ms, all of it on that one text column, whose prefixes walk
+86 MB.
 
 ## Where the time goes
 
