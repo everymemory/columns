@@ -364,9 +364,17 @@ short strings. keine writes three times faster than parquet's default and reads
 faster scoped at every zstd level, because zstd's decompression cost barely rises
 with the level while flate's is already spread across blocks. The size conclusion
 does not survive the comparison: from level 3 up parquet is the smaller file, by
-ten percent there and by a quarter at level 19. That is the trade stdlib-only
-buys — Go's `compress` has no zstd, and a column of HTML comment bodies is exactly
-the data zstd's longer match search was built for. Parquet's uncompressed file is
+ten percent there and by a quarter at level 19.
+
+That is not a gap an encoding can close, which is worth checking rather than
+assuming. The obvious candidate is a shared phrase dictionary over the column —
+the text is comment prose, and prose repeats its own boilerplate. Measured, it
+does not: 87 percent of the column's 16-byte substrings occur once, the four
+thousand most frequent ones cover 4 percent of its bytes, and the sixty-five
+thousand most frequent cover 8. Almost nothing recurs to factor out, so flate's
+window already holds what repetition there is, and a column-wide dictionary has
+nothing left to add. The gap is the entropy coder, not the match finder: stdlib
+Go has no zstd, and on data this close to random the better coder simply wins. Parquet's uncompressed file is
 the fastest read of the four and 2.4 times the size, which is the other end of it.
 
 `Optimize` on the same shard takes the write to 35.4 s and the file to 144.75
