@@ -36,6 +36,54 @@ func (m *Model) EncodeBytes(raw []byte) []uint16 {
 	return ids
 }
 
+// EncodeSplit is EncodeBytes with the byte each escape carries held out of the id
+// stream: an escape is the escape id alone in ids and its byte in escapes, in the
+// order the escapes appear. A storage layer that bit-packs the ids or remaps them
+// onto a smaller alphabet cannot carry a raw byte inside a stream of ids, so this
+// is the form it works from. ids and the escape markers in it are the same stream
+// EncodeBytes produces; only the bytes that followed the markers moved.
+func (m *Model) EncodeSplit(raw []byte) (ids []uint16, escapes []byte) {
+	inline := m.EncodeBytes(raw)
+	for i := 0; i < len(inline); {
+		id := inline[i]
+		ids = append(ids, id)
+		i++
+		if id == m.escapeID {
+			escapes = append(escapes, byte(inline[i]))
+			i++
+		}
+	}
+	return ids, escapes
+}
+
+// EscapeID is the id that stands for the raw byte the encoder carried out of the
+// id stream. A decoder treats it as a marker rather than as a token.
+func (m *Model) EscapeID() uint16 { return m.escapeID }
+
+// DecodeSplit is the inverse of EncodeSplit: escapes supplies the bytes the
+// escape ids carry, in the order the markers appear. ids is the stream
+// EncodeBytes would have produced with those bytes interleaved back in, so the
+// two reach the same text through the same walk.
+func (m *Model) DecodeSplit(ids []uint16, escapes []byte) (string, error) {
+	inline := make([]uint16, 0, len(ids)+len(escapes))
+	e := 0
+	for _, id := range ids {
+		inline = append(inline, id)
+		if id != m.escapeID {
+			continue
+		}
+		if e >= len(escapes) {
+			return "", fmt.Errorf("tokenized: escape id with no byte to carry")
+		}
+		inline = append(inline, uint16(escapes[e]))
+		e++
+	}
+	if e != len(escapes) {
+		return "", fmt.Errorf("tokenized: %d escape bytes were never claimed", len(escapes)-e)
+	}
+	return m.Decode(inline)
+}
+
 // splitSpecial walks raw and cuts out every occurrence of a special token. HF
 // matches special tokens before any pre-tokenizer stage, so a special token's
 // content never reaches the pre-tokenizer; the text between two of them does.

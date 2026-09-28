@@ -103,6 +103,17 @@ func TestModelAccessors(t *testing.T) {
 	if toks := m.SortedTokens(); len(toks) != 3 || toks[0] != "a" {
 		t.Errorf("SortedTokens = %v, want [a ab b]", toks)
 	}
+	// The escape id has to sit above every vocab id, because a decoder picks it
+	// out of the stream by value: an id the vocab also used would mean a byte
+	// with no token and a token at the same time.
+	if m.EscapeID() != 3 {
+		t.Errorf("EscapeID = %d, want 3 (one above the highest vocab id)", m.EscapeID())
+	}
+	for _, id := range smallVocab {
+		if id == m.EscapeID() {
+			t.Errorf("vocab id %d is the escape id", id)
+		}
+	}
 }
 
 // TestSplitMerge covers the delimiter rule, including a token that itself holds
@@ -242,5 +253,83 @@ func TestDecodeEmitsStoredText(t *testing.T) {
 	}
 	if out != "a€a" {
 		t.Errorf("Decode = %q, want a€a", out)
+	}
+}
+
+// TestSplitMatchesInline pins the contract the storage layer relies on: the ids
+// EncodeSplit returns are the inline stream with the escaped bytes lifted out,
+// and nothing else about it differs. A value with escapes is the one that proves
+// it, since every byte with no token is one.
+func TestSplitMatchesInline(t *testing.T) {
+	m, err := LoadFile(modelPath)
+	if err != nil {
+		t.Fatalf("load model: %v", err)
+	}
+	checked, escaped := 0, 0
+	for _, rec := range splitCorpusInputs(t) {
+		inline := m.EncodeBytes(rec)
+		ids, escapes := m.EncodeSplit(rec)
+
+		// Re-interleaving the split form has to give back the inline stream
+		// exactly: the split form is that stream with the escaped bytes lifted
+		// out, and nothing else about it differs.
+		want := make([]uint16, 0, len(inline))
+		e := 0
+		for _, id := range ids {
+			want = append(want, id)
+			if id == m.escapeID {
+				want = append(want, uint16(escapes[e]))
+				e++
+			}
+		}
+		if !equalIDs(want, inline) {
+			t.Fatalf("EncodeSplit(%q) does not re-interleave to the inline stream:\n got %v\nwant %v", rec, want, inline)
+		}
+		if e != len(escapes) {
+			t.Fatalf("EncodeSplit(%q) carried %d escapes, the stream has %d", rec, len(escapes), e)
+		}
+		if len(escapes) > 0 {
+			escaped++
+		}
+
+		text, err := m.DecodeSplit(ids, escapes)
+		if err != nil {
+			t.Fatalf("DecodeSplit(%q): %v", rec, err)
+		}
+		if text != string(rec) {
+			t.Fatalf("DecodeSplit(%q) = %q", rec, text)
+		}
+		checked++
+	}
+	t.Logf("split form round-tripped %d inputs, %d of them carrying escapes", checked, escaped)
+	if escaped == 0 {
+		t.Error("no input exercised the escape path")
+	}
+}
+
+// splitCorpusInputs is the differential corpus as raw records, which is the input
+// set the inline and split forms have to agree on.
+func splitCorpusInputs(t *testing.T) [][]byte {
+	t.Helper()
+	records, _ := loadCorpus(t)
+	out := make([][]byte, len(records))
+	for i, rec := range records {
+		out[i] = rec.bytes
+	}
+	return out
+}
+
+// TestDecodeSplitRejectsMismatchedEscapes covers the two ways the two streams can
+// disagree: an escape marker whose byte is missing, and bytes no marker claims.
+func TestDecodeSplitRejectsMismatchedEscapes(t *testing.T) {
+	m, err := Load(tokenizerDoc(smallVocab, nil, "Sequence", "ByteLevel"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.DecodeSplit([]uint16{m.escapeID}, nil); err == nil {
+		t.Error("DecodeSplit of an escape with no byte succeeded, want an error")
+	}
+	if _, err := m.DecodeSplit(nil, []byte{1}); err == nil {
+		t.Error("DecodeSplit of bytes no escape claims succeeded, want an error")
 	}
 }
