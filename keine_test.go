@@ -1606,3 +1606,273 @@ func TestBitmap(t *testing.T) {
 		}
 	}
 }
+
+// buildTypedSchema is buildSchema with no nullable column, since a typed slice
+// has nowhere to put a null.
+func buildTypedSchema() []ColumnSchema {
+	schema := make([]ColumnSchema, len(allTypes))
+	for i, typ := range allTypes {
+		schema[i] = ColumnSchema{Name: fmt.Sprintf("col%d_%d", i, typ), Type: typ}
+	}
+	return schema
+}
+
+// buildValueColumns is buildColumns with the nulls left out, so the same values
+// can go to either entry.
+func buildValueColumns(g int) [][]any {
+	cols := make([][]any, len(allTypes))
+	for c, typ := range allTypes {
+		col := make([]any, rowsPerGroup)
+		for r := 0; r < rowsPerGroup; r++ {
+			col[r] = genValue(typ, g, r)
+		}
+		cols[c] = col
+	}
+	return cols
+}
+
+// buildTypedColumns is the typed form of buildValueColumns: the same values,
+// run through the canonicaliser the boxed entry uses, so a column handed to
+// AddRowGroupTyped is the column AddRowGroup would have built from the same
+// values.
+func buildTypedColumns(g int) []any {
+	cols := make([]any, len(allTypes))
+	for c, typ := range allTypes {
+		typed, err := canonicalColumnTyped(buildValueColumns(g)[c], typ)
+		if err != nil {
+			panic(fmt.Sprintf("canonicalColumnTyped(%s): %v", typeNames[typ], err))
+		}
+		cols[c] = typed
+	}
+	return cols
+}
+
+// TestAddRowGroupTyped writes the same three row groups both ways and compares
+// the files byte for byte, which is the whole claim the typed entry makes: no
+// canonicalisation, and no change on disk.
+func TestAddRowGroupTyped(t *testing.T) {
+	schema := buildTypedSchema()
+
+	var boxed, typed bytes.Buffer
+	bw := NewWriter(&boxed, schema)
+	tw := NewWriter(&typed, schema)
+	for g := 0; g < 3; g++ {
+		if err := bw.AddRowGroup(buildValueColumns(g)); err != nil {
+			t.Fatalf("AddRowGroup(%d): %v", g, err)
+		}
+		if err := tw.AddRowGroupTyped(buildTypedColumns(g)); err != nil {
+			t.Fatalf("AddRowGroupTyped(%d): %v", g, err)
+		}
+	}
+	if err := bw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if !bytes.Equal(boxed.Bytes(), typed.Bytes()) {
+		t.Errorf("typed write produced %d bytes, the boxed write %d over the same values",
+			len(typed.Bytes()), len(boxed.Bytes()))
+	}
+
+	r, err := NewReader(bytes.NewReader(typed.Bytes()))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	all := make([]int, len(allTypes))
+	for i := range all {
+		all[i] = i
+	}
+	for g := 0; g < 3; g++ {
+		got, err := r.ReadRowGroup(g, all)
+		if err != nil {
+			t.Fatalf("ReadRowGroup(%d, all): %v", g, err)
+		}
+		want := buildValueColumns(g)
+		for c := range want {
+			if !reflect.DeepEqual(got[c], want[c]) {
+				t.Errorf("row group %d column %d (%s): got %v, want %v",
+					g, c, schema[c].Name, got[c], want[c])
+			}
+		}
+	}
+}
+
+// TestOptimizeTyped runs the pass both ways and then writes with the layouts it
+// chose, so a typed caller reaches the same file the boxed one does.
+func TestOptimizeTyped(t *testing.T) {
+	schema := buildTypedSchema()
+
+	var boxed, typed bytes.Buffer
+	bw := NewWriter(&boxed, schema)
+	tw := NewWriter(&typed, schema)
+
+	if err := bw.Optimize(buildValueColumns(0)); err != nil {
+		t.Fatalf("Optimize: %v", err)
+	}
+	if err := tw.OptimizeTyped(buildTypedColumns(0)); err != nil {
+		t.Fatalf("OptimizeTyped: %v", err)
+	}
+	for i := range allTypes {
+		box, typ := bw.layouts[i], tw.layouts[i]
+		if box.Encoding != typ.Encoding || box.Compress != typ.Compress ||
+			box.EncodedSize != typ.EncodedSize || box.CompressedSize != typ.CompressedSize {
+			t.Errorf("column %d (%s): typed pass chose %v, boxed chose %v",
+				i, schema[i].Name, typ, box)
+		}
+	}
+
+	for g := 0; g < 3; g++ {
+		if err := bw.AddRowGroup(buildValueColumns(g)); err != nil {
+			t.Fatalf("AddRowGroup(%d): %v", g, err)
+		}
+		if err := tw.AddRowGroupTyped(buildTypedColumns(g)); err != nil {
+			t.Fatalf("AddRowGroupTyped(%d): %v", g, err)
+		}
+	}
+	if err := bw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !bytes.Equal(boxed.Bytes(), typed.Bytes()) {
+		t.Errorf("after Optimize, the typed write produced %d bytes and the boxed one %d",
+			len(typed.Bytes()), len(boxed.Bytes()))
+	}
+
+	// What the reader reports has to be the layout the pass picked, not the one
+	// the type implies.
+	r, err := NewReader(bytes.NewReader(typed.Bytes()))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	for g := 0; g < 3; g++ {
+		rg, err := r.RowGroupMeta(g)
+		if err != nil {
+			t.Fatalf("RowGroupMeta(%d): %v", g, err)
+		}
+		for c := range allTypes {
+			if rg.Columns[c].Encoding != tw.layouts[c].Encoding {
+				t.Errorf("row group %d column %d: encoding is %d, the pass chose %d",
+					g, c, rg.Columns[c].Encoding, tw.layouts[c].Encoding)
+			}
+		}
+	}
+}
+
+// TestAddRowGroupTypedErrors covers the contract the typed entry refuses, each
+// case one the boxed entry would have served.
+func TestAddRowGroupTypedErrors(t *testing.T) {
+	schema := buildTypedSchema()
+	cols := buildTypedColumns(0)
+
+	cases := []struct {
+		name    string
+		schema  []ColumnSchema
+		columns func() []any
+	}{{
+		name:   "nullable column",
+		schema: nullableSchema(schema),
+		columns: func() []any {
+			return cols
+		},
+	}, {
+		name:   "wrong element type",
+		schema: schema,
+		columns: func() []any {
+			c := append([]any(nil), cols...)
+			c[4] = []int32{1, 2, 3}
+			return c
+		},
+	}, {
+		name:   "untyped nil column",
+		schema: schema,
+		columns: func() []any {
+			c := append([]any(nil), cols...)
+			c[0] = nil
+			return c
+		},
+	}, {
+		name:   "mismatched lengths",
+		schema: schema,
+		columns: func() []any {
+			c := append([]any(nil), cols...)
+			c[1] = c[1].([]int8)[:rowsPerGroup-1]
+			return c
+		},
+	}, {
+		name:   "wrong column count",
+		schema: schema,
+		columns: func() []any {
+			return cols[:len(cols)-1]
+		},
+	}}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			w := NewWriter(&buf, tc.schema)
+			if err := w.AddRowGroupTyped(tc.columns()); err == nil {
+				t.Error("AddRowGroupTyped succeeded, want a type or null error")
+			}
+			// A refused column is refused before any bytes are written, so the
+			// file still has only its header and Close can still finish it.
+			if buf.Len() != len(magic)+1 {
+				t.Errorf("after a refused AddRowGroupTyped the buffer holds %d bytes, want %d",
+					buf.Len(), len(magic)+1)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatalf("Close after a refused AddRowGroupTyped: %v", err)
+			}
+		})
+	}
+
+	// OptimizeTyped refuses the same columns.
+	var buf bytes.Buffer
+	w := NewWriter(&buf, nullableSchema(schema))
+	if err := w.OptimizeTyped(cols); err == nil {
+		t.Error("OptimizeTyped on a nullable column succeeded, want an error")
+	}
+}
+
+// nullableSchema is schema with every column nullable, which is how the typed
+// entries cannot be used.
+func nullableSchema(schema []ColumnSchema) []ColumnSchema {
+	out := make([]ColumnSchema, len(schema))
+	for i, s := range schema {
+		s.Nullable = true
+		out[i] = s
+	}
+	return out
+}
+
+// TestTypedEntriesReportSetup covers the paths the typed entries share with the
+// boxed ones: a writer that never got past its own setup reports that instead of
+// trying a row group, and a schema type no column carries is a mismatch rather
+// than a column stored some other way.
+func TestTypedEntriesReportSetup(t *testing.T) {
+	schema := buildTypedSchema()
+	cols := buildTypedColumns(0)
+
+	var buf bytes.Buffer
+	w := NewWriterWithOptions(&buf, schema, Options{Compress: 99})
+	if err := w.AddRowGroupTyped(cols); err == nil {
+		t.Error("AddRowGroupTyped with an unusable codec succeeded, want the setup error")
+	}
+	if err := w.OptimizeTyped(cols); err == nil {
+		t.Error("OptimizeTyped with an unusable codec succeeded, want the setup error")
+	}
+
+	// A type tag none of the thirteen columns carries.
+	unknown := append([]ColumnSchema(nil), schema...)
+	unknown[0] = ColumnSchema{Name: "mystery", Type: 99}
+	var buf2 bytes.Buffer
+	w = NewWriter(&buf2, unknown)
+	if err := w.AddRowGroupTyped(cols); err == nil {
+		t.Error("AddRowGroupTyped with an unknown schema type succeeded, want an error")
+	}
+	if err := w.OptimizeTyped(cols); err == nil {
+		t.Error("OptimizeTyped with an unknown schema type succeeded, want an error")
+	}
+}

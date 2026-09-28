@@ -14,6 +14,12 @@
 // Options to NewWriterWithOptions changes the encoding, the codec, its level and
 // the block size, and an empty Options names the defaults.
 //
+// A row group is written from either [][]any, which AddRowGroup coerces to the
+// schema's types, or []any of typed slices, which AddRowGroupTyped hands to the
+// encoders as the caller holds them. The two write the same file; the typed entry
+// skips the coercion, and refuses a column whose values are not already the type
+// its schema implies. ReadColumn is the read side of the same trade.
+//
 // Optimize trades a pass over the data for knowing what is in it. It encodes and
 // compresses every candidate layout against each column's own values, at the
 // level the file will be written at, and keeps the smallest. Call it once for a

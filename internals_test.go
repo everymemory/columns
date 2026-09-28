@@ -1222,6 +1222,15 @@ func TestEncodeWith(t *testing.T) {
 	if _, err := canonicalColumnTyped([]any{int64(1)}, 99); err == nil {
 		t.Error("canonicalColumnTyped of an unknown type: want error, got nil")
 	}
+	if typedColumn(TypeInt64, []int32{1}) {
+		t.Error("typedColumn accepted []int32 for an int64 column")
+	}
+	if !typedColumn(TypeInt64, []int64{1, 2}) {
+		t.Error("typedColumn rejected a []int64 column for TypeInt64")
+	}
+	if typedColumn(99, []int64{1}) {
+		t.Error("typedColumn accepted a column for an unknown type")
+	}
 	if _, err := encodeWith(EncOffsetBytes, [][]byte{{1, 2}, {3}}, TypeBytes); err != nil {
 		t.Errorf("encodeWith of a bytes column as offset bytes: %v", err)
 	}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"reflect"
 	"runtime"
 	"sync"
 )
@@ -161,11 +162,35 @@ func (w *Writer) Optimize(columns [][]any) error {
 	if err != nil {
 		return err
 	}
+	return w.measureLayouts(typed)
+}
 
-	if len(w.measure) < len(columns) {
-		w.measure = make([]measureScratch, len(columns))
+// OptimizeTyped is Optimize for a caller that holds each column as a slice of
+// the Go type its schema implies: []int64 for an int64 column, []string for a
+// string one. The pass costs what it costs either way, since it is compression
+// bound and the columns it measures are the same ones the boxed entry hands it;
+// this entry exists because without it a typed caller would have to box every
+// value to reach the pass at all, which is the cost the typed entries remove.
+func (w *Writer) OptimizeTyped(columns []any) error {
+	if w.writeErr != nil {
+		return w.writeErr
 	}
-	w.layouts = make([]LayoutResult, len(columns))
+	if _, err := w.checkTypedColumns(columns); err != nil {
+		return err
+	}
+	return w.measureLayouts(columns)
+}
+
+// measureLayouts encodes and compresses every candidate layout over every value
+// of each typed column and keeps the winner per column, at the level the row
+// groups afterwards are written at. Both entries reach it with columns already
+// in the types the encoders consume, so a column is measured exactly as it is
+// stored whichever one the caller used.
+func (w *Writer) measureLayouts(typed []any) error {
+	if len(w.measure) < len(typed) {
+		w.measure = make([]measureScratch, len(typed))
+	}
+	w.layouts = make([]LayoutResult, len(typed))
 
 	level := optimizeLevel(w.opts.OptimizeLevel)
 	w.level = level
@@ -180,10 +205,10 @@ func (w *Writer) Optimize(columns [][]any) error {
 			defer func() { <-w.sem }()
 
 			results := benchmarkLayoutsTyped(typed[i], w.schema[i], &w.measure[i], level)
-			// A column collect accepted has candidate encodings, so this is never
-			// empty. An empty result would leave the zero layout, whose encoding no
-			// encoder recognises, and the write would fail on it rather than store
-			// the column some other way.
+			// A column either entry accepted has candidate encodings, so this is
+			// never empty. An empty result would leave the zero layout, whose
+			// encoding no encoder recognises, and the write would fail on it
+			// rather than store the column some other way.
 			if len(results) > 0 {
 				w.layouts[i] = results[0]
 			}
@@ -191,6 +216,47 @@ func (w *Writer) Optimize(columns [][]any) error {
 	}
 	wg.Wait()
 	return nil
+}
+
+// checkTypedColumns reports whether columns has one slice per schema column,
+// each a slice of the Go type its schema implies, and one length across all of
+// them. It returns the row count too, which the loop has to compute anyway, so
+// a writer with no columns needs no special case. A nullable column is not one
+// it can accept: a typed slice has nowhere to put a null, the way ReadColumn
+// has nowhere to return one.
+func (w *Writer) checkTypedColumns(columns []any) (uint32, error) {
+	if len(columns) != len(w.schema) {
+		return 0, fmt.Errorf("keine: expected %d columns, got %d", len(w.schema), len(columns))
+	}
+	numRows := uint32(0)
+	for i, col := range columns {
+		if w.schema[i].Nullable {
+			return 0, fmt.Errorf("keine: column %d (%s) is nullable; use AddRowGroup for a column with nulls", i, w.schema[i].Name)
+		}
+		if !typedColumn(w.schema[i].Type, col) {
+			return 0, typedColumnErr(i, w.schema[i], col)
+		}
+		n := uint32(sliceLen(col))
+		if i == 0 {
+			numRows = n
+			continue
+		}
+		if n != numRows {
+			return 0, fmt.Errorf("keine: column %d has %d rows, expected %d", i, n, numRows)
+		}
+	}
+	return numRows, nil
+}
+
+// typedColumnErr explains why col is not the slice typ implies, naming both
+// sides through reflect so no parallel table of type names is needed. An
+// unknown type tag is reported the way canonicalColumnTyped reports one.
+func typedColumnErr(i int, schema ColumnSchema, col any) error {
+	want, ok := goType[schema.Type]
+	if !ok {
+		return fmt.Errorf("keine: column %d (%s) has unknown type %d", i, schema.Name, schema.Type)
+	}
+	return fmt.Errorf("keine: column %d (%s) is %v, want %v", i, schema.Name, reflect.TypeOf(col), want)
 }
 
 // checkColumns reports whether columns has one slice per schema column and one
@@ -277,15 +343,56 @@ func (w *Writer) AddRowGroup(columns [][]any) error {
 		numRows = uint32(len(columns[0]))
 	}
 
-	rg := RowGroupMeta{
-		NumRows:    numRows,
-		ByteOffset: w.offset,
-		Columns:    make([]ColMeta, len(columns)),
-	}
-
 	typed, metas, bitmasks, err := w.collect(columns)
 	if err != nil {
 		return err
+	}
+	return w.writeRowGroup(numRows, typed, metas, bitmasks)
+}
+
+// AddRowGroupTyped is AddRowGroup for a caller that already holds each column as
+// a slice of the Go type its schema implies: []int64 for an int64 column,
+// []string for a string one. Nothing between the caller and the encoders
+// re-reads the values, so a column is stored exactly as the caller had it and
+// the file is byte for byte the one AddRowGroup would have written over the same
+// values.
+//
+// The contract is the read side's, reversed: a nullable column is an error
+// rather than a column with nil values, and a slice whose element type is not
+// the one the schema implies is an error rather than a widening conversion.
+// AddRowGroup widens an int into an int64 because a caller handing over []any
+// has not said what the values are; this one has.
+//
+// Every encoder allocates its own output, so nothing the writer keeps points
+// into a caller's slice and the slices can be reused as soon as this returns.
+func (w *Writer) AddRowGroupTyped(columns []any) error {
+	if w.writeErr != nil {
+		return w.writeErr
+	}
+	numRows, err := w.checkTypedColumns(columns)
+	if err != nil {
+		return err
+	}
+
+	metas := make([]ColMeta, len(columns))
+	for i, col := range columns {
+		fillStatsTyped(&metas[i], col)
+	}
+	return w.writeRowGroup(numRows, columns, metas, nil)
+}
+
+// writeRowGroup is the tail both entries share: encode every column with the
+// layout chosen for it, write the chunks in order, and record the row group.
+// typed and metas are one per column, already in the types the encoders consume;
+// bitmasks is one per column too, and nil on the typed path, where no column can
+// hold a null. WriteChunk writes a zero length for a nil bitmap the way it does
+// for the empty slice EncodeBitmap returns, so the bytes do not depend on which
+// entry the caller used.
+func (w *Writer) writeRowGroup(numRows uint32, typed []any, metas []ColMeta, bitmasks [][]byte) error {
+	rg := RowGroupMeta{
+		NumRows:    numRows,
+		ByteOffset: w.offset,
+		Columns:    make([]ColMeta, len(typed)),
 	}
 
 	// Encoding and compressing a column touches no other, so both spread across
@@ -295,18 +402,20 @@ func (w *Writer) AddRowGroup(columns [][]any) error {
 	// the bytes identical to a serial write, since no encoder sees another
 	// column's data. The schema fixes the column count for the writer's lifetime,
 	// so these buffers grow once and later row groups reuse them.
-	if len(w.measure) < len(columns) {
-		w.measure = make([]measureScratch, len(columns))
+	if len(w.measure) < len(typed) {
+		w.measure = make([]measureScratch, len(typed))
 	}
 	chunks, err := encodeColumns(typed, w.schema, w.layouts, w.opts, w.level, w.measure, w.sem)
 	if err != nil {
 		return err
 	}
 
-	for i := range columns {
+	for i := range typed {
 		meta := metas[i]
 		chunk := chunks[i]
-		chunk.NullBitmap = bitmasks[i]
+		if bitmasks != nil {
+			chunk.NullBitmap = bitmasks[i]
+		}
 
 		cw := &countingWriter{w: w.w}
 		if err := WriteChunk(cw, chunk); err != nil {

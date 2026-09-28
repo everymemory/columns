@@ -281,6 +281,39 @@ func BenchmarkComparison(b *testing.B) {
 			file()
 		}
 	})
+	b.Run("write typed", func(b *testing.B) {
+		// AddRowGroupTyped hands the encoders the slices the caller already has,
+		// so the difference against write is the canonicalisation collect does.
+		typed := make([]any, len(columns))
+		for i, col := range columns {
+			t, err := canonicalColumnTyped(col, schema[i].Type)
+			if err != nil {
+				b.Fatal(err)
+			}
+			typed[i] = t
+		}
+		write := func() []byte {
+			buf := &bytes.Buffer{}
+			w := NewWriter(buf, schema)
+			if err := w.AddRowGroupTyped(typed); err != nil {
+				b.Fatal(err)
+			}
+			if err := w.Close(); err != nil {
+				b.Fatal(err)
+			}
+			return buf.Bytes()
+		}
+		first := write()
+		if !bytes.Equal(first, data) {
+			b.Fatalf("typed write produced %d bytes, the boxed write %d", len(first), len(data))
+		}
+
+		b.ResetTimer()
+		b.ReportMetric(float64(len(first))/float64(comparisonRows), "B/row")
+		for i := 0; i < b.N; i++ {
+			write()
+		}
+	})
 	b.Run("write optimized", func(b *testing.B) {
 		// The default layouts are the type's, and Optimize is what it costs to trade
 		// them for the column's. Next to the default write, the difference is the

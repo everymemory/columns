@@ -212,6 +212,23 @@ ids, _ := keine.ReadColumn[int64](r, 0, 0)
 `TypeString`. A column with nulls has nowhere to put a `nil` in a `[]T`, so it
 returns an error and `ReadRowGroup` reads those.
 
+The write side has the same entry. `AddRowGroupTyped` takes `[]any` where each
+element is the typed slice for its column, so a caller holding `[]int64` columns
+writes them without boxing a value:
+
+```go
+w.AddRowGroupTyped([]any{ids, names})
+```
+
+The slices go straight to the encoders, so the file is the one `AddRowGroup`
+would have written over the same values, and nothing the writer keeps points into
+a caller's slice: every encoder allocates its own output, so the slices can be
+reused as soon as the call returns. The contract mirrors the read side's — a
+nullable column is an error, because a typed slice has nowhere for a null, and a
+slice whose element type is not the schema's is an error rather than a widening
+conversion. `AddRowGroup` coerces, because `[]any` has not said what the values
+are; this one has. `OptimizeTyped` is the same pair for the layout pass.
+
 When the same reader scans the same columns over and over, `ReadRowGroupScoped`
 hands the values to a callback as typed slices and takes them back when it
 returns. Nothing is boxed, and the slices point into buffers the reader keeps
@@ -259,19 +276,23 @@ Xeon X5687 with `go test -bench=BenchmarkComparison -count=3`:
 BenchmarkComparison
     write             15.56 bytes/row
     write             33 ms    94 MB/s   45 MB     720 allocs
+    write typed       25 ms   125 MB/s   33 MB     690 allocs
     write optimized   14.55 bytes/row
     write optimized   7.1 s    0.4 MB/s  1.2 GB    4.4M allocs
     read              24 ms   128 MB/s   37 MB     735 allocs
     read scoped       10 ms   310 MB/s   266 KB    691 allocs
 ```
 
-The two write rows are the same values. The first stores each column the way its
-type implies and the second after `Optimize` has read them, so the difference
-between them is the pass and what it bought: 1.01 bytes a row, about six percent of
-the file. Two of the five columns keep their default layout, and the pass's time is
-almost entirely the encodings that do not win, the affix table over a near-distinct
-string column and a dictionary over pseudo-random integers, measured because they
-are candidates rather than plausible winners.
+The three write rows are the same values. The first stores each column the way its
+type implies, the second hands the writer the typed slices a reader of the same
+column would hold, and the third runs `Optimize` first. The typed write produces
+byte-identical output, so the time and the memory between the first two rows is
+what `AddRowGroup` spends canonicalising: each column is walked and re-homed into
+a slice of the type its schema implies, and every value the caller already held
+typed is boxed on the way in. Optimize costs 1.01 bytes a row, about six percent
+of the file, and its time is almost entirely the encodings that do not win, the
+affix table over a near-distinct string column and a dictionary over pseudo-random
+integers, measured because they are candidates rather than plausible winners.
 
 The scoped read returns typed slices into the reader's own buffers, so the
 memory it reports is transient: only the first read allocates the columns. The
