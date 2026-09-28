@@ -130,8 +130,16 @@ func BenchmarkLayouts(col []any, schema ColumnSchema) []LayoutResult {
 func benchmarkLayoutsTyped(col any, schema ColumnSchema, ms *measureScratch, level int) []LayoutResult {
 	var results []LayoutResult
 	for _, enc := range layoutCandidates(schema.Type) {
+		// One encoding serves every codec, since they all consume the same bytes.
+		// Encoding inside the codec loop would build the same byte stream once per
+		// codec, and Dict's dictionary is most of the pass's time and allocations.
+		encoded, err := encodeWith(enc, col, schema.Type)
+		if err != nil {
+			continue
+		}
+		n := sliceLen(col)
 		for _, codec := range layoutCodecs {
-			r, ok := measureLayout(col, schema, enc, codec, level, ms)
+			r, ok := measureEncoded(encoded, enc, codec, level, n, schema.Type, ms)
 			if ok {
 				results = append(results, r)
 			}

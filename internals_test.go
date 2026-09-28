@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"reflect"
 	"testing"
 )
@@ -1333,6 +1334,64 @@ func TestFillStats(t *testing.T) {
 	if empty.MinVal != nil || empty.MaxVal != nil || empty.MinLen != 0 || empty.MaxLen != 0 {
 		t.Errorf("fillStatsTyped of no values left statistics set: %+v", empty)
 	}
+
+	// Fixed width values are stored little endian, whose most significant byte is
+	// the last one, so the min and the max have to be found by comparing values
+	// rather than comparing the bytes from index 0. 2.5 and 0.5 first differ in
+	// the byte before the sign, and a byte wise comparison from the low end reads
+	// that byte first and calls 2.5 the smaller.
+	ff, err := canonicalColumnTyped([]any{
+		float64(2.5), float64(0.5), float64(4.5), float64(-1.0),
+	}, TypeFloat64)
+	if err != nil {
+		t.Fatalf("canonicalColumnTyped: %v", err)
+	}
+	var f64Meta ColMeta
+	fillStatsTyped(&f64Meta, ff)
+	var want [8]byte
+	binary.LittleEndian.PutUint64(want[:], math.Float64bits(-1.0))
+	if !bytes.Equal(f64Meta.MinVal, want[:]) {
+		t.Errorf("fillStatsTyped float64 min = %x, want %x", f64Meta.MinVal, want)
+	}
+	binary.LittleEndian.PutUint64(want[:], math.Float64bits(4.5))
+	if !bytes.Equal(f64Meta.MaxVal, want[:]) {
+		t.Errorf("fillStatsTyped float64 max = %x, want %x", f64Meta.MaxVal, want)
+	}
+	if f64Meta.MinLen != 8 || f64Meta.MaxLen != 8 {
+		t.Errorf("fillStatsTyped float64 MinLen = %d, MaxLen = %d, want 8 and 8",
+			f64Meta.MinLen, f64Meta.MaxLen)
+	}
+
+	// Signed integers are likewise ordered by value, not by byte.
+	ii, err := canonicalColumnTyped([]any{
+		int64(300), int64(-300), int64(1),
+	}, TypeInt64)
+	if err != nil {
+		t.Fatalf("canonicalColumnTyped: %v", err)
+	}
+	var i64Meta ColMeta
+	fillStatsTyped(&i64Meta, ii)
+	smallest := int64(-300)
+	binary.LittleEndian.PutUint64(want[:], uint64(smallest))
+	if !bytes.Equal(i64Meta.MinVal, want[:]) {
+		t.Errorf("fillStatsTyped int64 min = %x, want %x", i64Meta.MinVal, want)
+	}
+	binary.LittleEndian.PutUint64(want[:], 300)
+	if !bytes.Equal(i64Meta.MaxVal, want[:]) {
+		t.Errorf("fillStatsTyped int64 max = %x, want %x", i64Meta.MaxVal, want)
+	}
+
+	// Booleans are one byte each, so the min is false and the max is true.
+	bb2, err := canonicalColumnTyped([]any{true, false, true}, TypeBool)
+	if err != nil {
+		t.Fatalf("canonicalColumnTyped: %v", err)
+	}
+	var boolMeta ColMeta
+	fillStatsTyped(&boolMeta, bb2)
+	if !bytes.Equal(boolMeta.MinVal, []byte{0}) || !bytes.Equal(boolMeta.MaxVal, []byte{1}) {
+		t.Errorf("fillStatsTyped bool min = %v, max = %v", boolMeta.MinVal, boolMeta.MaxVal)
+	}
+
 	if _, err := canonicalColumnTyped([]any{nil}, TypeBool); err == nil {
 		t.Error("canonicalColumnTyped of nil: want error, got nil")
 	}

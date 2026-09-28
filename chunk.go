@@ -202,10 +202,19 @@ func ReadChunk(r io.Reader) (ColumnChunk, error) {
 // uncompressed block keeps its slice of encoded rather than copying, since
 // nothing in between can overwrite it before WriteChunk consumes it.
 //
+// A codec that fails to shrink the column is dropped rather than paid for.
+// Random data beats DEFLATE by a few bytes, and a reader then spends Huffman
+// decode to get back exactly what it could have had as a memcpy. The codec is
+// recorded per chunk, so the whole column falling back costs the format
+// nothing: the blocks store their raw slices and the chunk's codec becomes
+// CompressNone. Compression is attempted first because a column of mixed
+// blocks can still shrink overall even when one does not, and the comparison
+// is against the column as a whole, since that is what the reader pays for.
+//
 // blockSz is the block size the writer is configured with and level the level
 // its codecs run at, so the blocks are the ones the configuration describes
 // rather than the package's defaults.
-func splitBlocks(encoded []byte, codec uint8, level, blockSz int, sem chan struct{}) []ColumnBlock {
+func splitBlocks(encoded []byte, codec uint8, level, blockSz int, sem chan struct{}) ([]ColumnBlock, uint8) {
 	n := (len(encoded) + blockSz - 1) / blockSz
 	if n == 0 {
 		n = 1
@@ -234,5 +243,25 @@ func splitBlocks(encoded []byte, codec uint8, level, blockSz int, sem chan struc
 		}()
 	}
 	wg.Wait()
-	return blocks
+
+	if codec == CompressNone {
+		return blocks, CompressNone
+	}
+	stored := 0
+	for i := range blocks {
+		stored += len(blocks[i].Data)
+	}
+	// Compression that does not beat the raw bytes costs the reader its whole
+	// budget for nothing, so the column is stored as it encoded.
+	if stored >= len(encoded) {
+		for i := range blocks {
+			end := (i + 1) * blockSz
+			if end > len(encoded) {
+				end = len(encoded)
+			}
+			blocks[i].Data = encoded[i*blockSz : end]
+		}
+		return blocks, CompressNone
+	}
+	return blocks, codec
 }

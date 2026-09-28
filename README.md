@@ -141,7 +141,7 @@ tiebreak is size alone, never measured time, so the same columns write the same
 file on any machine.
 
 That thoroughness is the cost. On the five-column, 200000-row comparison file
-below, `Optimize` takes the write from 40 ms to 7.2 s and the file from 15.56 to
+below, `Optimize` takes the write from 33 ms to 7.1 s and the file from 15.56 to
 14.55 bytes per row. The pass measures at the best level the codec offers, where a
 plain write stays at level 3, and that choice accounts for most of both numbers: a
 block compressed harder costs no more to read back, so the extra write time is the
@@ -258,11 +258,11 @@ Xeon X5687 with `go test -bench=BenchmarkComparison -count=3`:
 ```
 BenchmarkComparison
     write             15.56 bytes/row
-    write             40 ms    78 MB/s   43 MB     710 allocs
+    write             33 ms    94 MB/s   45 MB     720 allocs
     write optimized   14.55 bytes/row
-    write optimized   7.2 s    0.4 MB/s  1.6 GB    7.2M allocs
-    read              24 ms   130 MB/s   37 MB     830 allocs
-    read scoped       10 ms   300 MB/s   300 KB    710 allocs
+    write optimized   7.1 s    0.4 MB/s  1.2 GB    4.4M allocs
+    read              24 ms   128 MB/s   37 MB     735 allocs
+    read scoped       10 ms   310 MB/s   266 KB    691 allocs
 ```
 
 The two write rows are the same values. The first stores each column the way its
@@ -298,7 +298,7 @@ On 200000 rows in 5 columns:
 
 | | bytes/row | write | read all | read 1 column |
 | --- | --- | --- | --- | --- |
-| keine | 15.56 | 39 ms | 9.5 ms (scoped) | 0.8 ms |
+| keine | 15.56 | 33 ms | 9.5 ms (scoped) | 0.8 ms |
 | parquet zstd | 19.57 | 114 ms | 14 ms | 5.4 ms |
 | parquet snappy | 28.66 | 98 ms | 15 ms | 5.9 ms |
 | parquet none | 54.98 | 96 ms | 15 ms | 2.3 ms |
@@ -314,7 +314,7 @@ doing.
 
 keine's row is the default write, the one that stores each column the way its
 type implies. An `Optimize`d write of the same values is 14.55 bytes/row, smaller
-than every parquet row here, and it costs 7.2 s rather than 40 ms: the pass reads
+than every parquet row here, and it costs 7.1 s rather than 33 ms: the pass reads
 every value and measures every candidate at the codec's best level, and the
 default is what the table reports because most callers do not want to pay that.
 
@@ -434,7 +434,7 @@ written without a pass.
 
 Parquet pays nothing to choose a layout: its encodings are compiled in. A keine
 write that has not been Optimized pays the same nothing, because the layout comes
-from the type. The 40 ms above is encoding and compressing the five columns and
+from the type. The 33 ms above is encoding and compressing the five columns and
 nothing else, which is what buys the size advantage over a format with a better
 compressor: keine has a worse one and spends the time it saved on not measuring.
 

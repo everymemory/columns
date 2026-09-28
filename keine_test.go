@@ -344,9 +344,9 @@ func TestWriterUsesDefaultLayouts(t *testing.T) {
 		name       string
 		enc, codec uint8
 	}{
-		{"b", EncRLEBitpack, CompressFlate},
-		{"i", EncDelta, CompressFlate},
-		{"s", EncPlain, CompressFlate},
+		{"b", EncRLEBitpack, CompressNone},
+		{"i", EncDelta, CompressNone},
+		{"s", EncPlain, CompressNone},
 	}
 	for i, wnt := range want {
 		got := rg.Columns[i]
@@ -371,6 +371,12 @@ func TestWriterUsesDefaultLayouts(t *testing.T) {
 // to, and the columns still have to round trip through what was asked for. The
 // codec's zero value is CompressNone, which is a valid codec, so an empty Options
 // asks for the type's default encoding stored uncompressed.
+//
+// A codec that cannot shrink a column is dropped rather than stored at a loss, so
+// the codec a chunk reports is what the data earned, not always the one asked for.
+// Four values are too little for flate to beat at its default level, and enough
+// once the deltas run to one repeated byte, so the two flate cases below disagree
+// about the outcome.
 func TestWriterOptions(t *testing.T) {
 	schema := []ColumnSchema{
 		{Name: "i", Type: TypeInt64},
@@ -390,8 +396,8 @@ func TestWriterOptions(t *testing.T) {
 		{name: "plain encoding", opts: Options{Encoding: EncPlain}, want: [][2]uint8{{EncPlain, CompressNone}, {EncPlain, CompressNone}}},
 		{name: "no compression", opts: Options{Compress: CompressNone}, want: [][2]uint8{{EncDelta, CompressNone}, {EncPlain, CompressNone}}},
 		{name: "lzw", opts: Options{Compress: CompressLzw}, want: [][2]uint8{{EncDelta, CompressLzw}, {EncPlain, CompressLzw}}},
-		{name: "plain on flate", opts: Options{Encoding: EncPlain, Compress: CompressFlate}, want: [][2]uint8{{EncPlain, CompressFlate}, {EncPlain, CompressFlate}}},
-		{name: "level and block size", opts: Options{Compress: CompressFlate, CompressLevel: 9, BlockSize: 64}, want: [][2]uint8{{EncDelta, CompressFlate}, {EncPlain, CompressFlate}}},
+		{name: "plain on flate", opts: Options{Encoding: EncPlain, Compress: CompressFlate}, want: [][2]uint8{{EncPlain, CompressNone}, {EncPlain, CompressNone}}},
+		{name: "level and block size", opts: Options{Compress: CompressFlate, CompressLevel: 9, BlockSize: 64}, want: [][2]uint8{{EncDelta, CompressFlate}, {EncPlain, CompressNone}}},
 	}
 	for _, o := range opts {
 		t.Run(o.name, func(t *testing.T) {
