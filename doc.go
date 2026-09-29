@@ -28,5 +28,12 @@
 // shares its affixes, and a column the type serves well keeps the layout it
 // would have had anyway.
 //
+// A text column can also be stored as token ids, which is the Tokenized encoding.
+// Options.Tokenizers names the tokenizer for the columns that should have it, and
+// the file names it back by the hash of the tokenizer it was built from, resolved
+// by a reader through a tokenizer.Registry. The ids are only readable by the
+// tokenizer that made them, so a hash the registry cannot resolve is an error
+// rather than a substitution.
+//
 // See the README for the on-disk layout.
 package keine

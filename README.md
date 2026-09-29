@@ -14,6 +14,8 @@ to.
 ```
 "KEIN"
 format version     1 byte
+tokenizer count    uint32, little-endian, version 2 only
+tokenizer digests  32 bytes each, version 2 only
 row group 0
     column chunk
     column chunk
@@ -24,6 +26,11 @@ footer
 footer length      uint32, little-endian
 "KEIN"
 ```
+
+Version 1 omits the count and the digests, which is what a file with no tokenized
+column still is. A version 2 file's digests are the SHA-256 of the tokenizer JSON
+each column was stored through, and a column names one by its one-based position
+in the table, recorded in the footer; zero names none.
 
 A column chunk is:
 
@@ -64,7 +71,7 @@ length only when the codec is none.
 
 Thirteen type tags: bool, int8-64, uint8-64, float32, float64, bytes, string.
 
-Six encodings:
+Seven encodings:
 
 | Encoding | Layout |
 | --- | --- |
@@ -74,6 +81,7 @@ Six encodings:
 | Dict | Bit-packed indices into a dictionary of distinct values. |
 | OffsetBytes | An offset table over concatenated raw bytes. For strings and byte slices. |
 | Affix | The prefix and suffix every value shares, then length-prefixed middles. For strings and byte slices. |
+| Tokenized | A text column stored as the ids a tokenizer maps its values to, plus the boundaries that separate them. |
 
 Affix is what a high cardinality string column lands on when its values come from
 one domain: email addresses, file paths, URLs. The shared part is stored once
@@ -87,6 +95,23 @@ fixed width type and the raw bytes for a string or byte slice, rather than its
 text. A float column can then be a dictionary without a formatting round trip, and
 a dict column decodes as one plain read of the declared type. `DecodeDict`
 returns `[][]byte`, and the typed read path narrows from there.
+
+Tokenized is the one encoding that looks outside the value: it stores a text
+column as the ids a tokenizer maps each value to, so the vocabulary the text
+draws on is recorded once rather than spelled out per occurrence. Those ids are
+little-endian `uint16`, and three representations of them are measured against
+three ways of recording where one value ends and the next begins: per-value token
+counts, cumulative offsets into the id stream, and the first count followed by
+per-value differences. Nine layouts in all, and the one the file gets is settled
+by size the same way every other encoding's is.
+
+The ids cannot be read back without the tokenizer that made them, so a file names
+it by the SHA-256 of the `tokenizer.json` it was built from, in a table the file
+header carries. A reader resolves that hash through a registry and refuses one it
+cannot resolve, because a tokenizer that merely shares a name would decode the ids
+to text that was never written. Bytes the tokenizer's own pipeline would drop are
+not dropped: they are carried in an escape stream alongside the ids, so a column
+of arbitrary bytes reads back exactly as it was written.
 
 Nulls are handled before any of these apply. A nullable column's chunk carries a
 bitmap with one bit per row; only the non-null values are encoded, and the reader
@@ -247,6 +272,43 @@ Holding a slice past the callback reads whatever the next read wrote over it, so
 it is a borrowing API: copy out what you need before returning. A nullable
 column is an error here for the same reason it is in `ReadColumn`.
 
+A text column can also be stored as the ids a tokenizer maps its values to, which
+is the one encoding that buys something the type cannot tell you. Hand the writer
+the tokenizer for the columns that should have it:
+
+```go
+tok, err := tokenizer.LoadFile("falcon-tokenizer.json")
+if err != nil {
+    return err
+}
+if err := tokenizer.Register(tok); err != nil {
+    return err
+}
+
+w := keine.NewWriterWithOptions(&buf, schema, keine.Options{
+    Tokenizers: map[int]*tokenizer.Model{1: tok},
+})
+```
+
+The map is keyed by column index, so a schema with one text column among ten
+needs one entry. A column not in the map is laid out the way its type implies,
+and a column that is has Tokenized among its candidates. Without `Optimize` the
+ids are stored with `TokenizedLayout`'s zero value, raw ids and per-value counts;
+with it, all nine layouts are measured and the smallest is what the file gets.
+
+The model is registered, because the reader has to find it again. A file names the
+tokenizer by the hash of the bytes it was built from, and `NewReader` resolves
+that hash through the package's default registry; a reader that does not share it
+can be given its own with `NewReaderWithRegistry`. A file whose hash is not in the
+registry is refused with the hash named, so the caller can load what the file
+needs — nothing is ever substituted for it.
+
+`LoadFileRegistered` is the same loader with a hash the caller already knows,
+which fails if the file on disk is not the one the caller expected; `Register` and
+`Lookup` are the pair behind it, and a registry refuses to file a second model
+under a hash already taken, since that hash is what a file on disk identifies a
+tokenizer by.
+
 ## Status
 
 v0.2.0. The format is stable enough to write and read real data, but it is not a
@@ -257,10 +319,10 @@ layouts, and `Optimize` on columns chosen to favour each encoding it can pick.
 The writer is deterministic: two writes of the same values produce the same bytes,
 which a golden file test pins.
 
-The byte after the leading magic is the format version, currently 1. A reader that
-meets another version refuses the file rather than misreading it, so a layout
-change is a clean break. Files written by v0.1.0 have no version byte and will be
-refused.
+The byte after the leading magic is the format version. A reader that meets
+another version refuses the file rather than misreading it, so a layout change is
+a clean break. Files written by v0.1.0 have no version byte and will be refused.
+This build reads versions 1 and 2, and writes 2 only when a column is tokenized.
 
 ## Benchmarks
 
@@ -304,6 +366,32 @@ every candidate's size, since a winner is only meaningful next to what it beat.
 `BenchmarkWriter` and `BenchmarkRead` cover the whole write and read paths,
 `BenchmarkTypedRead` the unboxed read path, and `BenchmarkPartialRead` the cost
 of skipping columns.
+
+`BenchmarkTokenized` is the same shape with a text column of prose and a tokenizer
+on it, at 20000 rows, since prose is the case the comparison file's two string
+columns are not: its words repeat and its values do not. Measured the same way:
+
+```
+BenchmarkTokenized
+    write                    5.9 ms          130.5 B/row
+    write tokenized          1.5 s           79.67 B/row
+    write optimized          7.1 s           27.47 B/row
+    read scoped              29 ms    54 MB/s
+```
+
+The pass picked `Tokenized+Flate` for the text column, which is why the optimized
+row is smaller than the tokenized one rather than the same. It is worth saying
+that the row reports what the pass chose and not what the tokenizer was handed:
+prose drawn from a fixed word list is a dictionary's best case too, and the pass
+measures both. The 130.5 bytes a row the plain write holds is the text itself, and
+the 27.47 the optimized write holds is the ids and the boundaries — the
+vocabulary not being respelled per occurrence.
+
+The tokenized write is 250 times slower than the plain one, and all of that is the
+tokenizer: the column is 2 MB of prose and the BPE walks it at roughly 1.5 MB/s,
+which is measured against the Rust reference below. The read is 54 MB/s rather
+than a plain string column's rate, because the ids have to be turned back into
+text rather than copied. Both are the encoding's honest cost and not a bug in it.
 
 ## Compared with parquet
 
@@ -398,6 +486,38 @@ nothing left to add. The gap is the entropy coder, not the match finder: stdlib
 Go has no zstd, and on data this close to random the better coder simply wins. Parquet's uncompressed file is
 the fastest read of the four and 2.4 times the size, which is the other end of it.
 
+Tokenizing the same column is the one encoding that changes what the codec sees
+rather than how it looks for repetition, and on this shard it does close the gap.
+Storing the text column as ids, measured on the same 255218 rows, with the
+`Optimize` pass timed separately from the write it decides:
+
+| | bytes/row | pass | write | read all |
+| --- | --- | --- | --- | --- |
+| keine flate 3 | 160.23 | — | 315 ms | 144 ms (scoped) |
+| keine flate 3, text tokenized | 129.52 | — | 49.0 s | 1.17 s (scoped) |
+| keine flate 9 | 147.43 | — | 1.51 s | 133 ms (scoped) |
+| keine flate 9, text tokenized | 121.33 | — | 49.6 s | 1.08 s (scoped) |
+| keine flate 3, optimized | 144.75 | 32.7 s | 1.06 s | 153 ms (scoped) |
+| keine flate 3, optimized, text tokenized | 108.90 | 166 s | 51.9 s | 1.26 s (scoped) |
+| parquet zstd 19 | 122.31 | — | 39.4 s | 258 ms |
+
+Tokenized at flate 9 is smaller than every parquet row in the table above,
+including the one that took 39 seconds to write, and tokenized at flate 3 is
+smaller than all but that one. The optimized tokenized row is eleven percent
+smaller than parquet's best. Where the phrase dictionary failed, the tokenizer's
+own vocabulary succeeds: it is 65024 entries chosen for English rather than for
+this column, so the ids are drawn from a narrow alphabet while the text they
+spell is not, and that is what flate compresses well.
+
+The size is one column of the table and the other three are its price. The write
+is thirty to over a hundred and fifty times slower, and all of it is the BPE: 86 MB
+of comment text at roughly 1.7 MB/s. The optimized tokenized row pays it twice,
+once in the pass that measures the layouts and again in the write that encodes
+them, which is 218 seconds against the optimized write's 34. The read is eight
+times slower, because the ids have to be reassembled into text instead of copied
+out of the chunk. Neither is a defect in the encoding; both are the tokenizer's
+own cost, which is measured against the reference implementation below.
+
 `Optimize` on the same shard takes the write to 35.4 s and the file to 144.75
 bytes per row, so the pass costs a hundred times the write and recovers ten percent
 of the file. What it buys is visible per column: `by`, a string column whose values
@@ -424,6 +544,34 @@ row group already records the value count, so the first walk was measuring
 something the file already said. Passing the count through took the shard's scoped
 read from 161 ms to 140 ms, all of it on that one text column, whose prefixes walk
 86 MB.
+
+## The tokenizer's own cost
+
+The tokenizer is where the tokenized rows above spend their time, so it is worth
+measuring against the implementation it was written to match. The reference is
+the Rust `tokenizers` crate, at the version the Python wheel is built from, built
+as a standalone encoder over the same corpus and the same `tokenizer.json`. That
+crate is a development oracle, not a dependency: this package has no Hugging Face
+code in it at runtime, and the timing harness is not in this repository for the
+same reason the parquet one is not — it needs a Rust toolchain, and the library
+does not.
+
+Encoded on 50000 of the shard's comment bodies, 18.9 MB of text, over eight
+passes on this side and three on the reference:
+
+| | MB/s | ktok/s | peak memory |
+| --- | --- | --- | --- |
+| this package | 1.7 | 455 | 47 MB heap |
+| rust reference | 1.1 | 282 | 55 MB RSS |
+
+The Go side is not slower than the reference, which is the result worth checking
+rather than assuming: it allocates heavily to do it, roughly 730 allocations and
+80 KB per record against a 378 byte average, and a pre-tokenizer pass that builds
+its pieces as strings is most of that. The throughput is the same order, and the
+memory is the same order, so the encoding's cost above is what tokenization costs
+in any implementation rather than what it costs in this one. Both numbers are far
+below a text column's own encode and compress rate, which is why the tokenized
+write is the outlier row in every table above.
 
 ## Where the time goes
 

@@ -29,22 +29,22 @@ var tokenizedLayouts = func() []TokenizedLayout {
 // tokenizedModel is Falcon's tokenizer, loaded from the corpus the tokenizer
 // package keeps. LoadFileRegistered is what a caller goes through to make a model
 // resolvable by its hash, which is how a reader finds one.
-func tokenizedModel(t *testing.T) *tokenizer.Model {
-	t.Helper()
+func tokenizedModel(tb testing.TB) *tokenizer.Model {
+	tb.Helper()
 	m, err := tokenizer.LoadFile("tokenizer/testdata/falcon-tokenizer.json")
 	if err != nil {
-		t.Fatalf("load model: %v", err)
+		tb.Fatalf("load model: %v", err)
 	}
 	return m
 }
 
 // tokenizedCorpus is the differential corpus as a []string, which is the shape a
 // TypeString column carries.
-func tokenizedCorpus(t *testing.T) []string {
-	t.Helper()
+func tokenizedCorpus(tb testing.TB) []string {
+	tb.Helper()
 	corpus, err := loadCorpusFile("tokenizer/testdata/corpus.bin")
 	if err != nil {
-		t.Skipf("corpus not present: %v", err)
+		tb.Skipf("corpus not present: %v", err)
 	}
 	out := make([]string, len(corpus))
 	for i, rec := range corpus {
@@ -431,14 +431,14 @@ func boxedStrings(vals []string) []any {
 // caller does once, before the file that needs the model is read; the lookup
 // first keeps a second test from tripping the registry's rule against filing a
 // second model under one hash.
-func registeredModel(t *testing.T) *tokenizer.Model {
-	t.Helper()
-	m := tokenizedModel(t)
+func registeredModel(tb testing.TB) *tokenizer.Model {
+	tb.Helper()
+	m := tokenizedModel(tb)
 	if have, ok := tokenizer.Lookup(m.Hash()); ok {
 		return have
 	}
 	if err := tokenizer.Register(m); err != nil {
-		t.Fatalf("register model: %v", err)
+		tb.Fatalf("register model: %v", err)
 	}
 	return m
 }
