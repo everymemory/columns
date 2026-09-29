@@ -172,10 +172,11 @@ plain write stays at level 3, and that choice accounts for most of both numbers:
 block compressed harder costs no more to read back, so the extra write time is the
 only price. The defaults are already right for two of those five columns, and the pass
 pays for the other three by a byte a row. It is the right call when the file is
-written once and read many times, and the wrong one when it is not; `OptimizeLevel`
-buys back part of the time without changing what the pass chooses, and nothing
-cheaper than the full walk exists, because a sample that cheap is a guess the
-values did not get to answer.
+written once and read many times, and the wrong one when it is not. `OptimizeLevel`
+buys back part of the pass time, but it also changes what the pass picks, because
+a layout that wins once flate is squeezing hard can lose to `Plain` when it is
+not; nothing cheaper than the full walk exists, because a sample that cheap is a
+guess the values did not get to answer.
 
 ## Usage
 
@@ -216,7 +217,7 @@ w.AddRowGroup([][]any{ /* the same or later values */ })
 it goes before the first `AddRowGroup`. It measures and writes at the best level
 the codec offers, because a caller who runs the pass has already decided the data
 is worth walking in full and a harder block costs nothing to read back; set
-`OptimizeLevel` to spend less of the pass. `Options` is also how a writer that has
+`OptimizeLevel` to spend less of the pass, at the price of the layouts it picks. `Options` is also how a writer that has
 not been Optimized is told what to do: `Encoding` zero means the type's own
 choice, and any other encoding is used for every column it can serve.
 
@@ -497,39 +498,61 @@ Storing the text column as ids, measured on the same 255218 rows, with the
 | keine flate 3, text tokenized | 129.52 | — | 49.0 s | 1.17 s (scoped) |
 | keine flate 9 | 147.43 | — | 1.51 s | 133 ms (scoped) |
 | keine flate 9, text tokenized | 121.33 | — | 49.6 s | 1.08 s (scoped) |
-| keine flate 3, optimized | 144.75 | 32.7 s | 1.06 s | 153 ms (scoped) |
-| keine flate 3, optimized, text tokenized | 108.90 | 166 s | 51.9 s | 1.26 s (scoped) |
+| keine flate 9, optimized | 144.75 | 32.7 s | 1.06 s | 153 ms (scoped) |
+| keine flate 9, optimized, text tokenized | 108.90 | 166 s | 51.9 s | 1.26 s (scoped) |
+| keine flate 3, optimized | 157.05 | 18.7 s | 315 ms | 140 ms (scoped) |
+| keine flate 3, optimized, text tokenized | 113.06 | 136 s | 52.3 s | 1.29 s (scoped) |
 | parquet zstd 19 | 122.31 | — | 39.4 s | 258 ms |
+
+`Optimize` measures every candidate at `OptimizeLevel` and writes every later row
+group at that level too; zero means the codec's best, which for flate is 9. The
+two optimized rows above are level 9 files whatever `CompressLevel` was set to,
+because the level the pass measures at is the one the write uses. The last two
+rows set `OptimizeLevel` to 3, the only way to see what a cheaper pass buys.
 
 Tokenized at flate 9 is smaller than every parquet row in the table above,
 including the one that took 39 seconds to write, and tokenized at flate 3 is
-smaller than all but that one. The optimized tokenized row is eleven percent
-smaller than parquet's best. Where the phrase dictionary failed, the tokenizer's
-own vocabulary succeeds: it is 65024 entries chosen for English rather than for
-this column, so the ids are drawn from a narrow alphabet while the text they
-spell is not, and that is what flate compresses well.
+smaller than all but that one. Both optimized tokenized rows beat it too: the
+level 3 pass lands at 113.06, seven and a half percent under parquet's best, and
+the level 9 pass at 108.90, eleven percent. Where the phrase dictionary failed,
+the tokenizer's own vocabulary succeeds: it is 65024 entries chosen for English
+rather than for this column, so the ids are drawn from a narrow alphabet while
+the text they spell is not, and that is what flate compresses well.
 
 The size is one column of the table and the other three are its price. The write
 is thirty to over a hundred and fifty times slower, and all of it is the BPE: 86 MB
 of comment text at roughly 1.7 MB/s. The optimized tokenized row pays it twice,
 once in the pass that measures the layouts and again in the write that encodes
-them, which is 218 seconds against the optimized write's 34. The read is eight
-times slower, because the ids have to be reassembled into text instead of copied
+them, which is 218 seconds against the optimized write's 34. Asking the pass for
+level 3 cuts its own cost by a fifth and gives back 4.2 bytes a row, and still
+lands seven and a half percent under parquet's best. The read is eight times
+slower, because the ids have to be reassembled into text instead of copied
 out of the chunk. Neither is a defect in the encoding; both are the tokenizer's
 own cost, which is measured against the reference implementation below.
 
-`Optimize` on the same shard takes the write to 35.4 s and the file to 144.75
-bytes per row, so the pass costs a hundred times the write and recovers ten percent
-of the file. What it buys is visible per column: `by`, a string column whose values
-cluster by author, becomes a dictionary; `title`, whose values share a site prefix
-and a suffix, becomes affix; `parent`, a mostly-sparse id column, stops paying for
-subtraction on values it does not have. The other nine columns keep the layout
-their type gave them. That is the honest shape of the trade: the pass is right
-about which columns it changes and ruinously expensive for how little it changes.
+`Optimize` at its default recovers far less than the table above makes it look,
+because the pass writes at flate 9 and the row above it in the table is a level 3
+file. Held against the plain flate 9 write, it is 144.75 against 147.43, just
+under two percent of the file; most of the improvement over the level 3 default
+is the level, not the pass. What the pass itself buys is visible per column: `by`,
+a string column whose values cluster by author, becomes a dictionary; `title`,
+whose values share a site prefix and a suffix, becomes affix; `parent`, a
+mostly-sparse id column, stops paying for subtraction on values it does not have.
+The other nine columns keep the layout their type gave them. That is the honest
+shape of the trade: the pass is right about which columns it changes and
+ruinously expensive for how little it changes.
+
+Asking the pass for level 3 makes it cheaper and worse in a way worth seeing. It
+costs 18.7 s rather than 32.7, and it picks `Plain` for the text column, because
+at level 3 flate does not squeeze an affix encoding hard enough for the extra
+structure to pay. The file lands at 157.05 bytes a row, two percent better than
+not running a pass at all. Which encoding wins depends on the level it was
+measured at, which is why the default is the codec's best.
+
 It also arrives somewhere parquet already was: 144.75 bytes per row is parquet's
-zstd level 3 to within a byte, which parquet reaches in 1.3 s rather than 35.4 s.
-The pass buys knowledge the format can carry forward to every later row group, and
-it costs twenty-seven times what the same size costs parquet once.
+zstd level 3 to within a byte, which parquet reaches in 1.3 s rather than the
+pass's 33. The pass buys knowledge the format can carry forward to every later
+row group, and it costs twenty-five times what the same size costs parquet once.
 
 The shard also found a bug the benchmark could not. Compressing a column's blocks
 used to be a serial loop inside one per-column goroutine, so that 330-block text
