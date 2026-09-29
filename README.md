@@ -97,8 +97,8 @@ a dict column decodes as one plain read of the declared type. `DecodeDict`
 returns `[][]byte`, and the typed read path narrows from there.
 
 Tokenized is the one encoding that looks outside the value: it stores a text
-column as the ids a tokenizer maps each value to, so the vocabulary the text
-draws on is recorded once rather than spelled out per occurrence. Those ids are
+column as the ids a tokenizer maps each value to, recording the vocabulary the
+text draws on once rather than spelling it out per occurrence. Those ids are
 little-endian `uint16`, and three representations of them are measured against
 three ways of recording where one value ends and the next begins: per-value token
 counts, cumulative offsets into the id stream, and the first count followed by
@@ -146,7 +146,7 @@ What a column is laid out as is decided once, and there are two ways to decide i
 
 `NewWriter` decides from the type. Bool packs to bits, integers are stored as
 deltas, and floating point, bytes and strings are stored plainly, each compressed
-with Flate. These are properties of the type rather than of the values, so they
+with Flate. These are properties of the type rather than of the values: they
 cost nothing to choose and cannot be wrong the way a guess at the data's shape
 can. They are also what an empty `Options` means: the defaults are documented by
 the zero value rather than beside it.
@@ -249,7 +249,7 @@ w.AddRowGroupTyped([]any{ids, names})
 The slices go straight to the encoders, so the file is the one `AddRowGroup`
 would have written over the same values, and nothing the writer keeps points into
 a caller's slice: every encoder allocates its own output, so the slices can be
-reused as soon as the call returns. The contract mirrors the read side's — a
+reused as soon as the call returns. The contract mirrors the read side's: a
 nullable column is an error, because a typed slice has nowhere for a null, and a
 slice whose element type is not the schema's is an error rather than a widening
 conversion. `AddRowGroup` coerces, because `[]any` has not said what the values
@@ -302,7 +302,7 @@ tokenizer by the hash of the bytes it was built from, and `NewReader` resolves
 that hash through the package's default registry; a reader that does not share it
 can be given its own with `NewReaderWithRegistry`. A file whose hash is not in the
 registry is refused with the hash named, so the caller can load what the file
-needs — nothing is ever substituted for it.
+needs, and nothing is ever substituted for it.
 
 `LoadFileRegistered` is the same loader with a hash the caller already knows,
 which fails if the file on disk is not the one the caller expected; `Register` and
@@ -381,26 +381,27 @@ BenchmarkTokenized
 ```
 
 The pass picked `Tokenized+Flate` for the text column, which is why the optimized
-row is smaller than the tokenized one rather than the same. It is worth saying
-that the row reports what the pass chose and not what the tokenizer was handed:
-prose drawn from a fixed word list is a dictionary's best case too, and the pass
-measures both. The 130.5 bytes a row the plain write holds is the text itself, and
-the 27.47 the optimized write holds is the ids and the boundaries — the
-vocabulary not being respelled per occurrence.
+row is smaller than the tokenized one rather than the same. The row reports what
+the pass chose, not what the tokenizer was handed: prose drawn from a fixed word
+list is a dictionary's best case too, and the pass measures both. The 130.5 bytes
+a row the plain write holds is the text itself, and the 27.47 the optimized write
+holds is the ids and the boundaries, the vocabulary not being respelled per
+occurrence.
 
 The tokenized write is 250 times slower than the plain one, and all of that is the
 tokenizer: the column is 2 MB of prose and the BPE walks it at roughly 1.5 MB/s,
 which is measured against the Rust reference below. The read is 54 MB/s rather
 than a plain string column's rate, because the ids have to be turned back into
-text rather than copied. Both are the encoding's honest cost and not a bug in it.
+text rather than copied. Both are what tokenization costs, not a defect in the
+encoding.
 
 ## Compared with parquet
 
 Measured against pyarrow 25.0.1, both formats fed the *same* values: the five
 columns `BenchmarkComparison` builds were dumped to raw files and handed to
 pyarrow, so neither saw easier data and the bytes/row is the same file in both
-rows of the table. The harness is not in this repository — it needs a Python
-install, and the library does not — but it is a handful of lines around
+rows of the table. The harness is not in this repository, it needs a Python
+install and the library does not, but it is a handful of lines around
 `pq.write_table` and `pq.ParquetFile.read`, and both sides were timed best of
 five on the same idle X5687.
 
@@ -440,11 +441,11 @@ stable ecosystem, and readers in every language. keine has none of that, and the
 read gap this table used to show is closed only because the scoped read now
 exists to compare against Arrow's buffers rather than against a boxed `[]any`.
 
-The table is synthetic data, which is worth checking against the real thing. One
-monthly shard of `open-index/hacker-news` on HF — 255218 rows — was fed through
-both formats, taking the thirteen scalar columns and leaving the three list ones
-out, since keine has no nested type. This is the subset the format can express
-rather than a claim about the table:
+The table is synthetic data, so the real thing is worth a look. One monthly shard
+of `open-index/hacker-news` on HF, 255218 rows, was fed through both formats,
+taking the thirteen scalar columns and leaving the three list ones out, since
+keine has no nested type. This is the subset the format can express rather than a
+claim about the table:
 
 | | bytes/row | write | read all |
 | --- | --- | --- | --- |
@@ -453,10 +454,9 @@ rather than a claim about the table:
 | parquet snappy | 236.64 | 742 ms | 306 ms |
 | parquet none | 380.95 | 861 ms | 114 ms |
 
-`parquet zstd` above is pyarrow's default, which asks zstd for level 1 — the
+`parquet zstd` above is pyarrow's default, which asks zstd for level 1, the
 weakest of its levels, and the only one keine outsizes. Turning it up costs
-parquet write time and buys file size, at a rate worth seeing next to the row
-above:
+parquet write time and buys file size, at a rate the next table shows:
 
 | | bytes/row | write | read all |
 | --- | --- | --- | --- |
@@ -476,10 +476,10 @@ with the level while flate's is already spread across blocks. The size conclusio
 does not survive the comparison: from level 3 up parquet is the smaller file, by
 ten percent there and by a quarter at level 19.
 
-That is not a gap an encoding can close, which is worth checking rather than
-assuming. The obvious candidate is a shared phrase dictionary over the column —
-the text is comment prose, and prose repeats its own boilerplate. Measured, it
-does not: 87 percent of the column's 16-byte substrings occur once, the four
+That is not a gap an encoding can close, or so it seems until the obvious
+candidate is measured. A shared phrase dictionary over the column is the one to
+try: the text is comment prose, and prose repeats its own boilerplate. It does
+not work. 87 percent of the column's 16-byte substrings occur once, the four
 thousand most frequent ones cover 4 percent of its bytes, and the sixty-five
 thousand most frequent cover 8. Almost nothing recurs to factor out, so flate's
 window already holds what repetition there is, and a column-wide dictionary has
@@ -516,8 +516,8 @@ smaller than all but that one. Both optimized tokenized rows beat it too: the
 level 3 pass lands at 113.06, seven and a half percent under parquet's best, and
 the level 9 pass at 108.90, eleven percent. Where the phrase dictionary failed,
 the tokenizer's own vocabulary succeeds: it is 65024 entries chosen for English
-rather than for this column, so the ids are drawn from a narrow alphabet while
-the text they spell is not, and that is what flate compresses well.
+rather than for this column, so the ids come from a narrow alphabet while the
+text they spell does not, and that is what flate compresses well.
 
 The size is one column of the table and the other three are its price. The write
 is thirty to over a hundred and fifty times slower, and all of it is the BPE: 86 MB
@@ -538,16 +538,15 @@ is the level, not the pass. What the pass itself buys is visible per column: `by
 a string column whose values cluster by author, becomes a dictionary; `title`,
 whose values share a site prefix and a suffix, becomes affix; `parent`, a
 mostly-sparse id column, stops paying for subtraction on values it does not have.
-The other nine columns keep the layout their type gave them. That is the honest
-shape of the trade: the pass is right about which columns it changes and
-ruinously expensive for how little it changes.
+The other nine columns keep the layout their type gave them. The pass is right
+about which columns it changes and expensive for how little it changes.
 
-Asking the pass for level 3 makes it cheaper and worse in a way worth seeing. It
-costs 18.7 s rather than 32.7, and it picks `Plain` for the text column, because
-at level 3 flate does not squeeze an affix encoding hard enough for the extra
-structure to pay. The file lands at 157.05 bytes a row, two percent better than
-not running a pass at all. Which encoding wins depends on the level it was
-measured at, which is why the default is the codec's best.
+Asking the pass for level 3 makes it cheaper and worse. It costs 18.7 s rather
+than 32.7, and it picks `Plain` for the text column, because at level 3 flate
+does not squeeze an affix encoding hard enough for the extra structure to pay.
+The file lands at 157.05 bytes a row, two percent better than not running a pass
+at all. Which encoding wins depends on the level it was measured at, which is why
+the default is the codec's best.
 
 It also arrives somewhere parquet already was: 144.75 bytes per row is parquet's
 zstd level 3 to within a byte, which parquet reaches in 1.3 s rather than the
@@ -570,13 +569,13 @@ read from 161 ms to 140 ms, all of it on that one text column, whose prefixes wa
 
 ## The tokenizer's own cost
 
-The tokenizer is where the tokenized rows above spend their time, so it is worth
-measuring against the implementation it was written to match. The reference is
+The tokenizer is where the tokenized rows above spend their time, so it is
+measured against the implementation it was written to match. The reference is
 the Rust `tokenizers` crate, at the version the Python wheel is built from, built
 as a standalone encoder over the same corpus and the same `tokenizer.json`. That
 crate is a development oracle, not a dependency: this package has no Hugging Face
 code in it at runtime, and the timing harness is not in this repository for the
-same reason the parquet one is not — it needs a Rust toolchain, and the library
+same reason the parquet one is not, it needs a Rust toolchain and the library
 does not.
 
 Encoded on 50000 of the shard's comment bodies, 18.9 MB of text, over eight
@@ -587,10 +586,10 @@ passes on this side and three on the reference:
 | this package | 1.7 | 455 | 47 MB heap |
 | rust reference | 1.1 | 282 | 55 MB RSS |
 
-The Go side is not slower than the reference, which is the result worth checking
-rather than assuming: it allocates heavily to do it, roughly 730 allocations and
-80 KB per record against a 378 byte average, and a pre-tokenizer pass that builds
-its pieces as strings is most of that. The throughput is the same order, and the
+The Go side is not slower than the reference, which is the thing to check rather
+than assume. It allocates heavily to do it, roughly 730 allocations and 80 KB per
+record against a 378 byte average, and a pre-tokenizer pass that builds its
+pieces as strings is most of that. The throughput is the same order, and the
 memory is the same order, so the encoding's cost above is what tokenization costs
 in any implementation rather than what it costs in this one. Both numbers are far
 below a text column's own encode and compress rate, which is why the tokenized
@@ -598,8 +597,8 @@ write is the outlier row in every table above.
 
 ## Where the time goes
 
-Encoding and compressing a column touches no other, so the writer runs them
-across blocks and columns at once and writes each result in order, which keeps the
+Encoding and compressing a column touches no other, and the writer runs them
+across blocks and columns at once, writing each result in order, which keeps the
 bytes identical to a serial write. The reader splits the same way: chunk bytes
 come through one shared file handle serially, and each block's decompression and
 each column's decoding run across cores. A five-column read on a 16-core machine
@@ -608,19 +607,19 @@ fills the machine, which took the comparison file's read from 34ms to 27ms.
 
 What is left of the write gap is `compress/flate`. The standard library ships no
 zstd, so there is no faster codec to reach for, only a slower setting to stop
-using. DEFLATE's cost is not symmetric in what it is given, so the level is where
-the time lives — but only on the write side. Decompression does not search, so a
+using. DEFLATE's cost is not symmetric in what it is given: the level is where
+the time lives, and only on the write side. Decompression does not search, so a
 block compressed harder takes no longer to read back, which makes the level the
 one knob whose price is write time alone.
 
 That is why the default and `Optimize` part ways on it. A writer that has not been
 asked to scan the data writes at level 3, because the layout a type implies is
 free and the caller has not decided the data is worth a pass. `Optimize` has
-decided exactly that, so it measures and writes at level 9. On a 255000-row
+decided exactly that, and measures and writes at level 9. On a 255000-row
 hacker-news shard the difference is eight percent of the file: 160.23 bytes per row
 at level 3, 153.31 at level 6, 147.43 at level 9. Reading any of the three costs
 about the same, because decompression does not search. The pass also picks its
-layouts at that level, so the encoding it reports is the one the file gets.
+layouts at that level, and the encoding it reports is the one the file gets.
 `OptimizeLevel` sets it, and `CompressLevel` sets the level of every row group
 written without a pass.
 
@@ -682,7 +681,7 @@ The remainder is decoding and the parallel machinery around it.
 That 12ms is what parquet's typed read takes 15ms to do on the same values, which
 is the point the codec argument reaches: keine is slower at decompressing and
 still finishes first, because it decompresses less and does it across more cores.
-The gap that remains is not a codec gap but a contract one — the boxed read below
+The gap that remains is not a codec gap but a contract one: the boxed read below
 costs its interface headers, and no `[]any` return can avoid them.
 
 The three read paths are for three callers. `ReadRowGroup` returns `[]any` and

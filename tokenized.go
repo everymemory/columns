@@ -338,8 +338,8 @@ func DecodeTokenized(b []byte, tok *tokenizer.Model, typ uint8) (any, error) {
 	escapeCount := int(read32())
 	tableLen := int(read32())
 
-	// The four counts size three regions — the table, the boundaries, and the
-	// escapes — and those have to fit inside the chunk before any of them is
+	// The four counts size three regions, the table, the boundaries and the
+	// escapes, and those have to fit inside the chunk before any of them is
 	// trusted. The sum runs in uint64 because two uint32 counts times their element
 	// widths can wrap a 32 bit int and pass the very check meant to catch them.
 	need := uint64(at) + 2*uint64(tableLen) + 4*uint64(valueCount) + uint64(escapeCount)

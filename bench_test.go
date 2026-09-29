@@ -541,9 +541,10 @@ func BenchmarkTokenized(b *testing.B) {
 		}
 	})
 	// Optimize re-tokenizes the column once to measure all nine layouts against it,
-	// which is most of this row's time. The pass is free to prefer another encoding
-	// — prose drawn from a fixed word list is a dictionary's best case — so the row
-	// reports what it picked rather than assuming the tokenizer won.
+	// which is most of this row's time. The pass is free to prefer another
+	// encoding, since prose drawn from a fixed word list is a dictionary's best
+	// case, so the row reports what it picked rather than assuming the tokenizer
+	// won.
 	b.Run("write optimized", func(b *testing.B) {
 		opts := Options{Tokenizers: map[int]*tokenizer.Model{1: tok}}
 		first := write(opts, true)
