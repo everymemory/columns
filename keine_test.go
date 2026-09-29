@@ -186,7 +186,7 @@ func benchmarkLayoutsAt(t *testing.T, col []any, schema ColumnSchema, level int)
 	if err != nil {
 		t.Fatalf("canonicalColumnTyped(%s): %v", schema.Name, err)
 	}
-	return benchmarkLayoutsTyped(typed, schema, &measureScratch{}, level)
+	return benchmarkLayoutsTyped(typed, schema, nil, &measureScratch{}, level)
 }
 
 func TestBenchmarkLayouts(t *testing.T) {
@@ -198,7 +198,7 @@ func TestBenchmarkLayouts(t *testing.T) {
 		boolCol[i] = i%3 == 0
 	}
 
-	results := BenchmarkLayouts(boolCol, ColumnSchema{Name: "b", Type: TypeBool})
+	results := BenchmarkLayouts(boolCol, ColumnSchema{Name: "b", Type: TypeBool}, nil)
 	if len(results) == 0 {
 		t.Fatal("BenchmarkLayouts returned no candidates")
 	}
@@ -239,7 +239,7 @@ func TestBenchmarkLayouts(t *testing.T) {
 	for i := range strCol {
 		strCol[i] = fmt.Sprintf("id-%d-keine-common-suffix", i)
 	}
-	strResults := BenchmarkLayouts(strCol, ColumnSchema{Name: "s", Type: TypeString})
+	strResults := BenchmarkLayouts(strCol, ColumnSchema{Name: "s", Type: TypeString}, nil)
 	if len(strResults) == 0 {
 		t.Fatal("BenchmarkLayouts returned no candidates for strings")
 	}
@@ -1493,7 +1493,7 @@ func TestTypedDecodeErrors(t *testing.T) {
 	if _, err := decodePlainTyped(nil, 0xFF, &dest{}, 0); err == nil {
 		t.Error("decodePlainTyped with an unknown type: want error, got nil")
 	}
-	if _, err := decodeTyped(0xFF, nil, 0, TypeInt64, &dest{}); err == nil {
+	if _, err := decodeTyped(0xFF, nil, 0, TypeInt64, &dest{}, nil); err == nil {
 		t.Error("decodeTyped with an unknown encoding: want error, got nil")
 	}
 	if got, ok := asValues[int64](nil); ok {

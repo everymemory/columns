@@ -79,10 +79,10 @@ func TestCanonicalColumnTypedErrors(t *testing.T) {
 // type does not match the encoding, or that cannot be coerced at all, is
 // rejected rather than measured against the alternatives.
 func TestLayoutTypedInputs(t *testing.T) {
-	if results := BenchmarkLayouts([]any{struct{}{}}, ColumnSchema{Name: "b", Type: TypeBool}); results != nil {
+	if results := BenchmarkLayouts([]any{struct{}{}}, ColumnSchema{Name: "b", Type: TypeBool}, nil); results != nil {
 		t.Errorf("BenchmarkLayouts of an uncoercible column = %v, want nil", results)
 	}
-	if _, ok := measureLayout([]string{"x"}, ColumnSchema{Name: "b", Type: TypeBool}, EncRLEBitpack, CompressNone, flateLevel, &measureScratch{}); ok {
+	if _, ok := measureLayout([]string{"x"}, ColumnSchema{Name: "b", Type: TypeBool}, EncRLEBitpack, CompressNone, flateLevel, &measureScratch{}, nil); ok {
 		t.Error("measureLayout of a bool encoding on strings: want not ok")
 	}
 }

@@ -104,7 +104,15 @@ func EncodeTokenized(vals any, tok *tokenizer.Model, layout TokenizedLayout) ([]
 	}
 
 	ids, escapes, counts := tokenizedColumn(strings, bytes, tok)
+	return encodeTokenizedColumn(ids, escapes, counts, layout), nil
+}
 
+// encodeTokenizedColumn is EncodeTokenized past the tokenizer: it renders ids,
+// escapes and the per-value counts the tokenizer produced into the layout asked
+// for. The nine layouts of one column all share a tokenization, and this is the
+// part of the encode that differs between them, so a caller comparing layouts
+// tokenizes once and renders nine.
+func encodeTokenizedColumn(ids []uint16, escapes []byte, counts []uint32, layout TokenizedLayout) []byte {
 	bound := tokenizedBoundaries(counts, layout.Bound)
 
 	var idStream []byte
@@ -138,7 +146,7 @@ func EncodeTokenized(vals any, tok *tokenizer.Model, layout TokenizedLayout) ([]
 	}
 	buf = append(buf, idStream...)
 	buf = append(buf, escapes...)
-	return buf, nil
+	return buf
 }
 
 // tokenizedValues returns vals as a []string and a [][]byte, one of which is the

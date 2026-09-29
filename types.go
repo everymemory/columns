@@ -56,6 +56,7 @@ const (
 	EncDict        uint8 = 0x04
 	EncOffsetBytes uint8 = 0x05
 	EncAffix       uint8 = 0x06
+	EncTokenized   uint8 = 0x07
 )
 
 // Compress tags identify the compression codec applied to a chunk's encoded

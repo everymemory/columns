@@ -10,15 +10,34 @@ import (
 	"reflect"
 	"runtime"
 	"sync"
+
+	"github.com/everymemory/keine/tokenizer"
 )
 
 // magic is written at the start of a file and again after the footer length.
 const magic = "KEIN"
 
-// formatVersion is the byte after the leading magic. A reader that sees another
-// version refuses the file, so a change to the layout on disk is a clean break
-// rather than a silent corruption.
-const formatVersion = 1
+// The byte after the leading magic names the layout of everything that follows
+// it. A reader that sees another version refuses the file, so a change to the
+// layout on disk is a clean break rather than a silent corruption.
+const (
+	// formatVersion is the file every release before tokenized columns wrote: the
+	// magic, the version, then the chunks. A writer with no tokenizer for any
+	// column still writes it, so a file with no tokenized column is byte for byte
+	// the file it always was.
+	formatVersion = 1
+
+	// tokenizedVersion is formatVersion with a tokenizer table between the version
+	// and the chunks: a uint32 count and that many 32 byte SHA-256 digests. A
+	// column names one by its one-based position in the table, and a reader
+	// resolves the digest to the tokenizer the file was written with. The table is
+	// written only when a column is tokenized, so a reader of either version sees
+	// the chunks where it expects them.
+	tokenizedVersion = 2
+)
+
+// digestLen is the size of the SHA-256 a tokenizer is named by.
+const digestLen = 32
 
 // Writer accumulates row groups into a keine file. Chunks are large sequential
 // blocks, so writes go to w directly: buffering would only obscure which write
@@ -48,6 +67,11 @@ type Writer struct {
 	// makes. A column is the unit of parallelism below, so element i is only
 	// touched by column i's goroutine and needs no synchronisation.
 	measure []measureScratch
+
+	// tokOf is the position in the header's tokenizer table of the model a column
+	// is stored through, keyed by column index. A column without an entry has no
+	// tokenizer, and its ColMeta records a zero, which names none.
+	tokOf map[int]int
 
 	// sem bounds the compressors one write has in flight, across every column and
 	// every block of every column. It outlives a row group so the blocks of one
@@ -90,6 +114,19 @@ type Options struct {
 	// Zero means 256KB, above DEFLATE's window and small enough that a wide
 	// column still splits into several jobs.
 	BlockSize int
+
+	// Tokenizers is the tokenizer a column is stored through, keyed by column
+	// index: a TypeString column at 2 handed a Falcon model is written as the ids
+	// that model maps its values to. A column not in the map is laid out the way
+	// its type implies, so a table with one text column among ten needs one entry.
+	// Optimize decides whether the ids are worth it; without it, the column is
+	// tokenized at TokenizedLayout's zero value, raw ids and per-value counts.
+	Tokenizers map[int]*tokenizer.Model
+
+	// TokenizedLayout is how a tokenized column the writer has not optimized
+	// stores its ids and its value boundaries. Optimize picks its own, and the
+	// one it picks is what the write uses.
+	TokenizedLayout TokenizedLayout
 }
 
 // validate reports whether opts asks for a codec and an encoding this build can
@@ -105,6 +142,21 @@ func (o Options) validate() error {
 	case 0, EncPlain, EncRLEBitpack, EncDelta, EncDict, EncOffsetBytes, EncAffix:
 	default:
 		return fmt.Errorf("keine: unknown encoding %d", o.Encoding)
+	}
+	switch o.TokenizedLayout.Rep {
+	case TokenizedRaw, TokenizedRemap, TokenizedBits:
+	default:
+		return fmt.Errorf("keine: tokenized representation %d is not one this build writes", o.TokenizedLayout.Rep)
+	}
+	switch o.TokenizedLayout.Bound {
+	case TokenizedCounts, TokenizedOffsets, TokenizedDeltas:
+	default:
+		return fmt.Errorf("keine: tokenized boundary %d is not one this build writes", o.TokenizedLayout.Bound)
+	}
+	for i, tok := range o.Tokenizers {
+		if tok == nil {
+			return fmt.Errorf("keine: tokenizer for column %d is nil", i)
+		}
 	}
 	return nil
 }
@@ -128,16 +180,65 @@ func NewWriterWithOptions(w io.Writer, schema []ColumnSchema, opts Options) *Wri
 		wr.writeErr = err
 		return wr
 	}
-	if _, err := w.Write([]byte(magic)); err != nil {
+	for i := range opts.Tokenizers {
+		if i < 0 || i >= len(schema) {
+			wr.writeErr = fmt.Errorf("keine: tokenizer for column %d, schema has %d columns", i, len(schema))
+			return wr
+		}
+	}
+	digests, tokOf := tokenizerTable(len(schema), opts.Tokenizers)
+	wr.tokOf = tokOf
+
+	head := []byte(magic)
+	if len(digests) > 0 {
+		head = tokenizerHeader(tokenizedVersion, digests)
+	} else {
+		head = append(head, formatVersion)
+	}
+	if _, err := w.Write(head); err != nil {
 		wr.writeErr = err
 		return wr
 	}
-	if _, err := w.Write([]byte{formatVersion}); err != nil {
-		wr.writeErr = err
-		return wr
-	}
-	wr.offset = int64(len(magic) + 1)
+	wr.offset = int64(len(head))
 	return wr
+}
+
+// tokenizerTable orders the models a schema's columns use into the digest table
+// the header writes. The walk is by column index, never by map order, because the
+// table's order settles the bytes on disk; columns sharing a model share one
+// entry, because the table names tokenizers and not the columns that use them.
+func tokenizerTable(n int, toks map[int]*tokenizer.Model) (digests [][32]byte, of map[int]int) {
+	of = make(map[int]int, len(toks))
+	byHash := make(map[[32]byte]int, len(toks))
+	for i := 0; i < n; i++ {
+		tok, ok := toks[i]
+		if !ok {
+			continue
+		}
+		h := tok.Hash()
+		if at, ok := byHash[h]; ok {
+			of[i] = at
+			continue
+		}
+		of[i] = len(digests)
+		byHash[h] = len(digests)
+		digests = append(digests, h)
+	}
+	return digests, of
+}
+
+// tokenizerHeader builds the leading bytes of a file with a tokenizer table: the
+// magic, the version, the digest count, then the digests themselves. A column
+// names one by its one-based position among them.
+func tokenizerHeader(version byte, digests [][32]byte) []byte {
+	head := make([]byte, len(magic)+1+4+digestLen*len(digests))
+	copy(head, magic)
+	head[len(magic)] = version
+	binary.LittleEndian.PutUint32(head[len(magic)+1:], uint32(len(digests)))
+	for i, d := range digests {
+		copy(head[len(magic)+5+i*digestLen:], d[:])
+	}
+	return head
 }
 
 // Optimize encodes and compresses every candidate layout over every value of
@@ -204,7 +305,7 @@ func (w *Writer) measureLayouts(typed []any) error {
 			w.sem <- struct{}{}
 			defer func() { <-w.sem }()
 
-			results := benchmarkLayoutsTyped(typed[i], w.schema[i], &w.measure[i], level)
+			results := benchmarkLayoutsTyped(typed[i], w.schema[i], w.opts.Tokenizers[i], &w.measure[i], level)
 			// A column either entry accepted has candidate encodings, so this is
 			// never empty. An empty result would leave the zero layout, whose
 			// encoding no encoder recognises, and the write would fail on it
@@ -426,6 +527,12 @@ func (w *Writer) writeRowGroup(numRows uint32, typed []any, metas []ColMeta, bit
 		meta.ByteLength = cw.count
 		meta.Encoding = chunk.Encoding
 		meta.Compress = chunk.Compress
+		// The tokenizer table sits in the header, so a column names its entry
+		// rather than carrying the digest. Zero names none, which is what a
+		// column the reader has no tokenizer for decodes as.
+		if at, ok := w.tokOf[i]; ok {
+			meta.Tokenizer = at + 1
+		}
 		metas[i] = meta
 	}
 	copy(rg.Columns, metas)
@@ -458,7 +565,13 @@ func encodeColumns(typed []any, schema []ColumnSchema, layouts []LayoutResult, o
 			defer wg.Done()
 
 			enc, codec := chosenLayout(i, schema[i], layouts, opts)
-			encoded, err := encodeWith(enc, typed[i], schema[i].Type)
+			var encoded []byte
+			var err error
+			if enc == EncTokenized {
+				encoded, err = EncodeTokenized(typed[i], opts.Tokenizers[i], tokenizedLayoutFor(i, layouts, opts))
+			} else {
+				encoded, err = encodeWith(enc, typed[i], schema[i].Type)
+			}
 			if err != nil {
 				errs[i] = err
 				return
@@ -492,11 +605,24 @@ func chosenLayout(i int, schema ColumnSchema, layouts []LayoutResult, opts Optio
 	if layouts != nil {
 		return layouts[i].Encoding, layouts[i].Compress
 	}
+	if _, ok := opts.Tokenizers[i]; ok {
+		return EncTokenized, opts.Compress
+	}
 	if opts.Encoding == 0 {
 		enc, _ := defaultLayout(schema.Type)
 		return enc, opts.Compress
 	}
 	return opts.Encoding, opts.Compress
+}
+
+// tokenizedLayoutFor is the layout a tokenized column's ids and boundaries are
+// stored in: the one Optimize measured the smallest, or the one the options ask
+// for when the writer decides the layout itself.
+func tokenizedLayoutFor(i int, layouts []LayoutResult, opts Options) TokenizedLayout {
+	if layouts != nil {
+		return TokenizedLayout{Rep: layouts[i].Rep, Bound: layouts[i].Bound}
+	}
+	return opts.TokenizedLayout
 }
 
 // blockOfSize is the block size a writer uses; zero and anything below a block

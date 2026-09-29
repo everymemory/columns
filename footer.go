@@ -29,6 +29,11 @@ type ColMeta struct {
 	MaxLen     uint32
 	Encoding   uint8
 	Compress   uint8
+	// Tokenizer is the one-based position of the tokenizer a tokenized column is
+	// stored through, in the table the file header holds. Zero names none, so a
+	// file written before tokenized columns — whose gob record carries no such
+	// field — decodes to the same zero and reads as an untokenized column.
+	Tokenizer int
 }
 
 // encodeFooter serializes f with encoding/gob, which cannot fail on the fixed

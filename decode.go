@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"unsafe"
+
+	"github.com/everymemory/keine/tokenizer"
 )
 
 // dest holds one column's decoded values, reused across reads. Decoders write
@@ -538,7 +540,7 @@ func decodeBitunpack(b []byte, n int, nbits uint, d *dest) []uint32 {
 // the Go type that decoder produces, []int64 from EncDelta and []string from
 // EncDict. n is the number of values in the chunk. Pass a fresh d when the caller
 // keeps the result, because every value returned points into it.
-func decodeTyped(enc uint8, data []byte, n int, typ uint8, d *dest) (any, error) {
+func decodeTyped(enc uint8, data []byte, n int, typ uint8, d *dest, tok *tokenizer.Model) (any, error) {
 	switch enc {
 	case EncPlain:
 		return decodePlainTyped(data, typ, d, n)
@@ -552,6 +554,11 @@ func decodeTyped(enc uint8, data []byte, n int, typ uint8, d *dest) (any, error)
 		return decodeAffix(data, typ, d)
 	case EncOffsetBytes:
 		return decodeOffsetBytes(data, d)
+	case EncTokenized:
+		if tok == nil {
+			return nil, fmt.Errorf("keine: tokenized chunk with no tokenizer to read it with")
+		}
+		return DecodeTokenized(data, tok, typ)
 	default:
 		return nil, fmt.Errorf("keine: unknown encoding %d", enc)
 	}
@@ -574,15 +581,18 @@ func encProducesType(enc, typ uint8) bool {
 		return typ == TypeString || typ == TypeBytes
 	case EncOffsetBytes:
 		return typ == TypeBytes
+	case EncTokenized:
+		return typ == TypeString || typ == TypeBytes
 	default:
 		return false
 	}
 }
 
 // decodeWith dispatches data to the decoder for enc, then converts the values
-// to the Go types implied by typ. n is the number of values in the chunk.
-func decodeWith(enc uint8, data []byte, n int, typ uint8) ([]any, error) {
-	typed, err := decodeTyped(enc, data, n, typ, &dest{})
+// to the Go types implied by typ. n is the number of values in the chunk. tok is
+// the tokenizer a tokenized column was written with, nil for every other one.
+func decodeWith(enc uint8, data []byte, n int, typ uint8, tok *tokenizer.Model) ([]any, error) {
+	typed, err := decodeTyped(enc, data, n, typ, &dest{}, tok)
 	if err != nil {
 		return nil, err
 	}

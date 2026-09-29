@@ -974,16 +974,17 @@ func TestDecodeWithErrors(t *testing.T) {
 		{EncDelta, []byte{1, 2, 3}, TypeInt64},
 		{EncDict, []byte{1, 2}, TypeString},
 		{EncOffsetBytes, []byte{1, 2}, TypeBytes},
+		{EncTokenized, nil, TypeString},
 		{99, nil, TypeInt8},
 	} {
-		if _, err := decodeWith(c.enc, c.data, 1, c.typ); err == nil {
+		if _, err := decodeWith(c.enc, c.data, 1, c.typ, nil); err == nil {
 			t.Errorf("decodeWith(%d, ..., %d): want error, got nil", c.enc, c.typ)
 		}
 	}
 }
 
 func TestLayoutHelpers(t *testing.T) {
-	if got := layoutCandidates(0xFF); got != nil {
+	if got := layoutCandidates(0xFF, false); got != nil {
 		t.Errorf("layoutCandidates of an unknown type = %v, want nil", got)
 	}
 	if got := encName(99); got != "Enc99" {
@@ -1009,16 +1010,16 @@ func TestLayoutHelpers(t *testing.T) {
 		t.Errorf("codecName(99) = %q, want %q", got, "Codec99")
 	}
 
-	if _, ok := measureLayout([]any{int8(1)}, ColumnSchema{Name: "x", Type: TypeInt8}, EncPlain, CompressZstd, flateLevel, &measureScratch{}); ok {
+	if _, ok := measureLayout([]any{int8(1)}, ColumnSchema{Name: "x", Type: TypeInt8}, EncPlain, CompressZstd, flateLevel, &measureScratch{}, nil); ok {
 		t.Error("measureLayout with a codec that cannot compress: want not ok")
 	}
-	if _, ok := measureLayout([]any{int8(1)}, ColumnSchema{Name: "x", Type: TypeInt8}, EncPlain, CompressFlate, flateLevel, &measureScratch{}); !ok {
+	if _, ok := measureLayout([]any{int8(1)}, ColumnSchema{Name: "x", Type: TypeInt8}, EncPlain, CompressFlate, flateLevel, &measureScratch{}, nil); !ok {
 		t.Error("measureLayout with CompressFlate: want ok")
 	}
 	if _, err := canonicalColumnTyped([]any{struct{}{}}, TypeBool); err == nil {
 		t.Error("canonicalColumnTyped of an uncoercible value: want error, got nil")
 	}
-	if _, ok := measureLayout([]string{"x"}, ColumnSchema{Name: "x", Type: TypeBool}, EncRLEBitpack, CompressNone, flateLevel, &measureScratch{}); ok {
+	if _, ok := measureLayout([]string{"x"}, ColumnSchema{Name: "x", Type: TypeBool}, EncRLEBitpack, CompressNone, flateLevel, &measureScratch{}, nil); ok {
 		t.Error("measureLayout with a column of the wrong Go type: want not ok")
 	}
 
@@ -1026,13 +1027,13 @@ func TestLayoutHelpers(t *testing.T) {
 	// the decoded strings must convert back to the column type. Strings that do
 	// not parse as integers fail the round trip, which is the decode check
 	// measureLayout exists to catch.
-	if _, ok := measureLayout([]string{"abc", "def"}, ColumnSchema{Name: "x", Type: TypeInt32}, EncDict, CompressNone, flateLevel, &measureScratch{}); ok {
+	if _, ok := measureLayout([]string{"abc", "def"}, ColumnSchema{Name: "x", Type: TypeInt32}, EncDict, CompressNone, flateLevel, &measureScratch{}, nil); ok {
 		t.Error("measureLayout with values that cannot be decoded back: want not ok")
 	}
 
 	// An empty column gives every candidate a size of zero, so the ordering the
 	// sort falls back to is the encoded size.
-	results := benchmarkLayoutsTyped([]bool{}, ColumnSchema{Name: "x", Type: TypeBool}, &measureScratch{}, flateLevel)
+	results := benchmarkLayoutsTyped([]bool{}, ColumnSchema{Name: "x", Type: TypeBool}, nil, &measureScratch{}, flateLevel)
 	if len(results) != 6 {
 		t.Fatalf("benchmarkLayoutsTyped of an empty bool column: got %d results, want 6", len(results))
 	}
@@ -1065,9 +1066,26 @@ func TestLayoutCandidates(t *testing.T) {
 		{TypeString, "string", []uint8{EncPlain, EncOffsetBytes, EncDict, EncAffix}},
 		{0xFF, "unknown", nil},
 	} {
-		got := layoutCandidates(tc.typ)
+		got := layoutCandidates(tc.typ, false)
 		if !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("layoutCandidates(%s) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	// A column with a tokenizer adds one candidate, and only the two text-like
+	// types can take it: an int64 column holding tokens is still an int64 column.
+	for _, tc := range []struct {
+		typ  uint8
+		name string
+		want []uint8
+	}{
+		{TypeString, "string", []uint8{EncPlain, EncOffsetBytes, EncDict, EncAffix, EncTokenized}},
+		{TypeBytes, "bytes", []uint8{EncOffsetBytes, EncDict, EncAffix, EncTokenized}},
+		{TypeInt64, "int64", []uint8{EncPlain, EncDelta, EncDict}},
+	} {
+		got := layoutCandidates(tc.typ, true)
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("layoutCandidates(%s, tokenized) = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }
@@ -1282,16 +1300,16 @@ func TestWriterErrors(t *testing.T) {
 		t.Error("AddRowGroup of values that break statistics: want error, got nil")
 	}
 
-	// The underlying writer fails partway through the chunk. NewWriter has
-	// written the magic and the version, so the chunk header is the third write.
+	// The underlying writer fails partway through the chunk. NewWriter has written
+	// the magic and the version as one write, so the chunk header is the second.
 	w = NewWriter(&failAfter{n: 2}, schema)
 	if err := w.AddRowGroup([][]any{{true, false}}); err == nil {
 		t.Error("AddRowGroup with a failing writer: want error, got nil")
 	}
 
 	// Close failing at each of its three writes. NewWriter has already written the
-	// magic and the format version, so Close's are the third, fourth and fifth.
-	for n := 2; n <= 4; n++ {
+	// header in one, so Close's are the second, third and fourth.
+	for n := 1; n <= 3; n++ {
 		w := NewWriter(&failAfter{n: n}, nil)
 		if err := w.AddRowGroup(nil); err != nil {
 			t.Fatalf("AddRowGroup of an empty row group: %v", err)

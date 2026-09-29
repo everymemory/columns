@@ -110,7 +110,7 @@ func BenchmarkOptimize(b *testing.B) {
 func BenchmarkSizes(b *testing.B) {
 	for _, c := range benchColumns {
 		col := c.build(benchRows)
-		for _, r := range BenchmarkLayouts(col, c.schema) {
+		for _, r := range BenchmarkLayouts(col, c.schema, nil) {
 			b.Run(c.name+"/"+r.Name, func(b *testing.B) {
 				b.ReportMetric(float64(r.CompressedSize), "bytes")
 				b.ReportMetric(float64(r.CompressedSize)/float64(benchRows), "B/row")

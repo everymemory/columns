@@ -6,12 +6,21 @@ import (
 	"io"
 	"runtime"
 	"sync"
+
+	"github.com/everymemory/keine/tokenizer"
 )
 
 // Reader reads a keine file written by Writer.
 type Reader struct {
 	r      io.ReadSeeker
 	footer Footer
+
+	// toks holds the tokenizers the header's table names, in the table's own
+	// order, resolved through the registry the reader was built with. A file
+	// written before tokenized columns has no table, so this is nil and every
+	// column's tokenizer index is the zero that names none.
+	toks []*tokenizer.Model
+	reg  *tokenizer.Registry
 
 	// rgbuf holds the chunks of the row group being read, one region per column.
 	// rawbufs holds one decompression buffer per column, and raw the decompressed
@@ -34,9 +43,20 @@ type Reader struct {
 }
 
 // NewReader reads the footer of a file written by Writer. The file must end
-// with the footer, its length as a little-endian uint32, and the magic.
+// with the footer, its length as a little-endian uint32, and the magic. A
+// tokenized column is read with the tokenizer the header names, resolved through
+// the default tokenizer registry; a hash the registry does not hold is an error
+// that names it, so the caller can load what the file needs.
 func NewReader(r io.ReadSeeker) (*Reader, error) {
-	rd := &Reader{r: r}
+	return NewReaderWithRegistry(r, tokenizer.Default)
+}
+
+// NewReaderWithRegistry is NewReader resolving the file's tokenizers through reg
+// instead of the default one. A registry the caller has loaded its tokenizers
+// into is what keeps a file from being decoded by a tokenizer that merely shares
+// the name of the one that wrote it.
+func NewReaderWithRegistry(r io.ReadSeeker, reg *tokenizer.Registry) (*Reader, error) {
+	rd := &Reader{r: r, reg: reg}
 
 	end, err := r.Seek(0, io.SeekEnd)
 	if err != nil {
@@ -46,19 +66,14 @@ func NewReader(r io.ReadSeeker) (*Reader, error) {
 		return nil, fmt.Errorf("keine: file is %d bytes, too small to contain a footer", end)
 	}
 
-	lead := make([]byte, len(magic)+1)
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("keine: cannot seek to start of file: %w", err)
 	}
-	if _, err := io.ReadFull(r, lead); err != nil {
-		return nil, fmt.Errorf("keine: cannot read the leading magic: %w", err)
+	toks, err := readTokenizers(r, reg)
+	if err != nil {
+		return nil, err
 	}
-	if string(lead[:len(magic)]) != magic {
-		return nil, fmt.Errorf("keine: leading magic %q is not %q", lead[:len(magic)], magic)
-	}
-	if version := lead[len(magic)]; version != formatVersion {
-		return nil, fmt.Errorf("keine: file is format version %d, this build reads version %d", version, formatVersion)
-	}
+	rd.toks = toks
 
 	if _, err := r.Seek(end-8, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("keine: cannot seek to footer: %w", err)
@@ -93,6 +108,65 @@ func NewReader(r io.ReadSeeker) (*Reader, error) {
 	}
 	rd.footer = footer
 	return rd, nil
+}
+
+// readTokenizers consumes the leading magic, the version byte, and the tokenizer
+// table a version 2 file carries after it, leaving r positioned on the first
+// chunk. It returns the models the table names, resolved through the registry a
+// reader was built with. A version 1 file has no table, and every column of it
+// decodes without a tokenizer, so the slice is nil.
+//
+// A digest the registry does not hold is an error that prints it, because
+// substituting another tokenizer would decode the ids to text that was never
+// written; the caller is the one who can load the model the file names.
+func readTokenizers(r io.ReadSeeker, reg *tokenizer.Registry) ([]*tokenizer.Model, error) {
+	lead := make([]byte, len(magic)+1)
+	if _, err := io.ReadFull(r, lead); err != nil {
+		return nil, fmt.Errorf("keine: cannot read the leading magic: %w", err)
+	}
+	if string(lead[:len(magic)]) != magic {
+		return nil, fmt.Errorf("keine: leading magic %q is not %q", lead[:len(magic)], magic)
+	}
+	version := lead[len(magic)]
+	switch version {
+	case formatVersion:
+		return nil, nil
+	case tokenizedVersion:
+	default:
+		return nil, fmt.Errorf("keine: file is format version %d, this build reads versions %d and %d", version, formatVersion, tokenizedVersion)
+	}
+
+	var count uint32
+	if err := binary.Read(r, binary.LittleEndian, &count); err != nil {
+		return nil, fmt.Errorf("keine: cannot read the tokenizer count: %w", err)
+	}
+	buf := make([]byte, digestLen*int(count))
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, fmt.Errorf("keine: cannot read the tokenizer table: %w", err)
+	}
+	table := make([][digestLen]byte, count)
+	for i := range table {
+		copy(table[i][:], buf[i*digestLen:])
+	}
+	toks := make([]*tokenizer.Model, len(table))
+	for i, h := range table {
+		m, ok := reg.Lookup(h)
+		if !ok {
+			return nil, fmt.Errorf("keine: tokenizer %d is %x, and no model is registered for it", i, h[:])
+		}
+		toks[i] = m
+	}
+	return toks, nil
+}
+
+// tokenizerFor is the model a column was stored through, or nil when the column
+// is not a tokenized one. The index is one-based, so the zero a column without a
+// tokenizer records names none.
+func (rd *Reader) tokenizerFor(meta ColMeta) *tokenizer.Model {
+	if meta.Tokenizer <= 0 || meta.Tokenizer > len(rd.toks) {
+		return nil
+	}
+	return rd.toks[meta.Tokenizer-1]
 }
 
 // Schema returns the schema the file was written with.
@@ -363,7 +437,7 @@ func (rd *Reader) decodeJobs(jobs []readJob, dests []*dest) ([]any, []error) {
 			}
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			t, err := decodeTyped(j.chunk.Encoding, raw, numValues, sch.Type, dests[i])
+			t, err := decodeTyped(j.chunk.Encoding, raw, numValues, sch.Type, dests[i], rd.tokenizerFor(meta))
 			if err != nil {
 				errs[i] = fmt.Errorf("keine: decoding column %d (%s): %w", j.ci, sch.Name, err)
 				rd.rawbufs[i] = raw[:0]
@@ -476,7 +550,7 @@ func (rd *Reader) readColumn(start int64, rg RowGroupMeta, ci int) (typed any, n
 	if len(chunk.NullBitmap) > 0 {
 		numValues -= int(rg.Columns[ci].NullCount)
 	}
-	typed, err = decodeTyped(chunk.Encoding, raw, numValues, rd.footer.Schema[ci].Type, &dest{})
+	typed, err = decodeTyped(chunk.Encoding, raw, numValues, rd.footer.Schema[ci].Type, &dest{}, rd.tokenizerFor(rg.Columns[ci]))
 	if err != nil {
 		return nil, nil, fmt.Errorf("keine: decoding column %d (%s): %w", ci, rd.footer.Schema[ci].Name, err)
 	}

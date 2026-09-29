@@ -1,9 +1,12 @@
 package keine
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/everymemory/keine/tokenizer"
@@ -404,6 +407,517 @@ func boundName(bound uint8) string {
 		return "deltas"
 	}
 	return "unknown"
+}
+
+// boxedCorpus is the corpus as the boxed write API takes it, one interface per
+// value, which is the shape the layout pass measures.
+func boxedCorpus(t *testing.T) []any {
+	t.Helper()
+	return boxedStrings(tokenizedCorpus(t))
+}
+
+// boxedStrings is a slice of strings as the boxed API takes it: one interface
+// per value.
+func boxedStrings(vals []string) []any {
+	out := make([]any, len(vals))
+	for i := range vals {
+		out[i] = vals[i]
+	}
+	return out
+}
+
+// registeredModel is the Falcon model filed in the default registry, which is
+// where a reader of a file that names it looks it up. Registering is what a
+// caller does once, before the file that needs the model is read; the lookup
+// first keeps a second test from tripping the registry's rule against filing a
+// second model under one hash.
+func registeredModel(t *testing.T) *tokenizer.Model {
+	t.Helper()
+	m := tokenizedModel(t)
+	if have, ok := tokenizer.Lookup(m.Hash()); ok {
+		return have
+	}
+	if err := tokenizer.Register(m); err != nil {
+		t.Fatalf("register model: %v", err)
+	}
+	return m
+}
+
+// tokenizedFile writes one text column through tok, in the layout asked for, and
+// returns the file's bytes. The model is registered, because that is what a
+// reader of the file needs to resolve the tokenizer it names.
+func tokenizedFile(t *testing.T, vals []string, tok *tokenizer.Model, layout TokenizedLayout) []byte {
+	t.Helper()
+	schema := []ColumnSchema{{Name: "text", Type: TypeString}}
+	var buf bytes.Buffer
+	w := NewWriterWithOptions(&buf, schema, Options{
+		Compress:        CompressFlate,
+		Tokenizers:      map[int]*tokenizer.Model{0: tok},
+		TokenizedLayout: layout,
+		CompressLevel:   flateLevel,
+	})
+	if err := w.AddRowGroupTyped([]any{vals}); err != nil {
+		t.Fatalf("AddRowGroupTyped: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// TestTokenizedColumnRoundTrip writes a column as token ids through the file
+// format and reads it back, for every layout. The file's own header names the
+// tokenizer by hash and the reader resolves it, so nothing about the column is
+// carried out of band.
+func TestTokenizedColumnRoundTrip(t *testing.T) {
+	vals := tokenizedCorpus(t)
+	tok := registeredModel(t)
+
+	for _, layout := range tokenizedLayouts {
+		t.Run(repName(layout.Rep)+"/"+boundName(layout.Bound), func(t *testing.T) {
+			b := tokenizedFile(t, vals, tok, layout)
+			r, err := NewReader(bytes.NewReader(b))
+			if err != nil {
+				t.Fatalf("NewReader: %v", err)
+			}
+			out, err := r.ReadRowGroup(0, []int{0})
+			if err != nil {
+				t.Fatalf("ReadRowGroup: %v", err)
+			}
+			back := out[0]
+			if len(back) != len(vals) {
+				t.Fatalf("read %d values, wrote %d", len(back), len(vals))
+			}
+			for i := range vals {
+				if s, ok := back[i].(string); !ok || s != vals[i] {
+					t.Fatalf("value %d: got %#v, want %q", i, back[i], vals[i])
+				}
+			}
+			t.Logf("%d values, %d bytes", len(vals), len(b))
+		})
+	}
+}
+
+// TestTokenizedColumnScoped is the same column through the typed and scoped read
+// paths, which are the ones a caller holding a []string uses.
+func TestTokenizedColumnScoped(t *testing.T) {
+	vals := tokenizedCorpus(t)
+	tok := registeredModel(t)
+
+	b := tokenizedFile(t, vals, tok, TokenizedLayout{Rep: TokenizedBits, Bound: TokenizedDeltas})
+	r, err := NewReader(bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	if err := r.ReadRowGroupScoped(0, []int{0}, func(cols *Columns) error {
+		col, err := Column[string](cols, 0)
+		if err != nil {
+			return err
+		}
+		if len(col) != len(vals) {
+			t.Fatalf("scoped read gave %d values, want %d", len(col), len(vals))
+		}
+		for i := range vals {
+			if col[i] != vals[i] {
+				t.Fatalf("scoped value %d: got %q, want %q", i, col[i], vals[i])
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadRowGroupScoped: %v", err)
+	}
+
+	got, err := ReadColumn[string](r, 0, 0)
+	if err != nil {
+		t.Fatalf("ReadColumn: %v", err)
+	}
+	if len(got) != len(vals) {
+		t.Fatalf("ReadColumn gave %d values, want %d", len(got), len(vals))
+	}
+	for i := range vals {
+		if got[i] != vals[i] {
+			t.Fatalf("ReadColumn value %d: got %q, want %q", i, got[i], vals[i])
+		}
+	}
+}
+
+// TestTokenizedBytesColumn is the bytes column's path through the same format. A
+// TypeBytes column is a column of arbitrary bytes, which the tokenizer takes as
+// bytes and hands back as bytes, so the round trip has to hold for values a
+// string column would have to carry through the escape path.
+func TestTokenizedBytesColumn(t *testing.T) {
+	tok := registeredModel(t)
+	vals := [][]byte{{}, []byte("hello"), {0x00, 0xff, 0x1e}, []byte("world hello")}
+
+	for _, layout := range tokenizedLayouts {
+		t.Run(repName(layout.Rep)+"/"+boundName(layout.Bound), func(t *testing.T) {
+			schema := []ColumnSchema{{Name: "b", Type: TypeBytes}}
+			var buf bytes.Buffer
+			w := NewWriterWithOptions(&buf, schema, Options{
+				Compress:        CompressFlate,
+				CompressLevel:   flateLevel,
+				Tokenizers:      map[int]*tokenizer.Model{0: tok},
+				TokenizedLayout: layout,
+			})
+			if err := w.AddRowGroupTyped([]any{vals}); err != nil {
+				t.Fatalf("AddRowGroupTyped: %v", err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			r, err := NewReader(bytes.NewReader(buf.Bytes()))
+			if err != nil {
+				t.Fatalf("NewReader: %v", err)
+			}
+			out, err := r.ReadRowGroup(0, []int{0})
+			if err != nil {
+				t.Fatalf("ReadRowGroup: %v", err)
+			}
+			back := out[0]
+			if len(back) != len(vals) {
+				t.Fatalf("read %d values, wrote %d", len(back), len(vals))
+			}
+			for i := range vals {
+				got, ok := back[i].([]byte)
+				if !ok || !bytes.Equal(got, vals[i]) {
+					t.Fatalf("value %d: got %#v, want %#v", i, back[i], vals[i])
+				}
+			}
+		})
+	}
+}
+
+// TestTokenizedLayoutResults covers the pass's own gate: a column that is not
+// strings or bytes has no tokenized layouts, so the candidates that remain are
+// the ones the column can actually take.
+func TestTokenizedLayoutResults(t *testing.T) {
+	tok := registeredModel(t)
+	if got := tokenizedLayoutResults([]int64{1, 2}, TypeInt64, tok, &measureScratch{}, flateLevel); got != nil {
+		t.Errorf("an int64 column produced %d tokenized layouts, want none", len(got))
+	}
+	results := tokenizedLayoutResults(tokenizedCorpus(t), TypeString, tok, &measureScratch{}, flateLevel)
+	if len(results) != 9*len(layoutCodecs) {
+		t.Errorf("nine layouts over %d codecs gave %d results, want %d",
+			len(layoutCodecs), len(results), 9*len(layoutCodecs))
+	}
+	// Raw and Counts are the zero values of the two fields, so an unset layout and
+	// the first layout look alike; what distinguishes a measured result is that its
+	// pair is one of the nine that were run.
+	layouts := map[TokenizedLayout]bool{}
+	for _, rep := range []uint8{TokenizedRaw, TokenizedRemap, TokenizedBits} {
+		for _, bound := range []uint8{TokenizedCounts, TokenizedOffsets, TokenizedDeltas} {
+			layouts[TokenizedLayout{Rep: rep, Bound: bound}] = true
+		}
+	}
+	seen := map[TokenizedLayout]bool{}
+	for _, r := range results {
+		if r.Encoding != EncTokenized {
+			t.Errorf("a tokenized pass reported %s, want Tokenized", r.Name)
+		}
+		if !layouts[TokenizedLayout{Rep: r.Rep, Bound: r.Bound}] {
+			t.Errorf("a tokenized result reported an unset layout: %+v", r)
+		}
+		seen[TokenizedLayout{Rep: r.Rep, Bound: r.Bound}] = true
+	}
+	if len(seen) != 9 {
+		t.Errorf("the results cover %d of the nine layouts", len(seen))
+	}
+}
+
+// TestTokenizedHeader pins the header a file with a tokenizer writes: version 2,
+// one digest, then the chunks. The digest is the tokenizer's own hash, so a file
+// names the model that wrote it and nothing else.
+func TestTokenizedHeader(t *testing.T) {
+	tok := registeredModel(t)
+	b := tokenizedFile(t, []string{"hello", "world"}, tok, TokenizedLayout{})
+
+	if got := b[len(magic)]; got != tokenizedVersion {
+		t.Fatalf("version byte is %d, want %d", got, tokenizedVersion)
+	}
+	count := int(binary.LittleEndian.Uint32(b[len(magic)+1:]))
+	if count != 1 {
+		t.Fatalf("tokenizer table holds %d entries, want 1", count)
+	}
+	at := len(magic) + 5
+	var have [digestLen]byte
+	copy(have[:], b[at:at+digestLen])
+	if have != tok.Hash() {
+		t.Fatalf("the table holds %x, the model hashes to %x", have, tok.Hash())
+	}
+
+	// The table ends where the first chunk begins, and the reader that walks it
+	// lands on a chunk it can read. That is what makes the digest's position a
+	// length the file agrees with itself on.
+	r, err := NewReader(bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("NewReader on a file whose header the table ends: %v", err)
+	}
+	if len(r.toks) != 1 {
+		t.Fatalf("the reader resolved %d tokenizers, the table names 1", len(r.toks))
+	}
+}
+
+// TestTokenizedColumnsShareOneEntry covers the table's deduplication: two columns
+// through one model name one entry, so the digest is written once.
+func TestTokenizedColumnsShareOneEntry(t *testing.T) {
+	tok := registeredModel(t)
+	vals := []string{"one", "two", "three"}
+	schema := []ColumnSchema{
+		{Name: "a", Type: TypeString},
+		{Name: "b", Type: TypeString},
+	}
+	var buf bytes.Buffer
+	w := NewWriterWithOptions(&buf, schema, Options{
+		Compress:        CompressFlate,
+		Tokenizers:      map[int]*tokenizer.Model{0: tok, 1: tok},
+		TokenizedLayout: TokenizedLayout{},
+	})
+	if err := w.AddRowGroupTyped([]any{vals, vals}); err != nil {
+		t.Fatalf("AddRowGroupTyped: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	b := buf.Bytes()
+	count := int(binary.LittleEndian.Uint32(b[len(magic)+1:]))
+	if count != 1 {
+		t.Fatalf("two columns through one model named %d table entries, want 1", count)
+	}
+
+	r, err := NewReader(bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	out, err := r.ReadRowGroup(0, []int{0, 1})
+	if err != nil {
+		t.Fatalf("ReadRowGroup: %v", err)
+	}
+	for _, col := range out {
+		if len(col) != len(vals) {
+			t.Fatalf("read %d values, want %d", len(col), len(vals))
+		}
+		for i := range vals {
+			if s, ok := col[i].(string); !ok || s != vals[i] {
+				t.Fatalf("value %d: got %#v, want %q", i, col[i], vals[i])
+			}
+		}
+	}
+}
+
+// TestTokenizedWithoutTokenizerIsVersionOne pins what a file with no tokenized
+// column is: the same version the format always wrote. A reader built before
+// tokenized columns reads it, and so does this one.
+func TestTokenizedWithoutTokenizerIsVersionOne(t *testing.T) {
+	var buf bytes.Buffer
+	w := NewWriter(&buf, buildSchema())
+	if err := w.AddRowGroup(buildColumns(0)); err != nil {
+		t.Fatalf("AddRowGroup: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	b := buf.Bytes()
+	if got := b[len(magic)]; got != formatVersion {
+		t.Fatalf("a file with no tokenizer is version %d, want %d", got, formatVersion)
+	}
+
+	r, err := NewReader(bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("NewReader on a version 1 file: %v", err)
+	}
+	if _, err := r.ReadRowGroup(0, []int{0}); err != nil {
+		t.Fatalf("ReadRowGroup on a version 1 file: %v", err)
+	}
+}
+
+// TestTokenizedOptimize covers the pass a caller runs before the write: Tokenized
+// is measured beside every other candidate for a text column, and the one that
+// comes out smallest is what the file stores. The winner is not asserted, because
+// the point is that the pass measures the tokenizer's cost rather than assuming
+// it; what is asserted is that a column the pass chose reads back.
+func TestTokenizedOptimize(t *testing.T) {
+	tok := registeredModel(t)
+	vals := tokenizedCorpus(t)
+	schema := []ColumnSchema{{Name: "text", Type: TypeString}}
+
+	var buf bytes.Buffer
+	w := NewWriterWithOptions(&buf, schema, Options{
+		Compress:      CompressFlate,
+		CompressLevel: flateLevel,
+		Tokenizers:    map[int]*tokenizer.Model{0: tok},
+	})
+	if err := w.OptimizeTyped([]any{vals}); err != nil {
+		t.Fatalf("OptimizeTyped: %v", err)
+	}
+	if len(w.layouts) == 0 {
+		t.Fatal("OptimizeTyped left no layout")
+	}
+	for _, r := range w.layouts {
+		if r.Encoding == EncTokenized {
+			t.Logf("tokenized %s/%s: encoded %d, flate %d",
+				repName(r.Rep), boundName(r.Bound), r.EncodedSize, r.CompressedSize)
+		}
+	}
+	if err := w.AddRowGroupTyped([]any{vals}); err != nil {
+		t.Fatalf("AddRowGroupTyped: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	r, err := NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	out, err := r.ReadRowGroup(0, []int{0})
+	if err != nil {
+		t.Fatalf("ReadRowGroup: %v", err)
+	}
+	back := out[0]
+	if len(back) != len(vals) {
+		t.Fatalf("read %d values, wrote %d", len(back), len(vals))
+	}
+	for i := range vals {
+		if s, ok := back[i].(string); !ok || s != vals[i] {
+			t.Fatalf("value %d: got %#v, want %q", i, back[i], vals[i])
+		}
+	}
+}
+
+// TestOptimizePrefersTokenizedWhenItIsSmaller is the decision the pass exists to
+// make: on a column whose text compresses better as ids than as bytes, Tokenized
+// wins, and the file stores it as Tokenized.
+func TestOptimizePrefersTokenizedWhenItIsSmaller(t *testing.T) {
+	tok := registeredModel(t)
+	vals := tokenizedCorpus(t)
+	results := BenchmarkLayouts(boxedStrings(vals), ColumnSchema{Name: "text", Type: TypeString}, tok)
+	if len(results) == 0 {
+		t.Fatal("BenchmarkLayouts gave no candidates")
+	}
+	best := results[0]
+	for _, r := range results {
+		if r.Encoding == EncTokenized && r.CompressedSize == best.CompressedSize {
+			return
+		}
+	}
+	t.Errorf("the smallest layout is %s at %d bytes, and no tokenized layout matched it", best.Name, best.CompressedSize)
+}
+
+// TestTokenizedRejectsBadOptions covers the contracts a tokenized write makes
+// with its caller: a tokenizer for a column that does not exist is a mistake
+// worth reporting, a nil model is one, and so is an unknown layout.
+func TestTokenizedRejectsBadOptions(t *testing.T) {
+	tok := tokenizedModel(t)
+	schema := []ColumnSchema{{Name: "text", Type: TypeString}}
+
+	write := func(opts Options) error {
+		w := NewWriterWithOptions(io.Discard, schema, opts)
+		return w.AddRowGroupTyped([]any{[]string{"a"}})
+	}
+	if err := write(Options{Tokenizers: map[int]*tokenizer.Model{3: tok}}); err == nil {
+		t.Error("accepted a tokenizer for a column the schema does not have")
+	}
+	if err := write(Options{Tokenizers: map[int]*tokenizer.Model{0: nil}}); err == nil {
+		t.Error("accepted a nil tokenizer")
+	}
+	if err := write(Options{Tokenizers: map[int]*tokenizer.Model{0: tok}, TokenizedLayout: TokenizedLayout{Rep: 9}}); err == nil {
+		t.Error("accepted an unknown representation")
+	}
+	if err := write(Options{Tokenizers: map[int]*tokenizer.Model{0: tok}, TokenizedLayout: TokenizedLayout{Bound: 9}}); err == nil {
+		t.Error("accepted an unknown boundary")
+	}
+	// A tokenizer on a column the encoding cannot serve. A caller tokenizing an
+	// int64 column has asked for something the format does not do.
+	intSchema := []ColumnSchema{{Name: "n", Type: TypeInt64}}
+	w := NewWriterWithOptions(io.Discard, intSchema, Options{Tokenizers: map[int]*tokenizer.Model{0: tok}})
+	if err := w.AddRowGroupTyped([]any{[]int64{1, 2}}); err == nil {
+		t.Error("accepted a tokenizer on an int64 column")
+	}
+}
+
+// TestTokenizedRejectsUnresolvableHash covers what a reader does with a file
+// whose tokenizer it has not been given: report the hash, and read nothing.
+func TestTokenizedRejectsUnresolvableHash(t *testing.T) {
+	tok := tokenizedModel(t)
+	b := tokenizedFile(t, []string{"hello", "world"}, tok, TokenizedLayout{})
+
+	reg := tokenizer.NewRegistry()
+	if _, err := NewReaderWithRegistry(bytes.NewReader(b), reg); err == nil {
+		t.Error("read a file whose tokenizer the registry does not hold")
+	} else if !strings.Contains(err.Error(), "no model is registered") {
+		t.Errorf("the error does not name the missing model: %v", err)
+	}
+}
+
+// TestTokenizedRejectsBadFile covers a file whose header is not what either
+// version describes, and a tokenizer table that runs past the end of the file.
+func TestTokenizedRejectsBadFile(t *testing.T) {
+	tok := tokenizedModel(t)
+	b := tokenizedFile(t, []string{"hello", "world"}, tok, TokenizedLayout{})
+
+	// A version neither build writes.
+	other := append([]byte{}, b...)
+	other[len(magic)] = 9
+	if _, err := NewReader(bytes.NewReader(other)); err == nil {
+		t.Error("read a file whose version byte is 9")
+	}
+	// A table that claims more digests than the file holds.
+	big := append([]byte{}, b...)
+	binary.LittleEndian.PutUint32(big[len(magic)+1:], 4000000)
+	if _, err := NewReader(bytes.NewReader(big)); err == nil {
+		t.Error("read a file whose tokenizer table runs past the end")
+	}
+	// A table that claims one digest and stops short of it.
+	trunc := append([]byte{}, b[:len(magic)+5]...)
+	if _, err := NewReader(bytes.NewReader(trunc)); err == nil {
+		t.Error("read a file whose tokenizer table is truncated")
+	}
+	// A file that ends inside the count itself, so the table's length is the thing
+	// it cannot read. Eight bytes is the smallest a file can be and still get past
+	// the size check, and the other four are the footer the reader has not read yet.
+	cut := append([]byte{}, b[:len(magic)+4]...)
+	if _, err := NewReader(bytes.NewReader(cut)); err == nil {
+		t.Error("read a file whose tokenizer count is cut short")
+	}
+}
+
+// TestTokenizerFor covers the index a column's metadata names: zero names no
+// tokenizer, and an index outside the table names none either, because a file
+// that claims one is not read with a model guessed for it.
+func TestTokenizerFor(t *testing.T) {
+	tok := tokenizedModel(t)
+	rd := &Reader{toks: []*tokenizer.Model{tok}}
+	if got := rd.tokenizerFor(ColMeta{}); got != nil {
+		t.Error("a column naming no tokenizer got one")
+	}
+	if got := rd.tokenizerFor(ColMeta{Tokenizer: 1}); got != tok {
+		t.Error("a column naming tokenizer 1 did not get the table's first model")
+	}
+	for _, bad := range []int{-1, 2} {
+		if got := rd.tokenizerFor(ColMeta{Tokenizer: bad}); got != nil {
+			t.Errorf("a column naming tokenizer %d got a model", bad)
+		}
+	}
+}
+
+// TestTokenizerTable pins the table a writer builds: columns in schema order,
+// models shared by two columns named once, and a model a column does not use
+// absent from it.
+func TestTokenizerTable(t *testing.T) {
+	tok := tokenizedModel(t)
+	digests, of := tokenizerTable(3, map[int]*tokenizer.Model{2: tok, 0: tok})
+	if len(digests) != 1 {
+		t.Fatalf("two columns sharing a model built %d table entries, want 1", len(digests))
+	}
+	if digests[0] != tok.Hash() {
+		t.Fatalf("the table holds %x, the model hashes to %x", digests[0], tok.Hash())
+	}
+	if of[0] != 0 || of[2] != 0 {
+		t.Fatalf("columns 0 and 2 name entry %d and %d, both want 0", of[0], of[2])
+	}
+	if _, ok := of[1]; ok {
+		t.Error("column 1 has no tokenizer but the table gave it one")
+	}
 }
 
 // loadCorpusFile reads the length-prefixed record stream the tokenizer package
