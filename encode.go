@@ -1,4 +1,4 @@
-package keine
+package columns
 
 import (
 	"bytes"
@@ -115,14 +115,14 @@ func EncodePlain(vals any) ([]byte, error) {
 func encodePlainReflect(vals any) ([]byte, error) {
 	rv := reflect.ValueOf(vals)
 	if rv.Kind() != reflect.Slice {
-		return nil, fmt.Errorf("keine: plain encode expects a slice, got %T", vals)
+		return nil, fmt.Errorf("columns: plain encode expects a slice, got %T", vals)
 	}
 	var buf bytes.Buffer
 	for i := 0; i < rv.Len(); i++ {
 		v := rv.Index(i)
 		if v.Kind() == reflect.Interface {
 			if v.IsNil() {
-				return nil, fmt.Errorf("keine: plain encode cannot encode nil at index %d", i)
+				return nil, fmt.Errorf("columns: plain encode cannot encode nil at index %d", i)
 			}
 			v = v.Elem()
 		}
@@ -137,7 +137,7 @@ func encodePlainReflect(vals any) ([]byte, error) {
 			writeLengthPrefixed(&buf, v.String())
 		case reflect.Slice:
 			if v.Type().Elem().Kind() != reflect.Uint8 {
-				return nil, fmt.Errorf("keine: plain encode cannot encode %v", v.Type())
+				return nil, fmt.Errorf("columns: plain encode cannot encode %v", v.Type())
 			}
 			writeLengthPrefixed(&buf, string(v.Bytes()))
 		default:
@@ -214,7 +214,7 @@ func EncodeAffix(vals any) ([]byte, error) {
 		pre, suf := columnAffix(s)
 		return writeAffix(s, pre, suf), nil
 	default:
-		return nil, fmt.Errorf("keine: affix encodes string and bytes columns, got %T", vals)
+		return nil, fmt.Errorf("columns: affix encodes string and bytes columns, got %T", vals)
 	}
 }
 
@@ -375,7 +375,7 @@ func dictKeys(vals any) ([]string, int, error) {
 	// text the reader parses back.
 	rv := reflect.ValueOf(vals)
 	if rv.Kind() != reflect.Slice {
-		return nil, 0, fmt.Errorf("keine: dict encode expects a slice, got %T", vals)
+		return nil, 0, fmt.Errorf("columns: dict encode expects a slice, got %T", vals)
 	}
 	keys := make([]string, rv.Len())
 	for i := 0; i < rv.Len(); i++ {
@@ -388,11 +388,11 @@ func dictKeys(vals any) ([]string, int, error) {
 			keys[i] = v.String()
 		case reflect.Slice:
 			if v.Type().Elem().Kind() != reflect.Uint8 {
-				return nil, 0, fmt.Errorf("keine: dict cannot encode %v", v.Type())
+				return nil, 0, fmt.Errorf("columns: dict cannot encode %v", v.Type())
 			}
 			keys[i] = string(v.Bytes())
 		default:
-			return nil, 0, fmt.Errorf("keine: dict cannot encode %v", v.Type())
+			return nil, 0, fmt.Errorf("columns: dict cannot encode %v", v.Type())
 		}
 	}
 	return keys, rv.Len(), nil
@@ -448,7 +448,7 @@ func encodeWith(enc uint8, typed any, typ uint8) ([]byte, error) {
 	case EncRLEBitpack:
 		bools, ok := typed.([]bool)
 		if !ok {
-			return nil, fmt.Errorf("keine: rle bitpack encodes bool columns, got %T", typed)
+			return nil, fmt.Errorf("columns: rle bitpack encodes bool columns, got %T", typed)
 		}
 		return EncodeRLEBitpack(bools), nil
 	case EncDelta:
@@ -464,11 +464,11 @@ func encodeWith(enc uint8, typed any, typ uint8) ([]byte, error) {
 	case EncOffsetBytes:
 		raw, ok := typed.([][]byte)
 		if !ok {
-			return nil, fmt.Errorf("keine: offset bytes encodes bytes columns, got %T", typed)
+			return nil, fmt.Errorf("columns: offset bytes encodes bytes columns, got %T", typed)
 		}
 		return EncodeOffsetBytes(raw), nil
 	default:
-		return nil, fmt.Errorf("keine: unknown encoding %d", enc)
+		return nil, fmt.Errorf("columns: unknown encoding %d", enc)
 	}
 }
 
@@ -522,6 +522,6 @@ func toInt64s(typed any) ([]int64, error) {
 		}
 		return out, nil
 	default:
-		return nil, fmt.Errorf("keine: delta encodes integer columns, got %T", typed)
+		return nil, fmt.Errorf("columns: delta encodes integer columns, got %T", typed)
 	}
 }

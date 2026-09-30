@@ -1,3 +1,3 @@
-module github.com/everymemory/keine
+module github.com/everymemory/columns
 
 go 1.22.2

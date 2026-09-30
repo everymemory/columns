@@ -1,4 +1,4 @@
-package keine
+package columns
 
 import (
 	"bytes"
@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/everymemory/keine/tokenizer"
+	"github.com/everymemory/columns/tokenizer"
 )
 
 // benchColumn is one synthetic column used by the benchmarks.
@@ -81,7 +81,7 @@ var benchColumns = []benchColumn{
 		build: func(n int) []any {
 			col := make([]any, n)
 			for i := range col {
-				col[i] = fmt.Sprintf("id-%d-keine-suffix", i)
+				col[i] = fmt.Sprintf("id-%d-suffix", i)
 			}
 			return col
 		},

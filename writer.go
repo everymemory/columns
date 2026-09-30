@@ -1,4 +1,4 @@
-package keine
+package columns
 
 import (
 	"encoding/binary"
@@ -8,11 +8,11 @@ import (
 	"runtime"
 	"sync"
 
-	"github.com/everymemory/keine/tokenizer"
+	"github.com/everymemory/columns/tokenizer"
 )
 
 // magic is written at the start of a file and again after the footer length.
-const magic = "KEIN"
+const magic = "COLS"
 
 // The byte after the leading magic names the layout of everything that follows
 // it. A reader that sees another version refuses the file, so a change to the
@@ -36,7 +36,7 @@ const (
 // digestLen is the size of the SHA-256 a tokenizer is named by.
 const digestLen = 32
 
-// Writer accumulates row groups into a keine file. Chunks are large sequential
+// Writer accumulates row groups into a columns file. Chunks are large sequential
 // blocks, so writes go to w directly: buffering would only obscure which write
 // failed.
 type Writer struct {
@@ -133,26 +133,26 @@ func (o Options) validate() error {
 	switch o.Compress {
 	case CompressNone, CompressFlate, CompressGzip, CompressZlib, CompressLzw:
 	default:
-		return fmt.Errorf("keine: compression codec %d is not available in this build", o.Compress)
+		return fmt.Errorf("columns: compression codec %d is not available in this build", o.Compress)
 	}
 	switch o.Encoding {
 	case 0, EncPlain, EncRLEBitpack, EncDelta, EncDict, EncOffsetBytes, EncAffix:
 	default:
-		return fmt.Errorf("keine: unknown encoding %d", o.Encoding)
+		return fmt.Errorf("columns: unknown encoding %d", o.Encoding)
 	}
 	switch o.TokenizedLayout.Rep {
 	case TokenizedRaw, TokenizedRemap, TokenizedBits:
 	default:
-		return fmt.Errorf("keine: tokenized representation %d is not one this build writes", o.TokenizedLayout.Rep)
+		return fmt.Errorf("columns: tokenized representation %d is not one this build writes", o.TokenizedLayout.Rep)
 	}
 	switch o.TokenizedLayout.Bound {
 	case TokenizedCounts, TokenizedOffsets, TokenizedDeltas:
 	default:
-		return fmt.Errorf("keine: tokenized boundary %d is not one this build writes", o.TokenizedLayout.Bound)
+		return fmt.Errorf("columns: tokenized boundary %d is not one this build writes", o.TokenizedLayout.Bound)
 	}
 	for i, tok := range o.Tokenizers {
 		if tok == nil {
-			return fmt.Errorf("keine: tokenizer for column %d is nil", i)
+			return fmt.Errorf("columns: tokenizer for column %d is nil", i)
 		}
 	}
 	return nil
@@ -179,7 +179,7 @@ func NewWriterWithOptions(w io.Writer, schema []ColumnSchema, opts Options) *Wri
 	}
 	for i := range opts.Tokenizers {
 		if i < 0 || i >= len(schema) {
-			wr.writeErr = fmt.Errorf("keine: tokenizer for column %d, schema has %d columns", i, len(schema))
+			wr.writeErr = fmt.Errorf("columns: tokenizer for column %d, schema has %d columns", i, len(schema))
 			return wr
 		}
 	}
@@ -324,12 +324,12 @@ func (w *Writer) measureLayouts(typed []any) error {
 // has nowhere to return one.
 func (w *Writer) checkTypedColumns(columns []any) (uint32, error) {
 	if len(columns) != len(w.schema) {
-		return 0, fmt.Errorf("keine: expected %d columns, got %d", len(w.schema), len(columns))
+		return 0, fmt.Errorf("columns: expected %d columns, got %d", len(w.schema), len(columns))
 	}
 	numRows := uint32(0)
 	for i, col := range columns {
 		if w.schema[i].Nullable {
-			return 0, fmt.Errorf("keine: column %d (%s) is nullable; use AddRowGroup for a column with nulls", i, w.schema[i].Name)
+			return 0, fmt.Errorf("columns: column %d (%s) is nullable; use AddRowGroup for a column with nulls", i, w.schema[i].Name)
 		}
 		if !typedColumn(w.schema[i].Type, col) {
 			return 0, typedColumnErr(i, w.schema[i], col)
@@ -340,7 +340,7 @@ func (w *Writer) checkTypedColumns(columns []any) (uint32, error) {
 			continue
 		}
 		if n != numRows {
-			return 0, fmt.Errorf("keine: column %d has %d rows, expected %d", i, n, numRows)
+			return 0, fmt.Errorf("columns: column %d has %d rows, expected %d", i, n, numRows)
 		}
 	}
 	return numRows, nil
@@ -352,9 +352,9 @@ func (w *Writer) checkTypedColumns(columns []any) (uint32, error) {
 func typedColumnErr(i int, schema ColumnSchema, col any) error {
 	want, ok := goType[schema.Type]
 	if !ok {
-		return fmt.Errorf("keine: column %d (%s) has unknown type %d", i, schema.Name, schema.Type)
+		return fmt.Errorf("columns: column %d (%s) has unknown type %d", i, schema.Name, schema.Type)
 	}
-	return fmt.Errorf("keine: column %d (%s) is %v, want %v", i, schema.Name, reflect.TypeOf(col), want)
+	return fmt.Errorf("columns: column %d (%s) is %v, want %v", i, schema.Name, reflect.TypeOf(col), want)
 }
 
 // checkColumns reports whether columns has one slice per schema column and one
@@ -362,7 +362,7 @@ func typedColumnErr(i int, schema ColumnSchema, col any) error {
 // read any value.
 func (w *Writer) checkColumns(columns [][]any) error {
 	if len(columns) != len(w.schema) {
-		return fmt.Errorf("keine: expected %d columns, got %d", len(w.schema), len(columns))
+		return fmt.Errorf("columns: expected %d columns, got %d", len(w.schema), len(columns))
 	}
 	numRows := uint32(0)
 	if len(columns) > 0 {
@@ -370,7 +370,7 @@ func (w *Writer) checkColumns(columns [][]any) error {
 	}
 	for i, col := range columns {
 		if uint32(len(col)) != numRows {
-			return fmt.Errorf("keine: column %d has %d rows, expected %d", i, len(col), numRows)
+			return fmt.Errorf("columns: column %d has %d rows, expected %d", i, len(col), numRows)
 		}
 	}
 	return nil
@@ -412,7 +412,7 @@ func (w *Writer) collect(columns [][]any) ([]any, []ColMeta, [][]byte, error) {
 		}
 		t, err := canonicalColumnTyped(dense, schema.Type)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("keine: collecting stats for column %d (%s): %w", i, schema.Name, err)
+			return nil, nil, nil, fmt.Errorf("columns: collecting stats for column %d (%s): %w", i, schema.Name, err)
 		}
 		fillStatsTyped(&meta, t)
 
@@ -517,7 +517,7 @@ func (w *Writer) writeRowGroup(numRows uint32, typed []any, metas []ColMeta, bit
 
 		cw := &countingWriter{w: w.w}
 		if err := WriteChunk(cw, chunk); err != nil {
-			return fmt.Errorf("keine: writing column %d (%s): %w", i, w.schema[i].Name, err)
+			return fmt.Errorf("columns: writing column %d (%s): %w", i, w.schema[i].Name, err)
 		}
 		w.offset += cw.count
 
@@ -589,7 +589,7 @@ func encodeColumns(typed []any, schema []ColumnSchema, layouts []LayoutResult, o
 	// first.
 	for i, err := range errs {
 		if err != nil {
-			return nil, fmt.Errorf("keine: encoding column %d (%s): %w", i, schema[i].Name, err)
+			return nil, fmt.Errorf("columns: encoding column %d (%s): %w", i, schema[i].Name, err)
 		}
 	}
 	return chunks, nil

@@ -1,7 +1,7 @@
 // Per-column statistics: the min and max a column's values imply, and its
 // null count, recorded in ColMeta while a row group is written.
 
-package keine
+package columns
 
 import (
 	"bytes"

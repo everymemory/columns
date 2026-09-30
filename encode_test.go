@@ -1,6 +1,6 @@
 // Encoder bounds and dispatch.
 
-package keine
+package columns
 
 import (
 	"reflect"
@@ -68,12 +68,12 @@ func TestSharedAffixBounds(t *testing.T) {
 		a, b         string
 		prefix, suff int
 	}{
-		{"identical", "keine", "keine", 5, 5},
+		{"identical", "table", "table", 5, 5},
 		{"nothing shared", "abc", "xyz", 0, 0},
 		{"prefix only", "prefix-suffix", "prefix-other", 7, 0},
 		{"suffix only", "one-suffix", "two-suffix", 0, 7},
-		{"first shorter", "keine", "keine-longer", 5, 0},
-		{"second shorter", "longer-keine", "keine", 0, 5},
+		{"first shorter", "table", "table-longer", 5, 0},
+		{"second shorter", "longer-table", "table", 0, 5},
 	} {
 		if got := sharedPrefix(tc.a, tc.b); got != tc.prefix {
 			t.Errorf("%s: sharedPrefix(%q, %q) = %d, want %d", tc.name, tc.a, tc.b, got, tc.prefix)

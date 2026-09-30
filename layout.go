@@ -1,4 +1,4 @@
-package keine
+package columns
 
 import (
 	"fmt"
@@ -6,7 +6,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/everymemory/keine/tokenizer"
+	"github.com/everymemory/columns/tokenizer"
 )
 
 // LayoutResult is the measured outcome of encoding one column with a single

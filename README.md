@@ -1,6 +1,7 @@
-# keine
+# columns
 
-keine is a columnar file format library for Go with no dependencies outside the
+`columns` is a columnar file format library for Go, built by
+[everymemory](https://github.com/everymemory). It has no dependencies outside the
 standard library.
 
 A file is a sequence of row groups. Each row group stores its columns as separate
@@ -12,7 +13,7 @@ to.
 ## File layout
 
 ```
-"KEIN"
+"COLS"
 format version     1 byte
 tokenizer count    uint32, little-endian, version 2 only
 tokenizer digests  32 bytes each, version 2 only
@@ -24,7 +25,7 @@ row group 1
     ...
 footer
 footer length      uint32, little-endian
-"KEIN"
+"COLS"
 ```
 
 Version 1 omits the count and the digests, which is what a file with no tokenized
@@ -181,20 +182,20 @@ guess the values did not get to answer.
 ## Usage
 
 ```go
-schema := []keine.ColumnSchema{
-    {Name: "id", Type: keine.TypeInt64},
-    {Name: "email", Type: keine.TypeString, Nullable: true},
+schema := []columns.ColumnSchema{
+    {Name: "id", Type: columns.TypeInt64},
+    {Name: "email", Type: columns.TypeString, Nullable: true},
 }
 
 var buf bytes.Buffer
-w := keine.NewWriter(&buf, schema)
+w := columns.NewWriter(&buf, schema)
 w.AddRowGroup([][]any{
     {int64(1), int64(2), int64(3)},
     {"a@example.com", nil, "c@example.com"},
 })
 w.Close()
 
-r, _ := keine.NewReader(bytes.NewReader(buf.Bytes()))
+r, _ := columns.NewReader(bytes.NewReader(buf.Bytes()))
 cols, _ := r.ReadRowGroup(0, []int{1}) // email only; id is never read
 ```
 
@@ -202,8 +203,8 @@ The columns above are stored the way their type implies. Scanning the data first
 chooses the layout from the values instead:
 
 ```go
-w := keine.NewWriterWithOptions(&buf, schema, keine.Options{
-    Compress:      keine.CompressFlate,
+w := columns.NewWriterWithOptions(&buf, schema, columns.Options{
+    Compress:      columns.CompressFlate,
     CompressLevel: 6,
 })
 w.Optimize([][]any{
@@ -231,7 +232,7 @@ When the column holds no nulls, `ReadColumn` reads it into a typed slice instead
 which avoids boxing every value in an interface:
 
 ```go
-ids, _ := keine.ReadColumn[int64](r, 0, 0)
+ids, _ := columns.ReadColumn[int64](r, 0, 0)
 ```
 
 `T` is the Go type for the column, `int64` for `TypeInt64`, `string` for
@@ -262,8 +263,8 @@ for its next read, so after the first one a row group costs almost no
 allocation:
 
 ```go
-r.ReadRowGroupScoped(0, []int{0}, func(c *keine.Columns) error {
-    ids, _ := keine.Column[int64](c, 0)
+r.ReadRowGroupScoped(0, []int{0}, func(c *columns.Columns) error {
+    ids, _ := columns.Column[int64](c, 0)
     // ids is valid until this returns
     return nil
 })
@@ -286,7 +287,7 @@ if err := tokenizer.Register(tok); err != nil {
     return err
 }
 
-w := keine.NewWriterWithOptions(&buf, schema, keine.Options{
+w := columns.NewWriterWithOptions(&buf, schema, columns.Options{
     Tokenizers: map[int]*tokenizer.Model{1: tok},
 })
 ```
@@ -312,7 +313,7 @@ tokenizer by.
 
 ## Status
 
-v0.2.0. The format is stable enough to write and read real data, but it is not a
+v0.3.0. The format is stable enough to write and read real data, but it is not a
 production storage engine. There is no schema evolution, no concurrency control,
 and no way to append to an existing file. Round-trip tests cover every type,
 encoding and codec, columns long enough to span several blocks, the default
@@ -324,6 +325,11 @@ The byte after the leading magic is the format version. A reader that meets
 another version refuses the file rather than misreading it, so a layout change is
 a clean break. Files written by v0.1.0 have no version byte and will be refused.
 This build reads versions 1 and 2, and writes 2 only when a column is tokenized.
+
+v0.3.0 retires the `KEIN` magic for `COLS`, so a reader from this version refuses
+every file an earlier one wrote. The layout beyond the magic is unchanged; the
+break is deliberate, since a file that cannot identify its writer is a file a
+reader cannot be careful about.
 
 ## Benchmarks
 
@@ -409,13 +415,13 @@ On 200000 rows in 5 columns:
 
 | | bytes/row | write | read all | read 1 column |
 | --- | --- | --- | --- | --- |
-| keine | 15.56 | 33 ms | 9.5 ms (scoped) | 0.8 ms |
+| columns | 15.56 | 33 ms | 9.5 ms (scoped) | 0.8 ms |
 | parquet zstd | 19.57 | 114 ms | 14 ms | 5.4 ms |
 | parquet snappy | 28.66 | 98 ms | 15 ms | 5.9 ms |
 | parquet none | 54.98 | 96 ms | 15 ms | 2.3 ms |
 
 `read all` for parquet is `ParquetFile.read`, which returns an Arrow table of
-typed columnar buffers and never boxes a value. The fair keine counterpart is
+typed columnar buffers and never boxes a value. The fair columns counterpart is
 the scoped read, which hands back typed slices the same way; that is the 9.5 ms
 above, and it is faster than parquet's 14. The boxed read is a different
 contract: it returns owned values in interfaces, which costs 16 bytes a value
@@ -423,44 +429,44 @@ before any decoding, and no `[]any` return can go below that. It measures about
 24 ms and is not in the table, because it is not the same operation parquet is
 doing.
 
-keine's row is the default write, the one that stores each column the way its
+The columns row is the default write, the one that stores each column the way its
 type implies. An `Optimize`d write of the same values is 14.55 bytes/row, smaller
 than every parquet row here, and it costs 7.1 s rather than 33 ms: the pass reads
 every value and measures every candidate at the codec's best level, and the
 default is what the table reports because most callers do not want to pay that.
 
-keine is smaller than parquet at every compression level, three times faster to
+columns is smaller than parquet at every compression level, three times faster to
 write at every one of them, and four times faster reading a single column. The
 `parquet zstd` row is pyarrow's default, which is zstd level 1; turning it up on
 this table does not close the size gap either, since level 19 writes 15.80 bytes
-per row against keine's 15.56 and costs 3.1 s to do it. Real data does not behave
+per row against columns' 15.56 and costs 3.1 s to do it. Real data does not behave
 this way, and the shard below says which way.
 
 Where parquet still leads is not in the numbers above. It has nested types, a
-stable ecosystem, and readers in every language. keine has none of that, and the
+stable ecosystem, and readers in every language. columns has none of that, and the
 read gap this table used to show is closed only because the scoped read now
 exists to compare against Arrow's buffers rather than against a boxed `[]any`.
 
 The table is synthetic data, so the real thing is worth a look. One monthly shard
 of `open-index/hacker-news` on HF, 255218 rows, was fed through both formats,
 taking the thirteen scalar columns and leaving the three list ones out, since
-keine has no nested type. This is the subset the format can express rather than a
+columns has no nested type. This is the subset the format can express rather than a
 claim about the table:
 
 | | bytes/row | write | read all |
 | --- | --- | --- | --- |
-| keine | 160.23 | 310 ms | 140 ms (scoped) |
+| columns | 160.23 | 310 ms | 140 ms (scoped) |
 | parquet zstd | 166.74 | 936 ms | 242 ms |
 | parquet snappy | 236.64 | 742 ms | 306 ms |
 | parquet none | 380.95 | 861 ms | 114 ms |
 
 `parquet zstd` above is pyarrow's default, which asks zstd for level 1, the
-weakest of its levels, and the only one keine outsizes. Turning it up costs
+weakest of its levels, and the only one columns outsizes. Turning it up costs
 parquet write time and buys file size, at a rate the next table shows:
 
 | | bytes/row | write | read all |
 | --- | --- | --- | --- |
-| keine | 160.23 | 310 ms | 140 ms (scoped) |
+| columns | 160.23 | 310 ms | 140 ms (scoped) |
 | parquet zstd 1 | 166.74 | 885 ms | 223 ms |
 | parquet zstd 3 | 144.77 | 1314 ms | 278 ms |
 | parquet zstd 6 | 137.07 | 2950 ms | 273 ms |
@@ -470,7 +476,7 @@ parquet write time and buys file size, at a rate the next table shows:
 Real data keeps the write and read conclusions the synthetic data reached. This
 file is mostly one text column of HTML comment bodies, 86 MB of the 108 MB encoded,
 which flate turns into 36 MB, and the rest is thirteen million integers and a few
-short strings. keine writes three times faster than parquet's default and reads
+short strings. columns writes three times faster than parquet's default and reads
 faster scoped at every zstd level, because zstd's decompression cost barely rises
 with the level while flate's is already spread across blocks. The size conclusion
 does not survive the comparison: from level 3 up parquet is the smaller file, by
@@ -494,14 +500,14 @@ Storing the text column as ids, measured on the same 255218 rows, with the
 
 | | bytes/row | pass | write | read all |
 | --- | --- | --- | --- | --- |
-| keine flate 3 | 160.23 | — | 315 ms | 144 ms (scoped) |
-| keine flate 3, text tokenized | 129.52 | — | 49.0 s | 1.17 s (scoped) |
-| keine flate 9 | 147.43 | — | 1.51 s | 133 ms (scoped) |
-| keine flate 9, text tokenized | 121.33 | — | 49.6 s | 1.08 s (scoped) |
-| keine flate 9, optimized | 144.75 | 32.7 s | 1.06 s | 153 ms (scoped) |
-| keine flate 9, optimized, text tokenized | 108.90 | 166 s | 51.9 s | 1.26 s (scoped) |
-| keine flate 3, optimized | 157.05 | 18.7 s | 315 ms | 140 ms (scoped) |
-| keine flate 3, optimized, text tokenized | 113.06 | 136 s | 52.3 s | 1.29 s (scoped) |
+| columns flate 3 | 160.23 | — | 315 ms | 144 ms (scoped) |
+| columns flate 3, text tokenized | 129.52 | — | 49.0 s | 1.17 s (scoped) |
+| columns flate 9 | 147.43 | — | 1.51 s | 133 ms (scoped) |
+| columns flate 9, text tokenized | 121.33 | — | 49.6 s | 1.08 s (scoped) |
+| columns flate 9, optimized | 144.75 | 32.7 s | 1.06 s | 153 ms (scoped) |
+| columns flate 9, optimized, text tokenized | 108.90 | 166 s | 51.9 s | 1.26 s (scoped) |
+| columns flate 3, optimized | 157.05 | 18.7 s | 315 ms | 140 ms (scoped) |
+| columns flate 3, optimized, text tokenized | 113.06 | 136 s | 52.3 s | 1.29 s (scoped) |
 | parquet zstd 19 | 122.31 | — | 39.4 s | 258 ms |
 
 `Optimize` measures every candidate at `OptimizeLevel` and writes every later row
@@ -623,11 +629,11 @@ layouts at that level, and the encoding it reports is the one the file gets.
 `OptimizeLevel` sets it, and `CompressLevel` sets the level of every row group
 written without a pass.
 
-Parquet pays nothing to choose a layout: its encodings are compiled in. A keine
+Parquet pays nothing to choose a layout: its encodings are compiled in. A columns
 write that has not been Optimized pays the same nothing, because the layout comes
 from the type. The 33 ms above is encoding and compressing the five columns and
 nothing else, which is what buys the size advantage over a format with a better
-compressor: keine has a worse one and spends the time it saved on not measuring.
+compressor: columns has a worse one and spends the time it saved on not measuring.
 
 `Optimize` trades that back. Its 7.2 s is a full encode and compress pass per
 candidate per column, thirty-six measurements on this file, each one now at the
@@ -679,7 +685,7 @@ With the allocations gone, DEFLATE is what a scoped read is: about 60% of its 12
 The remainder is decoding and the parallel machinery around it.
 
 That 12ms is what parquet's typed read takes 15ms to do on the same values, which
-is the point the codec argument reaches: keine is slower at decompressing and
+is the point the codec argument reaches: columns is slower at decompressing and
 still finishes first, because it decompresses less and does it across more cores.
 The gap that remains is not a codec gap but a contract one: the boxed read below
 costs its interface headers, and no `[]any` return can avoid them.

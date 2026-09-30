@@ -1,4 +1,4 @@
-package keine
+package columns
 
 import (
 	"bytes"
@@ -237,7 +237,7 @@ func TestBenchmarkLayouts(t *testing.T) {
 	// encoding only adds index overhead and cannot be the best layout.
 	strCol := make([]any, n)
 	for i := range strCol {
-		strCol[i] = fmt.Sprintf("id-%d-keine-common-suffix", i)
+		strCol[i] = fmt.Sprintf("id-%d-suffix", i)
 	}
 	strResults := BenchmarkLayouts(strCol, ColumnSchema{Name: "s", Type: TypeString}, nil)
 	if len(strResults) == 0 {
@@ -1147,7 +1147,7 @@ func TestReadRowGroupScoped(t *testing.T) {
 
 	// The caller's error reaches the caller, and the read it came from is not
 	// silent about it.
-	want := errors.New("keine test: stop early")
+	want := errors.New("columns test: stop early")
 	if got := r.ReadRowGroupScoped(0, []int{0}, func(c *Columns) error {
 		return want
 	}); !errors.Is(got, want) {

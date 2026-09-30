@@ -1,4 +1,4 @@
-package keine
+package columns
 
 import (
 	"encoding/binary"
@@ -7,10 +7,10 @@ import (
 	"runtime"
 	"sync"
 
-	"github.com/everymemory/keine/tokenizer"
+	"github.com/everymemory/columns/tokenizer"
 )
 
-// Reader reads a keine file written by Writer.
+// Reader reads a columns file written by Writer.
 type Reader struct {
 	r      io.ReadSeeker
 	footer Footer
@@ -60,14 +60,14 @@ func NewReaderWithRegistry(r io.ReadSeeker, reg *tokenizer.Registry) (*Reader, e
 
 	end, err := r.Seek(0, io.SeekEnd)
 	if err != nil {
-		return nil, fmt.Errorf("keine: cannot seek to end of file: %w", err)
+		return nil, fmt.Errorf("columns: cannot seek to end of file: %w", err)
 	}
 	if end < 8 {
-		return nil, fmt.Errorf("keine: file is %d bytes, too small to contain a footer", end)
+		return nil, fmt.Errorf("columns: file is %d bytes, too small to contain a footer", end)
 	}
 
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("keine: cannot seek to start of file: %w", err)
+		return nil, fmt.Errorf("columns: cannot seek to start of file: %w", err)
 	}
 	toks, err := readTokenizers(r, reg)
 	if err != nil {
@@ -76,35 +76,35 @@ func NewReaderWithRegistry(r io.ReadSeeker, reg *tokenizer.Registry) (*Reader, e
 	rd.toks = toks
 
 	if _, err := r.Seek(end-8, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("keine: cannot seek to footer: %w", err)
+		return nil, fmt.Errorf("columns: cannot seek to footer: %w", err)
 	}
 
 	footerLen, err := readUint32(r)
 	if err != nil {
-		return nil, fmt.Errorf("keine: cannot read footer length: %w", err)
+		return nil, fmt.Errorf("columns: cannot read footer length: %w", err)
 	}
 	trailer := make([]byte, 4)
 	if _, err := io.ReadFull(r, trailer); err != nil {
-		return nil, fmt.Errorf("keine: cannot read trailing magic: %w", err)
+		return nil, fmt.Errorf("columns: cannot read trailing magic: %w", err)
 	}
 	if string(trailer) != magic {
-		return nil, fmt.Errorf("keine: trailing magic %q is not %q", trailer, magic)
+		return nil, fmt.Errorf("columns: trailing magic %q is not %q", trailer, magic)
 	}
 
 	if int64(footerLen) > end-8 {
-		return nil, fmt.Errorf("keine: footer length %d exceeds file size", footerLen)
+		return nil, fmt.Errorf("columns: footer length %d exceeds file size", footerLen)
 	}
 	if _, err := r.Seek(end-8-int64(footerLen), io.SeekStart); err != nil {
-		return nil, fmt.Errorf("keine: cannot seek to footer: %w", err)
+		return nil, fmt.Errorf("columns: cannot seek to footer: %w", err)
 	}
 	footerBytes := make([]byte, footerLen)
 	if _, err := io.ReadFull(r, footerBytes); err != nil {
-		return nil, fmt.Errorf("keine: cannot read footer: %w", err)
+		return nil, fmt.Errorf("columns: cannot read footer: %w", err)
 	}
 
 	footer, err := decodeFooter(footerBytes)
 	if err != nil {
-		return nil, fmt.Errorf("keine: cannot decode footer: %w", err)
+		return nil, fmt.Errorf("columns: cannot decode footer: %w", err)
 	}
 	rd.footer = footer
 	return rd, nil
@@ -122,10 +122,10 @@ func NewReaderWithRegistry(r io.ReadSeeker, reg *tokenizer.Registry) (*Reader, e
 func readTokenizers(r io.ReadSeeker, reg *tokenizer.Registry) ([]*tokenizer.Model, error) {
 	lead := make([]byte, len(magic)+1)
 	if _, err := io.ReadFull(r, lead); err != nil {
-		return nil, fmt.Errorf("keine: cannot read the leading magic: %w", err)
+		return nil, fmt.Errorf("columns: cannot read the leading magic: %w", err)
 	}
 	if string(lead[:len(magic)]) != magic {
-		return nil, fmt.Errorf("keine: leading magic %q is not %q", lead[:len(magic)], magic)
+		return nil, fmt.Errorf("columns: leading magic %q is not %q", lead[:len(magic)], magic)
 	}
 	version := lead[len(magic)]
 	switch version {
@@ -133,16 +133,16 @@ func readTokenizers(r io.ReadSeeker, reg *tokenizer.Registry) ([]*tokenizer.Mode
 		return nil, nil
 	case tokenizedVersion:
 	default:
-		return nil, fmt.Errorf("keine: file is format version %d, this build reads versions %d and %d", version, formatVersion, tokenizedVersion)
+		return nil, fmt.Errorf("columns: file is format version %d, this build reads versions %d and %d", version, formatVersion, tokenizedVersion)
 	}
 
 	var count uint32
 	if err := binary.Read(r, binary.LittleEndian, &count); err != nil {
-		return nil, fmt.Errorf("keine: cannot read the tokenizer count: %w", err)
+		return nil, fmt.Errorf("columns: cannot read the tokenizer count: %w", err)
 	}
 	buf := make([]byte, digestLen*int(count))
 	if _, err := io.ReadFull(r, buf); err != nil {
-		return nil, fmt.Errorf("keine: cannot read the tokenizer table: %w", err)
+		return nil, fmt.Errorf("columns: cannot read the tokenizer table: %w", err)
 	}
 	table := make([][digestLen]byte, count)
 	for i := range table {
@@ -152,7 +152,7 @@ func readTokenizers(r io.ReadSeeker, reg *tokenizer.Registry) ([]*tokenizer.Mode
 	for i, h := range table {
 		m, ok := reg.Lookup(h)
 		if !ok {
-			return nil, fmt.Errorf("keine: tokenizer %d is %x, and no model is registered for it", i, h[:])
+			return nil, fmt.Errorf("columns: tokenizer %d is %x, and no model is registered for it", i, h[:])
 		}
 		toks[i] = m
 	}
@@ -185,7 +185,7 @@ func (rd *Reader) RowGroupCount() int {
 // to read.
 func (rd *Reader) RowGroupMeta(index int) (RowGroupMeta, error) {
 	if index < 0 || index >= len(rd.footer.RowGroups) {
-		return RowGroupMeta{}, fmt.Errorf("keine: row group %d out of range (have %d)", index, len(rd.footer.RowGroups))
+		return RowGroupMeta{}, fmt.Errorf("columns: row group %d out of range (have %d)", index, len(rd.footer.RowGroups))
 	}
 	return rd.footer.RowGroups[index], nil
 }
@@ -202,7 +202,7 @@ func (rd *Reader) ReadRowGroup(index int, colIndexes []int) ([][]any, error) {
 	out := make([][]any, len(colIndexes))
 	for _, ci := range colIndexes {
 		if ci < 0 || ci >= len(rg.Columns) {
-			return nil, fmt.Errorf("keine: column index %d out of range (have %d)", ci, len(rg.Columns))
+			return nil, fmt.Errorf("columns: column index %d out of range (have %d)", ci, len(rg.Columns))
 		}
 	}
 
@@ -253,10 +253,10 @@ func (rd *Reader) ReadRowGroupScoped(index int, cols []int, fn func(*Columns) er
 	}
 	for _, ci := range cols {
 		if ci < 0 || ci >= len(rg.Columns) {
-			return fmt.Errorf("keine: column index %d out of range (have %d)", ci, len(rg.Columns))
+			return fmt.Errorf("columns: column index %d out of range (have %d)", ci, len(rg.Columns))
 		}
 		if rg.Columns[ci].NullCount > 0 {
-			return fmt.Errorf("keine: column %d (%s) has %d null values; the scoped path returns typed slices, which have nowhere for a nil, so ReadRowGroup reads those",
+			return fmt.Errorf("columns: column %d (%s) has %d null values; the scoped path returns typed slices, which have nowhere for a nil, so ReadRowGroup reads those",
 				ci, rd.footer.Schema[ci].Name, rg.Columns[ci].NullCount)
 		}
 	}
@@ -294,7 +294,7 @@ type Columns struct {
 // that width produces one slice the caller owns.
 func Column[T any](c *Columns, i int) ([]T, error) {
 	if i < 0 || i >= len(c.typed) {
-		return nil, fmt.Errorf("keine: column %d out of range (requested %d)", i, len(c.typed))
+		return nil, fmt.Errorf("columns: column %d out of range (requested %d)", i, len(c.typed))
 	}
 	if c.errs[i] != nil {
 		return nil, c.errs[i]
@@ -310,7 +310,7 @@ func Column[T any](c *Columns, i int) ([]T, error) {
 		for k, v := range vals {
 			tv, ok := v.(T)
 			if !ok {
-				return nil, fmt.Errorf("keine: column %d (%s) narrows to %T, not %T",
+				return nil, fmt.Errorf("columns: column %d (%s) narrows to %T, not %T",
 					i, c.rd.footer.Schema[c.cols[i]].Name, v, *new(T))
 			}
 			out[k] = tv
@@ -320,7 +320,7 @@ func Column[T any](c *Columns, i int) ([]T, error) {
 
 	out, ok := t.([]T)
 	if !ok {
-		return nil, fmt.Errorf("keine: column %d (%s) decodes to %T, not %T",
+		return nil, fmt.Errorf("columns: column %d (%s) decodes to %T, not %T",
 			i, c.rd.footer.Schema[c.cols[i]].Name, t, *new(T))
 	}
 	return out, nil
@@ -424,7 +424,7 @@ func (rd *Reader) decodeJobs(jobs []readJob, dests []*dest) ([]any, []error) {
 
 			for k, err := range blockErrs {
 				if err != nil {
-					errs[i] = fmt.Errorf("keine: decompressing column %d (%s), block %d: %w", j.ci, sch.Name, k, err)
+					errs[i] = fmt.Errorf("columns: decompressing column %d (%s), block %d: %w", j.ci, sch.Name, k, err)
 					rd.rawbufs[i] = raw[:0]
 					return
 				}
@@ -439,7 +439,7 @@ func (rd *Reader) decodeJobs(jobs []readJob, dests []*dest) ([]any, []error) {
 			defer func() { <-sem }()
 			t, err := decodeTyped(j.chunk.Encoding, raw, numValues, sch.Type, dests[i], rd.tokenizerFor(meta))
 			if err != nil {
-				errs[i] = fmt.Errorf("keine: decoding column %d (%s): %w", j.ci, sch.Name, err)
+				errs[i] = fmt.Errorf("columns: decoding column %d (%s): %w", j.ci, sch.Name, err)
 				rd.rawbufs[i] = raw[:0]
 				return
 			}
@@ -462,10 +462,10 @@ func ReadColumn[T any](rd *Reader, index, col int) ([]T, error) {
 		return nil, err
 	}
 	if col < 0 || col >= len(rg.Columns) {
-		return nil, fmt.Errorf("keine: column index %d out of range (have %d)", col, len(rg.Columns))
+		return nil, fmt.Errorf("columns: column index %d out of range (have %d)", col, len(rg.Columns))
 	}
 	if rg.Columns[col].NullCount > 0 {
-		return nil, fmt.Errorf("keine: column %d (%s) has %d null values; ReadRowGroup reads those",
+		return nil, fmt.Errorf("columns: column %d (%s) has %d null values; ReadRowGroup reads those",
 			col, rd.footer.Schema[col].Name, rg.Columns[col].NullCount)
 	}
 
@@ -479,7 +479,7 @@ func ReadColumn[T any](rd *Reader, index, col int) ([]T, error) {
 	if encProducesType(enc, typ) {
 		out, ok := asValues[T](typed)
 		if !ok {
-			return nil, fmt.Errorf("keine: column %d (%s) decodes to %T, not %T",
+			return nil, fmt.Errorf("columns: column %d (%s) decodes to %T, not %T",
 				col, rd.footer.Schema[col].Name, typed, *new(T))
 		}
 		return out, nil
@@ -496,7 +496,7 @@ func ReadColumn[T any](rd *Reader, index, col int) ([]T, error) {
 	for i, v := range vals {
 		t, ok := v.(T)
 		if !ok {
-			return nil, fmt.Errorf("keine: column %d (%s) narrows to %T, not %T",
+			return nil, fmt.Errorf("columns: column %d (%s) narrows to %T, not %T",
 				col, rd.footer.Schema[col].Name, v, *new(T))
 		}
 		out[i] = t
@@ -536,12 +536,12 @@ func (rd *Reader) readColumn(start int64, rg RowGroupMeta, ci int) (typed any, n
 	}
 	chunk, err := rd.readChunk(start, rd.chunkbuf)
 	if err != nil {
-		return nil, nil, fmt.Errorf("keine: reading column %d (%s): %w", ci, rd.footer.Schema[ci].Name, err)
+		return nil, nil, fmt.Errorf("columns: reading column %d (%s): %w", ci, rd.footer.Schema[ci].Name, err)
 	}
 
 	raw, err := readBlocks(sizedBuffer(chunk.RawLength, rd.raw), chunk)
 	if err != nil {
-		return nil, nil, fmt.Errorf("keine: decompressing column %d (%s): %w", ci, rd.footer.Schema[ci].Name, err)
+		return nil, nil, fmt.Errorf("columns: decompressing column %d (%s): %w", ci, rd.footer.Schema[ci].Name, err)
 	}
 	rd.raw = raw
 
@@ -552,7 +552,7 @@ func (rd *Reader) readColumn(start int64, rg RowGroupMeta, ci int) (typed any, n
 	}
 	typed, err = decodeTyped(chunk.Encoding, raw, numValues, rd.footer.Schema[ci].Type, &dest{}, rd.tokenizerFor(rg.Columns[ci]))
 	if err != nil {
-		return nil, nil, fmt.Errorf("keine: decoding column %d (%s): %w", ci, rd.footer.Schema[ci].Name, err)
+		return nil, nil, fmt.Errorf("columns: decoding column %d (%s): %w", ci, rd.footer.Schema[ci].Name, err)
 	}
 
 	if len(chunk.NullBitmap) > 0 {
@@ -600,14 +600,14 @@ func decompressBlock(raw []byte, off uint32, blk ColumnBlock, codec uint8) error
 // while another goroutine decodes it.
 func (rd *Reader) readChunk(start int64, region []byte) (ColumnChunk, error) {
 	if _, err := rd.r.Seek(start, io.SeekStart); err != nil {
-		return ColumnChunk{}, fmt.Errorf("keine: cannot seek to column: %w", err)
+		return ColumnChunk{}, fmt.Errorf("columns: cannot seek to column: %w", err)
 	}
 	if _, err := io.ReadFull(rd.r, region); err != nil {
-		return ColumnChunk{}, fmt.Errorf("keine: cannot read column bytes: %w", err)
+		return ColumnChunk{}, fmt.Errorf("columns: cannot read column bytes: %w", err)
 	}
 	var chunk ColumnChunk
 	if err := parseChunk(region, &chunk); err != nil {
-		return ColumnChunk{}, fmt.Errorf("keine: %w", err)
+		return ColumnChunk{}, fmt.Errorf("columns: %w", err)
 	}
 	return chunk, nil
 }

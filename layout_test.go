@@ -1,6 +1,6 @@
 // Layout candidates and the encoding and codec name tables.
 
-package keine
+package columns
 
 import (
 	"reflect"

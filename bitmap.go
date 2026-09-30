@@ -1,4 +1,4 @@
-package keine
+package columns
 
 // EncodeBitmap packs a null mask: bit i is set when row i is null, least
 // significant bit first, padded to a byte boundary.

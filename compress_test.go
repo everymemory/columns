@@ -1,6 +1,6 @@
 // Codec selection, pools and level mapping.
 
-package keine
+package columns
 
 import (
 	"bytes"

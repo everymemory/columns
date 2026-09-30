@@ -1,4 +1,4 @@
-package keine
+package columns
 
 import (
 	"encoding/binary"
@@ -6,7 +6,7 @@ import (
 	"math"
 	"unsafe"
 
-	"github.com/everymemory/keine/tokenizer"
+	"github.com/everymemory/columns/tokenizer"
 )
 
 // dest holds one column's decoded values, reused across reads. Decoders write
@@ -95,7 +95,7 @@ func decodePlainTyped(b []byte, typ uint8, d *dest, n int) (any, error) {
 	case TypeString, TypeBytes:
 		return decodePlainVarlen(b, typ, d, n)
 	default:
-		return nil, fmt.Errorf("keine: unknown type %d", typ)
+		return nil, fmt.Errorf("columns: unknown type %d", typ)
 	}
 }
 
@@ -115,13 +115,13 @@ func decodePlainVarlen(b []byte, typ uint8, d *dest, n int) (any, error) {
 		// for the count cannot hold it; one too long holds values the count does
 		// not admit, and the walk below reports that rather than this check.
 		if total = len(b) - 4*n; total < 0 {
-			return nil, fmt.Errorf("keine: plain data is %d bytes, too few for %d values", len(b), n)
+			return nil, fmt.Errorf("columns: plain data is %d bytes, too few for %d values", len(b), n)
 		}
 	} else {
 		var ok bool
 		n, total, ok = varlenStats(b)
 		if !ok {
-			return nil, fmt.Errorf("keine: plain data truncated at value %d", n)
+			return nil, fmt.Errorf("columns: plain data truncated at value %d", n)
 		}
 	}
 
@@ -144,7 +144,7 @@ func decodePlainVarlen(b []byte, typ uint8, d *dest, n int) (any, error) {
 			// so a value that spends more of it than the count allows is what a
 			// stream holding fewer values than n claims looks like.
 			if off+len(val) > total {
-				return nil, fmt.Errorf("keine: plain data truncated at value %d", i)
+				return nil, fmt.Errorf("columns: plain data truncated at value %d", i)
 			}
 			b = rest
 			copy(text[off:off+len(val)], val)
@@ -152,7 +152,7 @@ func decodePlainVarlen(b []byte, typ uint8, d *dest, n int) (any, error) {
 			off += len(val)
 		}
 		if len(b) > 0 {
-			return nil, fmt.Errorf("keine: plain data holds more than the %d values expected", n)
+			return nil, fmt.Errorf("columns: plain data holds more than the %d values expected", n)
 		}
 		return out, nil
 	}
@@ -169,7 +169,7 @@ func decodePlainVarlen(b []byte, typ uint8, d *dest, n int) (any, error) {
 		out[i] = append([]byte(nil), val...)
 	}
 	if len(b) > 0 {
-		return nil, fmt.Errorf("keine: plain data holds more than the %d values expected", n)
+		return nil, fmt.Errorf("columns: plain data holds more than the %d values expected", n)
 	}
 	return out, nil
 }
@@ -179,12 +179,12 @@ func decodePlainVarlen(b []byte, typ uint8, d *dest, n int) (any, error) {
 // has to report.
 func plainValue(b []byte, i int) (val, rest []byte, err error) {
 	if len(b) < 4 {
-		return nil, nil, fmt.Errorf("keine: plain data truncated at value %d", i)
+		return nil, nil, fmt.Errorf("columns: plain data truncated at value %d", i)
 	}
 	n := int(binary.LittleEndian.Uint32(b[:4]))
 	b = b[4:]
 	if len(b) < n {
-		return nil, nil, fmt.Errorf("keine: plain data truncated at value %d", i)
+		return nil, nil, fmt.Errorf("columns: plain data truncated at value %d", i)
 	}
 	return b[:n], b[n:], nil
 }
@@ -222,7 +222,7 @@ func stringAt(b []byte, off, n int) string {
 
 func decodeFixedT[T any](b []byte, width int, convert func([]byte) T, d *dest) ([]T, error) {
 	if len(b)%width != 0 {
-		return nil, fmt.Errorf("keine: plain data length %d is not a multiple of %d", len(b), width)
+		return nil, fmt.Errorf("columns: plain data length %d is not a multiple of %d", len(b), width)
 	}
 	out, _ := d.vals.([]T)
 	out = sizedSlice(out, len(b)/width)
@@ -264,7 +264,7 @@ func DecodeDelta(b []byte) ([]int64, error) {
 
 func decodeDelta(b []byte, d *dest) ([]int64, error) {
 	if len(b)%8 != 0 {
-		return nil, fmt.Errorf("keine: delta data length %d is not a multiple of 8", len(b))
+		return nil, fmt.Errorf("columns: delta data length %d is not a multiple of 8", len(b))
 	}
 	out, _ := d.vals.([]int64)
 	out = sizedSlice(out, len(b)/8)
@@ -288,12 +288,12 @@ func DecodeOffsetBytes(b []byte) ([][]byte, error) {
 
 func decodeOffsetBytes(b []byte, d *dest) ([][]byte, error) {
 	if len(b) < 4 {
-		return nil, fmt.Errorf("keine: offset bytes data truncated")
+		return nil, fmt.Errorf("columns: offset bytes data truncated")
 	}
 	n := int(binary.LittleEndian.Uint32(b[:4]))
 	hdr := 4 + 4*n
 	if len(b) < hdr {
-		return nil, fmt.Errorf("keine: offset bytes header truncated")
+		return nil, fmt.Errorf("columns: offset bytes header truncated")
 	}
 	// Read each offset where it is used rather than unpacking the whole column of
 	// them first, which would allocate a slice nobody keeps.
@@ -310,7 +310,7 @@ func decodeOffsetBytes(b []byte, d *dest) ([][]byte, error) {
 			end = at(i + 1)
 		}
 		if start < 0 || end < start || end > len(raw) {
-			return nil, fmt.Errorf("keine: invalid offset %d in offset bytes data", start)
+			return nil, fmt.Errorf("columns: invalid offset %d in offset bytes data", start)
 		}
 		out[i] = append([]byte(nil), raw[start:end]...)
 	}
@@ -328,26 +328,26 @@ func DecodeAffix(b []byte, typ uint8) (any, error) {
 
 func decodeAffix(b []byte, typ uint8, d *dest) (any, error) {
 	if len(b) < 8 {
-		return nil, fmt.Errorf("keine: affix data is %d bytes, too small for a header", len(b))
+		return nil, fmt.Errorf("columns: affix data is %d bytes, too small for a header", len(b))
 	}
 	preLen := binary.LittleEndian.Uint32(b[:4])
 	b = b[4:]
 	if uint64(len(b)) < uint64(preLen)+4 {
-		return nil, fmt.Errorf("keine: affix header wants %d bytes of prefix, data is %d", preLen, len(b))
+		return nil, fmt.Errorf("columns: affix header wants %d bytes of prefix, data is %d", preLen, len(b))
 	}
 	pre := b[:preLen]
 	b = b[preLen:]
 	sufLen := binary.LittleEndian.Uint32(b[:4])
 	b = b[4:]
 	if uint64(len(b)) < uint64(sufLen) {
-		return nil, fmt.Errorf("keine: affix header wants %d bytes of suffix, data is %d", sufLen, len(b))
+		return nil, fmt.Errorf("columns: affix header wants %d bytes of suffix, data is %d", sufLen, len(b))
 	}
 	suf := b[:sufLen]
 	b = b[sufLen:]
 
 	nvals, total, ok := varlenStats(b)
 	if !ok {
-		return nil, fmt.Errorf("keine: affix middles truncated at value %d", nvals)
+		return nil, fmt.Errorf("columns: affix middles truncated at value %d", nvals)
 	}
 
 	if typ == TypeString {
@@ -407,14 +407,14 @@ func DecodeDict(b []byte) ([][]byte, error) {
 // distinct entry once rather than once per value.
 func decodeDictTyped(b []byte, typ uint8, d *dest) (any, error) {
 	if len(b) < 12 {
-		return nil, fmt.Errorf("keine: dict data truncated")
+		return nil, fmt.Errorf("columns: dict data truncated")
 	}
 	nvals := int(binary.LittleEndian.Uint32(b[:4]))
 	dictSize := binary.LittleEndian.Uint32(b[4:8])
 	nbits := binary.LittleEndian.Uint32(b[8:12])
 	idxBytes := int((uint64(nvals)*uint64(nbits) + 7) / 8)
 	if len(b) < 12+idxBytes {
-		return nil, fmt.Errorf("keine: dict indices truncated")
+		return nil, fmt.Errorf("columns: dict indices truncated")
 	}
 	indices := decodeBitunpack(b[12:12+idxBytes], nvals, uint(nbits), d)
 
@@ -425,7 +425,7 @@ func decodeDictTyped(b []byte, typ uint8, d *dest) (any, error) {
 		return nil, err
 	}
 	if uint32(len(entries)) != dictSize {
-		return nil, fmt.Errorf("keine: dict size mismatch: header says %d, found %d", dictSize, len(entries))
+		return nil, fmt.Errorf("columns: dict size mismatch: header says %d, found %d", dictSize, len(entries))
 	}
 
 	if fixedWidth(typ) == 0 {
@@ -451,7 +451,7 @@ func indexDict[T any](dict []T, indices []uint32, d *dest) ([]T, error) {
 	d.vals = out
 	for i, idx := range indices {
 		if int(idx) >= len(dict) {
-			return nil, fmt.Errorf("keine: dict index %d out of range", idx)
+			return nil, fmt.Errorf("columns: dict index %d out of range", idx)
 		}
 		out[i] = dict[idx]
 	}
@@ -472,11 +472,11 @@ func fixedDictEntries(entries [][]byte, indices []uint32, typ uint8, d *dest) (a
 	off := 0
 	for _, idx := range indices {
 		if int(idx) >= len(entries) {
-			return nil, fmt.Errorf("keine: dict index %d out of range", idx)
+			return nil, fmt.Errorf("columns: dict index %d out of range", idx)
 		}
 		e := entries[idx]
 		if len(e) != width {
-			return nil, fmt.Errorf("keine: dict entry is %d bytes, a value of type %d is %d", len(e), typ, width)
+			return nil, fmt.Errorf("columns: dict entry is %d bytes, a value of type %d is %d", len(e), typ, width)
 		}
 		copy(flat[off:off+width], e)
 		off += width
@@ -554,11 +554,11 @@ func decodeTyped(enc uint8, data []byte, n int, typ uint8, d *dest, tok *tokeniz
 		return decodeOffsetBytes(data, d)
 	case EncTokenized:
 		if tok == nil {
-			return nil, fmt.Errorf("keine: tokenized chunk with no tokenizer to read it with")
+			return nil, fmt.Errorf("columns: tokenized chunk with no tokenizer to read it with")
 		}
 		return DecodeTokenized(data, tok, typ)
 	default:
-		return nil, fmt.Errorf("keine: unknown encoding %d", enc)
+		return nil, fmt.Errorf("columns: unknown encoding %d", enc)
 	}
 }
 

@@ -2,7 +2,7 @@
 // write path, which must normalize what a caller hands it, and the read path,
 // which must return values equal to the ones written, route through here.
 
-package keine
+package columns
 
 import (
 	"fmt"
@@ -94,7 +94,7 @@ func canonicalColumnTyped(vals []any, typ uint8) (any, error) {
 	case TypeBytes:
 		return canonicalTyped(vals, func(v any) ([]byte, error) { return coerceBytes(v) })
 	default:
-		return nil, fmt.Errorf("keine: unknown type %d", typ)
+		return nil, fmt.Errorf("columns: unknown type %d", typ)
 	}
 }
 
@@ -123,9 +123,9 @@ func coerceBool(v any) (bool, error) {
 	case int64:
 		return x != 0, nil
 	case nil:
-		return false, fmt.Errorf("keine: cannot coerce nil to bool")
+		return false, fmt.Errorf("columns: cannot coerce nil to bool")
 	}
-	return false, fmt.Errorf("keine: cannot coerce %T to bool", v)
+	return false, fmt.Errorf("columns: cannot coerce %T to bool", v)
 }
 
 func coerceInt(v any, bits int) (int64, error) {
@@ -164,9 +164,9 @@ func coerceInt(v any, bits int) (int64, error) {
 	case []byte:
 		return strconv.ParseInt(string(x), 10, bits)
 	case nil:
-		return 0, fmt.Errorf("keine: cannot coerce nil to int")
+		return 0, fmt.Errorf("columns: cannot coerce nil to int")
 	}
-	return 0, fmt.Errorf("keine: cannot coerce %T to int", v)
+	return 0, fmt.Errorf("columns: cannot coerce %T to int", v)
 }
 
 func coerceUint(v any, bits int) (uint64, error) {
@@ -205,9 +205,9 @@ func coerceUint(v any, bits int) (uint64, error) {
 	case []byte:
 		return strconv.ParseUint(string(x), 10, bits)
 	case nil:
-		return 0, fmt.Errorf("keine: cannot coerce nil to uint")
+		return 0, fmt.Errorf("columns: cannot coerce nil to uint")
 	}
-	return 0, fmt.Errorf("keine: cannot coerce %T to uint", v)
+	return 0, fmt.Errorf("columns: cannot coerce %T to uint", v)
 }
 
 func coerceFloat(v any, bits int) (float64, error) {
@@ -246,9 +246,9 @@ func coerceFloat(v any, bits int) (float64, error) {
 	case []byte:
 		return strconv.ParseFloat(string(x), bits)
 	case nil:
-		return 0, fmt.Errorf("keine: cannot coerce nil to float")
+		return 0, fmt.Errorf("columns: cannot coerce nil to float")
 	}
-	return 0, fmt.Errorf("keine: cannot coerce %T to float", v)
+	return 0, fmt.Errorf("columns: cannot coerce %T to float", v)
 }
 
 func coerceString(v any) (string, error) {
@@ -266,9 +266,9 @@ func coerceString(v any) (string, error) {
 	case bool:
 		return strconv.FormatBool(x), nil
 	case nil:
-		return "", fmt.Errorf("keine: cannot coerce nil to string")
+		return "", fmt.Errorf("columns: cannot coerce nil to string")
 	}
-	return "", fmt.Errorf("keine: cannot coerce %T to string", v)
+	return "", fmt.Errorf("columns: cannot coerce %T to string", v)
 }
 
 // coerceBytes returns the raw bytes of v. A string holding the fmt "%v" form of
@@ -281,14 +281,14 @@ func coerceBytes(v any) ([]byte, error) {
 	case string:
 		return parseBytesList(x)
 	case nil:
-		return nil, fmt.Errorf("keine: cannot coerce nil to bytes")
+		return nil, fmt.Errorf("columns: cannot coerce nil to bytes")
 	}
-	return nil, fmt.Errorf("keine: cannot coerce %T to bytes", v)
+	return nil, fmt.Errorf("columns: cannot coerce %T to bytes", v)
 }
 
 func parseBytesList(s string) ([]byte, error) {
 	if len(s) < 2 || s[0] != '[' || s[len(s)-1] != ']' {
-		return nil, fmt.Errorf("keine: cannot parse %q as a byte slice", s)
+		return nil, fmt.Errorf("columns: cannot parse %q as a byte slice", s)
 	}
 	inner := strings.TrimSpace(s[1 : len(s)-1])
 	if inner == "" {
@@ -299,7 +299,7 @@ func parseBytesList(s string) ([]byte, error) {
 	for i, p := range parts {
 		n, err := strconv.ParseUint(p, 10, 8)
 		if err != nil {
-			return nil, fmt.Errorf("keine: cannot parse %q as a byte slice: %w", s, err)
+			return nil, fmt.Errorf("columns: cannot parse %q as a byte slice: %w", s, err)
 		}
 		out[i] = byte(n)
 	}

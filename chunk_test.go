@@ -1,6 +1,6 @@
 // Chunk layout and block splitting error paths.
 
-package keine
+package columns
 
 import (
 	"bytes"

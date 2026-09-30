@@ -1,6 +1,6 @@
 // Reader error paths, and the zero-row and empty-column edges.
 
-package keine
+package columns
 
 import (
 	"bytes"

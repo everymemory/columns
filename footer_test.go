@@ -1,6 +1,6 @@
 // Footer encoding round trip.
 
-package keine
+package columns
 
 import (
 	"reflect"

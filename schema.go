@@ -1,4 +1,4 @@
-package keine
+package columns
 
 // ColumnSchema describes one column of a file.
 type ColumnSchema struct {

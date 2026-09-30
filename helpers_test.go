@@ -1,7 +1,7 @@
 // Fakes and fixtures the error-path tests build inputs from. The chunk and file
-// crafters live here because keine_test.go uses them too.
+// crafters live here because columns_test.go uses them too.
 
-package keine
+package columns
 
 import (
 	"bytes"
@@ -11,7 +11,7 @@ import (
 	"io"
 )
 
-var errSynthetic = errors.New("keine test: synthetic failure")
+var errSynthetic = errors.New("columns test: synthetic failure")
 
 // failAfter is an io.Writer that succeeds for the first n Write calls and then
 // fails, so each error branch of a multi-write function can be reached.
@@ -61,7 +61,7 @@ func (failingResetReader) Read([]byte) (int, error) { return 0, io.EOF }
 func (failingResetReader) Close() error { return nil }
 
 func (failingResetReader) Reset(io.Reader, []byte) error {
-	return fmt.Errorf("keine test: reset refused")
+	return fmt.Errorf("columns test: reset refused")
 }
 
 // mockCompressor is a placeholder for a pool to hold. Nothing writes through
@@ -90,7 +90,7 @@ func craftChunk(enc, codec uint8, bitmap, data []byte) []byte {
 	return b
 }
 
-// craftFile wraps a hand-built chunk in a complete keine file.
+// craftFile wraps a hand-built chunk in a complete columns file.
 func craftFile(chunk []byte, meta ColMeta, schema []ColumnSchema, numRows uint32) []byte {
 	var f []byte
 	f = append(f, magic...)

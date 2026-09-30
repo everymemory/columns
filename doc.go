@@ -1,4 +1,4 @@
-// Package keine reads and writes a columnar file format.
+// Package columns reads and writes a columnar file format.
 //
 // A file is a sequence of row groups, each storing its columns as independent
 // chunks, followed by a footer holding the schema and per-column metadata. The
@@ -36,4 +36,4 @@
 // rather than a substitution.
 //
 // See the README for the on-disk layout.
-package keine
+package columns

@@ -83,7 +83,7 @@ func TestLoadRejectsMalformedStage(t *testing.T) {
 }
 
 func TestLoadFileReportsMissingFile(t *testing.T) {
-	if _, err := LoadFile("/tmp/keine/no-such-tokenizer.json"); err == nil {
+	if _, err := LoadFile("/tmp/columns/no-such-tokenizer.json"); err == nil {
 		t.Error("LoadFile on a missing file succeeded, want an error")
 	}
 }

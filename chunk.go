@@ -1,4 +1,4 @@
-package keine
+package columns
 
 import (
 	"encoding/binary"
@@ -49,7 +49,7 @@ const chunkHeaderLen = 18
 // before that reuse happens.
 func parseChunk(b []byte, c *ColumnChunk) error {
 	if len(b) < chunkHeaderLen {
-		return fmt.Errorf("keine: chunk is %d bytes, too small for a header", len(b))
+		return fmt.Errorf("columns: chunk is %d bytes, too small for a header", len(b))
 	}
 	c.Encoding = b[0]
 	c.Compress = b[1]
@@ -58,16 +58,16 @@ func parseChunk(b []byte, c *ColumnChunk) error {
 	dataLen := binary.LittleEndian.Uint32(b[10:14])
 	nblocks := binary.LittleEndian.Uint32(b[14:18])
 	if nblocks == 0 {
-		return fmt.Errorf("keine: chunk declares no blocks")
+		return fmt.Errorf("columns: chunk declares no blocks")
 	}
 
 	tableLen := uint64(chunkHeaderLen) + 8*uint64(nblocks)
 	if uint64(len(b)) < tableLen {
-		return fmt.Errorf("keine: chunk header declares %d blocks, chunk is %d bytes", nblocks, len(b))
+		return fmt.Errorf("columns: chunk header declares %d blocks, chunk is %d bytes", nblocks, len(b))
 	}
 	dataStart := tableLen + uint64(nullLen)
 	if uint64(len(b)) < dataStart+uint64(dataLen) {
-		return fmt.Errorf("keine: chunk header wants %d bytes of data, chunk is %d", dataLen, len(b))
+		return fmt.Errorf("columns: chunk header wants %d bytes of data, chunk is %d", dataLen, len(b))
 	}
 
 	c.NullBitmap = b[tableLen:dataStart]
@@ -78,14 +78,14 @@ func parseChunk(b []byte, c *ColumnChunk) error {
 		raw := binary.LittleEndian.Uint32(b[chunkHeaderLen+8*i:])
 		stored := binary.LittleEndian.Uint32(b[chunkHeaderLen+8*i+4:])
 		if off+uint64(stored) > dataStart+uint64(dataLen) {
-			return fmt.Errorf("keine: block %d wants %d bytes, chunk has %d left", i, stored, dataStart+uint64(dataLen)-off)
+			return fmt.Errorf("columns: block %d wants %d bytes, chunk has %d left", i, stored, dataStart+uint64(dataLen)-off)
 		}
 		c.Blocks[i] = ColumnBlock{RawLength: raw, Data: b[off : off+uint64(stored)]}
 		off += uint64(stored)
 		rawSum += uint64(raw)
 	}
 	if rawSum != uint64(c.RawLength) {
-		return fmt.Errorf("keine: block raw lengths sum to %d, header says %d", rawSum, c.RawLength)
+		return fmt.Errorf("columns: block raw lengths sum to %d, header says %d", rawSum, c.RawLength)
 	}
 	return nil
 }
@@ -134,7 +134,7 @@ func ReadChunk(r io.Reader) (ColumnChunk, error) {
 	var c ColumnChunk
 	var head [chunkHeaderLen]byte
 	if _, err := io.ReadFull(r, head[:]); err != nil {
-		return c, fmt.Errorf("keine: cannot read chunk header: %w", err)
+		return c, fmt.Errorf("columns: cannot read chunk header: %w", err)
 	}
 	c.Encoding = head[0]
 	c.Compress = head[1]
@@ -143,16 +143,16 @@ func ReadChunk(r io.Reader) (ColumnChunk, error) {
 	dataLen := binary.LittleEndian.Uint32(head[10:14])
 	nblocks := binary.LittleEndian.Uint32(head[14:18])
 	if nblocks == 0 {
-		return c, fmt.Errorf("keine: chunk declares no blocks")
+		return c, fmt.Errorf("columns: chunk declares no blocks")
 	}
 
 	lens := make([]byte, 8*int(nblocks))
 	if _, err := io.ReadFull(r, lens); err != nil {
-		return c, fmt.Errorf("keine: cannot read block lengths: %w", err)
+		return c, fmt.Errorf("columns: cannot read block lengths: %w", err)
 	}
 	c.NullBitmap = make([]byte, nullLen)
 	if _, err := io.ReadFull(r, c.NullBitmap); err != nil {
-		return c, fmt.Errorf("keine: cannot read null bitmap: %w", err)
+		return c, fmt.Errorf("columns: cannot read null bitmap: %w", err)
 	}
 	c.Blocks = make([]ColumnBlock, nblocks)
 	rawSum := uint32(0)
@@ -162,11 +162,11 @@ func ReadChunk(r io.Reader) (ColumnChunk, error) {
 		stored := binary.LittleEndian.Uint32(lens[8*i+4:])
 		c.Blocks[i].Data = make([]byte, stored)
 		if _, err := io.ReadFull(r, c.Blocks[i].Data); err != nil {
-			return c, fmt.Errorf("keine: cannot read block %d: %w", i, err)
+			return c, fmt.Errorf("columns: cannot read block %d: %w", i, err)
 		}
 	}
 	if rawSum != c.RawLength {
-		return c, fmt.Errorf("keine: block raw lengths sum to %d, header says %d", rawSum, c.RawLength)
+		return c, fmt.Errorf("columns: block raw lengths sum to %d, header says %d", rawSum, c.RawLength)
 	}
 	if dataLen != 0 {
 		// Reported for the same consistency check parseChunk makes.
@@ -175,7 +175,7 @@ func ReadChunk(r io.Reader) (ColumnChunk, error) {
 			stored += uint32(len(blk.Data))
 		}
 		if stored != dataLen {
-			return c, fmt.Errorf("keine: chunk header wants %d bytes of data, blocks hold %d", dataLen, stored)
+			return c, fmt.Errorf("columns: chunk header wants %d bytes of data, blocks hold %d", dataLen, stored)
 		}
 	}
 	return c, nil

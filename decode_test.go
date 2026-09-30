@@ -1,6 +1,6 @@
 // Decoder bounds, truncation and round trips.
 
-package keine
+package columns
 
 import (
 	"bytes"

@@ -1,6 +1,6 @@
 // Writer option and column validation errors.
 
-package keine
+package columns
 
 import (
 	"io"

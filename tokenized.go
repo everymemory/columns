@@ -1,4 +1,4 @@
-package keine
+package columns
 
 import (
 	"encoding/binary"
@@ -6,7 +6,7 @@ import (
 	"math/bits"
 	"sort"
 
-	"github.com/everymemory/keine/tokenizer"
+	"github.com/everymemory/columns/tokenizer"
 )
 
 // A Tokenized column stores a string or bytes column as the token ids a tokenizer
@@ -95,12 +95,12 @@ func EncodeTokenized(vals any, tok *tokenizer.Model, layout TokenizedLayout) ([]
 	switch layout.Rep {
 	case TokenizedRaw, TokenizedRemap, TokenizedBits:
 	default:
-		return nil, fmt.Errorf("keine: tokenized representation %d is not one this build writes", layout.Rep)
+		return nil, fmt.Errorf("columns: tokenized representation %d is not one this build writes", layout.Rep)
 	}
 	switch layout.Bound {
 	case TokenizedCounts, TokenizedOffsets, TokenizedDeltas:
 	default:
-		return nil, fmt.Errorf("keine: tokenized boundary %d is not one this build writes", layout.Bound)
+		return nil, fmt.Errorf("columns: tokenized boundary %d is not one this build writes", layout.Bound)
 	}
 
 	ids, escapes, counts := tokenizedColumn(strings, bytes, tok)
@@ -161,7 +161,7 @@ func tokenizedValues(vals any) ([]string, [][]byte, error) {
 	case [][]byte:
 		return nil, s, nil
 	}
-	return nil, nil, fmt.Errorf("keine: tokenized encodes string and bytes columns, got %T", vals)
+	return nil, nil, fmt.Errorf("columns: tokenized encodes string and bytes columns, got %T", vals)
 }
 
 // tokenizedColumn tokenizes every value through tok and returns the flat id
@@ -323,7 +323,7 @@ func remapIDs(ids []uint16) (stream []byte, table []uint16) {
 // conversion.
 func DecodeTokenized(b []byte, tok *tokenizer.Model, typ uint8) (any, error) {
 	if len(b) < tokenizedHeaderLen {
-		return nil, fmt.Errorf("keine: tokenized data is %d bytes, too small for a header", len(b))
+		return nil, fmt.Errorf("columns: tokenized data is %d bytes, too small for a header", len(b))
 	}
 	rep := b[0]
 	bound := b[1]
@@ -344,7 +344,7 @@ func DecodeTokenized(b []byte, tok *tokenizer.Model, typ uint8) (any, error) {
 	// widths can wrap a 32 bit int and pass the very check meant to catch them.
 	need := uint64(at) + 2*uint64(tableLen) + 4*uint64(valueCount) + uint64(escapeCount)
 	if need > uint64(len(b)) {
-		return nil, fmt.Errorf("keine: tokenized header wants more data than the chunk holds")
+		return nil, fmt.Errorf("columns: tokenized header wants more data than the chunk holds")
 	}
 	tableStart := at
 	tableEnd := tableStart + 2*tableLen
@@ -386,17 +386,17 @@ func DecodeTokenized(b []byte, tok *tokenizer.Model, typ uint8) (any, error) {
 			}
 		}
 		if escapeAt+markers > escapeCount {
-			return nil, fmt.Errorf("keine: tokenized value %d claims escapes the stream does not hold", i)
+			return nil, fmt.Errorf("columns: tokenized value %d claims escapes the stream does not hold", i)
 		}
 		text, err := tok.DecodeSplit(ids[start:end], escapes[escapeAt:escapeAt+markers])
 		if err != nil {
-			return nil, fmt.Errorf("keine: decoding tokenized value %d: %w", i, err)
+			return nil, fmt.Errorf("columns: decoding tokenized value %d: %w", i, err)
 		}
 		escapeAt += markers
 		out[i] = text
 	}
 	if escapeAt != escapeCount {
-		return nil, fmt.Errorf("keine: tokenized chunk has %d escape bytes no value claimed", escapeCount-escapeAt)
+		return nil, fmt.Errorf("columns: tokenized chunk has %d escape bytes no value claimed", escapeCount-escapeAt)
 	}
 
 	if typ == TypeBytes {
@@ -425,7 +425,7 @@ func tokenizedSpans(b []byte, bound uint8, valueCount, tokenCount int) ([]int, e
 		for i := 0; i < valueCount; i++ {
 			off := int(read32(i))
 			if off < prev || off > tokenCount {
-				return nil, fmt.Errorf("keine: tokenized offset %d is %d, outside %d..%d", i, off, prev, tokenCount)
+				return nil, fmt.Errorf("columns: tokenized offset %d is %d, outside %d..%d", i, off, prev, tokenCount)
 			}
 			spans[i] = off
 			prev = off
@@ -438,7 +438,7 @@ func tokenizedSpans(b []byte, bound uint8, valueCount, tokenCount int) ([]int, e
 			spans[i+1] = off
 		}
 		if off != tokenCount {
-			return nil, fmt.Errorf("keine: tokenized counts sum to %d, header records %d", off, tokenCount)
+			return nil, fmt.Errorf("columns: tokenized counts sum to %d, header records %d", off, tokenCount)
 		}
 	case TokenizedDeltas:
 		// The deltas are differences between consecutive counts, so recovering a
@@ -448,19 +448,19 @@ func tokenizedSpans(b []byte, bound uint8, valueCount, tokenCount int) ([]int, e
 		for i := 0; i < valueCount; i++ {
 			count += unzigzagDelta(read32(i))
 			if count < 0 {
-				return nil, fmt.Errorf("keine: tokenized deltas give value %d a count of %d", i, count)
+				return nil, fmt.Errorf("columns: tokenized deltas give value %d a count of %d", i, count)
 			}
 			off += count
 			if off > int64(tokenCount) {
-				return nil, fmt.Errorf("keine: tokenized deltas put value %d at %d, past the %d ids the header records", i, off, tokenCount)
+				return nil, fmt.Errorf("columns: tokenized deltas put value %d at %d, past the %d ids the header records", i, off, tokenCount)
 			}
 			spans[i+1] = int(off)
 		}
 		if off != int64(tokenCount) {
-			return nil, fmt.Errorf("keine: tokenized deltas sum to %d ids, header records %d", off, tokenCount)
+			return nil, fmt.Errorf("columns: tokenized deltas sum to %d ids, header records %d", off, tokenCount)
 		}
 	default:
-		return nil, fmt.Errorf("keine: tokenized boundary %d is not one this build reads", bound)
+		return nil, fmt.Errorf("columns: tokenized boundary %d is not one this build reads", bound)
 	}
 	return spans, nil
 }
@@ -474,7 +474,7 @@ func tokenizedReadIDs(b []byte, rep uint8, tokenCount int, table []uint16) ([]ui
 	switch rep {
 	case TokenizedRaw:
 		if len(b) != 2*tokenCount {
-			return nil, fmt.Errorf("keine: tokenized id stream is %d bytes, %d ids take %d", len(b), tokenCount, 2*tokenCount)
+			return nil, fmt.Errorf("columns: tokenized id stream is %d bytes, %d ids take %d", len(b), tokenCount, 2*tokenCount)
 		}
 		for i := 0; i < tokenCount; i++ {
 			out[i] = uint16(b[2*i]) | uint16(b[2*i+1])<<8
@@ -487,7 +487,7 @@ func tokenizedReadIDs(b []byte, rep uint8, tokenCount int, table []uint16) ([]ui
 		nbits := uint(bits.Len(uint(maxTableID(table))))
 		want := (uint64(tokenCount)*uint64(nbits) + 7) / 8
 		if uint64(len(b)) != want {
-			return nil, fmt.Errorf("keine: tokenized id stream is %d bytes, %d ids at %d bits take %d", len(b), tokenCount, nbits, want)
+			return nil, fmt.Errorf("columns: tokenized id stream is %d bytes, %d ids at %d bits take %d", len(b), tokenCount, nbits, want)
 		}
 		for i, id := range decodeBitunpack(b, tokenCount, nbits, &dest{}) {
 			out[i] = uint16(id)
@@ -497,16 +497,16 @@ func tokenizedReadIDs(b []byte, rep uint8, tokenCount int, table []uint16) ([]ui
 		for i := 0; i < tokenCount; i++ {
 			idx, n := binary.Uvarint(b[at:])
 			if n <= 0 {
-				return nil, fmt.Errorf("keine: tokenized varint stream truncated at id %d", i)
+				return nil, fmt.Errorf("columns: tokenized varint stream truncated at id %d", i)
 			}
 			if int(idx) >= len(table) {
-				return nil, fmt.Errorf("keine: tokenized id index %d is outside the table of %d", idx, len(table))
+				return nil, fmt.Errorf("columns: tokenized id index %d is outside the table of %d", idx, len(table))
 			}
 			out[i] = table[idx]
 			at += n
 		}
 	default:
-		return nil, fmt.Errorf("keine: tokenized representation %d is not one this build reads", rep)
+		return nil, fmt.Errorf("columns: tokenized representation %d is not one this build reads", rep)
 	}
 	return out, nil
 }

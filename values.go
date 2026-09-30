@@ -2,7 +2,7 @@
 // point at values where they already sit, so a wide column costs one allocation
 // instead of one per value.
 
-package keine
+package columns
 
 import "unsafe"
 

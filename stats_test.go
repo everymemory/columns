@@ -1,6 +1,6 @@
 // Per-column statistics.
 
-package keine
+package columns
 
 import (
 	"bytes"

@@ -1,4 +1,4 @@
-package keine
+package columns
 
 import (
 	"bytes"
@@ -115,9 +115,9 @@ func compressAt(data []byte, codec uint8, level int) ([]byte, error) {
 		compressStream(&buf, data, codec, level)
 		return buf.Bytes(), nil
 	case CompressZstd:
-		return nil, fmt.Errorf("keine: zstd compression is not available in this build")
+		return nil, fmt.Errorf("columns: zstd compression is not available in this build")
 	default:
-		return nil, fmt.Errorf("keine: unknown compression codec %d", codec)
+		return nil, fmt.Errorf("columns: unknown compression codec %d", codec)
 	}
 }
 
@@ -206,7 +206,7 @@ func compressStream(w io.Writer, data []byte, codec uint8, level int) error {
 		}
 		return err
 	default:
-		return fmt.Errorf("keine: unknown compression codec %d", codec)
+		return fmt.Errorf("columns: unknown compression codec %d", codec)
 	}
 }
 
@@ -254,9 +254,9 @@ func decompressInto(dst, data []byte, codec uint8) ([]byte, error) {
 		defer r.Close()
 		return readAllInto(dst, r)
 	case CompressZstd:
-		return nil, fmt.Errorf("keine: zstd compression is not available in this build")
+		return nil, fmt.Errorf("columns: zstd compression is not available in this build")
 	default:
-		return nil, fmt.Errorf("keine: unknown compression codec %d", codec)
+		return nil, fmt.Errorf("columns: unknown compression codec %d", codec)
 	}
 }
 

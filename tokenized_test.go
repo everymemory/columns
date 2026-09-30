@@ -1,4 +1,4 @@
-package keine
+package columns
 
 import (
 	"bytes"
@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/everymemory/keine/tokenizer"
+	"github.com/everymemory/columns/tokenizer"
 )
 
 // A Tokenized column is tested against the corpus the tokenizer package already

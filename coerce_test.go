@@ -1,6 +1,6 @@
 // Canonical conversion of caller values.
 
-package keine
+package columns
 
 import (
 	"bytes"
@@ -266,7 +266,7 @@ func canonicalValue(v any, typ uint8) (any, error) {
 	case TypeBytes:
 		return coerceBytes(v)
 	default:
-		return nil, fmt.Errorf("keine: unknown type %d", typ)
+		return nil, fmt.Errorf("columns: unknown type %d", typ)
 	}
 }
 
