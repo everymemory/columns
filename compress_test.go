@@ -5,6 +5,7 @@ package columns
 import (
 	"bytes"
 	"compress/flate"
+	"runtime"
 	"testing"
 )
 
@@ -110,7 +111,22 @@ func TestCompressCodecs(t *testing.T) {
 // can report. A real flate reader never fails a reset, so the test puts one in
 // the pool that does. decompressInto must return that error and keep that reader
 // out of the pool, where it would fail every read after it.
+//
+// The reader this puts in has to be the one that comes back out. sync.Pool keeps
+// a private slot per P that a Get on another P cannot see, and the tests before
+// this one leave real readers behind, so the Put alone is not enough: a goroutine
+// that moved between the two could draw a real reader, pass this check on the
+// decompression error that bad data reports anyway, and leave the failing reader
+// installed for a later test to read through. One processor and an empty pool
+// make the hand off certain, and a reader that cannot reset is never put back, so
+// the pool is empty when this test ends.
 func TestPooledFlateReaderResetError(t *testing.T) {
+	old := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(old)
+
+	for flateReaders.Get() != nil {
+		// Discard the readers the tests before this one left behind.
+	}
 	flateReaders.Put(&failingResetReader{})
 	if _, err := decompressInto(nil, []byte{1, 2, 3}, CompressFlate); err == nil {
 		t.Error("decompressInto with a reader that cannot reset: want error, got nil")
