@@ -2,6 +2,7 @@ package columns
 
 import (
 	"bytes"
+	"reflect"
 	"testing"
 )
 
@@ -325,13 +326,20 @@ var goldenFile = []byte{
 
 // The writer must be byte stable, so the file it produces for a known set of
 // inputs is pinned here. The golden bytes are the round trip test's three row
-// groups and thirteen typed columns, stored the way their types imply. The test
-// writes through NewWriter, so no Optimize pass has read the columns and this is
-// also what a caller gets for doing nothing. The inputs are deterministic, so the
-// comparison is exact rather than statistical.
+// groups and thirteen typed columns, stored the way their types imply. The inputs
+// are deterministic, so the comparison is exact rather than statistical.
+//
+// The columns are written with compression off. Go does not promise that
+// compress/flate's encoded output stays the same between releases — the 1.27
+// notes say it may differ from 1.26 — so a golden that stored a compressed column
+// would be pinning the toolchain it was generated on rather than this format, and
+// would stop opening under the next Go. Uncompressed, every byte in the file is
+// this package's own: the encodings, the block framing and the gob footer. What
+// compression does to a column is pinned by the round trip, which reads back what
+// the writer earned rather than the bytes it happened to produce.
 func TestWriterOutputUnchanged(t *testing.T) {
 	var buf bytes.Buffer
-	w := NewWriter(&buf, buildSchema())
+	w := NewWriterWithOptions(&buf, buildSchema(), Options{Compress: CompressNone})
 	for g := 0; g < 3; g++ {
 		if err := w.AddRowGroup(buildColumns(g)); err != nil {
 			t.Fatalf("AddRowGroup(%d): %v", g, err)
@@ -345,6 +353,35 @@ func TestWriterOutputUnchanged(t *testing.T) {
 	if !bytes.Equal(buf.Bytes(), golden) {
 		t.Fatalf("writer output changed: wrote %d bytes, golden is %d bytes",
 			buf.Len(), len(golden))
+	}
+
+	// Reproducing the bytes only proves the writer still writes what it wrote.
+	// The golden also has to be a file a reader opens, and its contents have to
+	// be the ones it was captured from, or a regeneration that drifted from
+	// buildColumns would pin a plausible set of bytes for the wrong values.
+	r, err := NewReader(bytes.NewReader(golden))
+	if err != nil {
+		t.Fatalf("NewReader(golden): %v", err)
+	}
+	if got, want := r.RowGroupCount(), 3; got != want {
+		t.Fatalf("golden has %d row groups, want %d", got, want)
+	}
+	all := make([]int, len(allTypes))
+	for i := range all {
+		all[i] = i
+	}
+	for g := 0; g < 3; g++ {
+		want := buildColumns(g)
+		got, err := r.ReadRowGroup(g, all)
+		if err != nil {
+			t.Fatalf("ReadRowGroup(%d, all): %v", g, err)
+		}
+		for c := range want {
+			if !reflect.DeepEqual(got[c], want[c]) {
+				t.Errorf("golden row group %d column %d: got %v, want %v",
+					g, c, got[c], want[c])
+			}
+		}
 	}
 }
 

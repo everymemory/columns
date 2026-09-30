@@ -308,9 +308,41 @@ func TestDefaultLayout(t *testing.T) {
 	}
 }
 
+// earnedCodec is the codec col actually earns: the one asked for, unless it fails
+// to shrink what its encoding produced, in which case CompressNone. A writer
+// drops a codec that cannot beat the raw bytes, so this is what the chunk has to
+// report no matter what was asked for.
+//
+// Compressed sizes belong to the compressors, not to this package: the Go 1.27
+// notes say flat out that compress/flate's encoded output may differ from 1.26,
+// and the difference is large enough at small inputs to flip which codec wins.
+// A test that hardcodes the winner is pinning the toolchain it was written on,
+// so the expectation is measured from the same inputs the writer measures.
+func earnedCodec(col []any, typ, enc, codec, level uint8) uint8 {
+	if codec == CompressNone {
+		return CompressNone
+	}
+	typed, err := canonicalColumnTyped(col, typ)
+	if err != nil {
+		return CompressNone
+	}
+	encoded, err := encodeWith(enc, typed, typ)
+	if err != nil {
+		return CompressNone
+	}
+	// These columns are a single block, so compressing the whole encoding is the
+	// comparison splitBlocks makes over the sum of its blocks.
+	stored, err := compressAt(encoded, codec, int(level))
+	if err != nil || len(stored) >= len(encoded) {
+		return CompressNone
+	}
+	return codec
+}
+
 // A writer that has not been Optimized stores each column the way its type
-// implies, and the metadata it writes back says so. The default has to survive a
-// round trip, since it is what a caller gets for doing nothing.
+// implies, and the metadata it writes back says so. The encoding is the layout
+// the type picks and the codec is what that column earned, since the default has
+// to survive a round trip: it is what a caller gets for doing nothing.
 func TestWriterUsesDefaultLayouts(t *testing.T) {
 	schema := []ColumnSchema{
 		{Name: "b", Type: TypeBool},
@@ -344,9 +376,9 @@ func TestWriterUsesDefaultLayouts(t *testing.T) {
 		name       string
 		enc, codec uint8
 	}{
-		{"b", EncRLEBitpack, CompressNone},
-		{"i", EncDelta, CompressNone},
-		{"s", EncPlain, CompressNone},
+		{"b", EncRLEBitpack, earnedCodec(cols[0], TypeBool, EncRLEBitpack, CompressFlate, flateLevel)},
+		{"i", EncDelta, earnedCodec(cols[1], TypeInt64, EncDelta, CompressFlate, flateLevel)},
+		{"s", EncPlain, earnedCodec(cols[2], TypeString, EncPlain, CompressFlate, flateLevel)},
 	}
 	for i, wnt := range want {
 		got := rg.Columns[i]
@@ -374,9 +406,10 @@ func TestWriterUsesDefaultLayouts(t *testing.T) {
 //
 // A codec that cannot shrink a column is dropped rather than stored at a loss, so
 // the codec a chunk reports is what the data earned, not always the one asked for.
-// Four values are too little for flate to beat at its default level, and enough
-// once the deltas run to one repeated byte, so the two flate cases below disagree
-// about the outcome.
+// Which codec that is belongs to the compressor: the Go 1.27 notes say
+// compress/flate's output may differ from 1.26's, and at these sizes it flips the
+// contest. So the encoding is asserted and the codec is measured off the same
+// columns the writer sees.
 func TestWriterOptions(t *testing.T) {
 	schema := []ColumnSchema{
 		{Name: "i", Type: TypeInt64},
@@ -395,9 +428,18 @@ func TestWriterOptions(t *testing.T) {
 		{name: "empty options", opts: Options{}, want: [][2]uint8{{EncDelta, CompressNone}, {EncPlain, CompressNone}}},
 		{name: "plain encoding", opts: Options{Encoding: EncPlain}, want: [][2]uint8{{EncPlain, CompressNone}, {EncPlain, CompressNone}}},
 		{name: "no compression", opts: Options{Compress: CompressNone}, want: [][2]uint8{{EncDelta, CompressNone}, {EncPlain, CompressNone}}},
-		{name: "lzw", opts: Options{Compress: CompressLzw}, want: [][2]uint8{{EncDelta, CompressLzw}, {EncPlain, CompressLzw}}},
-		{name: "plain on flate", opts: Options{Encoding: EncPlain, Compress: CompressFlate}, want: [][2]uint8{{EncPlain, CompressNone}, {EncPlain, CompressNone}}},
-		{name: "level and block size", opts: Options{Compress: CompressFlate, CompressLevel: 9, BlockSize: 64}, want: [][2]uint8{{EncDelta, CompressFlate}, {EncPlain, CompressNone}}},
+		{name: "lzw", opts: Options{Compress: CompressLzw}, want: [][2]uint8{
+			{EncDelta, earnedCodec(cols[0], TypeInt64, EncDelta, CompressLzw, flateLevel)},
+			{EncPlain, earnedCodec(cols[1], TypeString, EncPlain, CompressLzw, flateLevel)},
+		}},
+		{name: "plain on flate", opts: Options{Encoding: EncPlain, Compress: CompressFlate}, want: [][2]uint8{
+			{EncPlain, earnedCodec(cols[0], TypeInt64, EncPlain, CompressFlate, flateLevel)},
+			{EncPlain, earnedCodec(cols[1], TypeString, EncPlain, CompressFlate, flateLevel)},
+		}},
+		{name: "level and block size", opts: Options{Compress: CompressFlate, CompressLevel: 9, BlockSize: 64}, want: [][2]uint8{
+			{EncDelta, earnedCodec(cols[0], TypeInt64, EncDelta, CompressFlate, 9)},
+			{EncPlain, earnedCodec(cols[1], TypeString, EncPlain, CompressFlate, 9)},
+		}},
 	}
 	for _, o := range opts {
 		t.Run(o.name, func(t *testing.T) {
