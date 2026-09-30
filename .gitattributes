@@ -1,0 +1,7 @@
+# The tokenizer's test data is read for the bytes it pins, never edited as prose,
+# so git must not convert its line endings at checkout. Model.Hash is the digest
+# of falcon-tokenizer.json as committed, and a Windows checkout in CRLF hashes
+# to something else than the one the parity test expects. gen_corpus is source,
+# so it stays text.
+tokenizer/testdata/*.json -text
+tokenizer/testdata/*.bin -text
