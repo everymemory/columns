@@ -696,3 +696,11 @@ covers nulls, and its cost is the interface headers as much as the bytes.
 reads several, takes the values back when it is done, and is the one that gets
 close to allocating nothing: it is what a scan over the same schema wants, and the
 one to reach for when the read is the workload rather than the values it returns.
+
+## License
+
+CC0 1.0 Universal. Everything in this repository is released to the public
+domain: no rights reserved, no attribution required, and no restriction on
+commercial use. See [LICENSE](LICENSE) for the full text, which also carries a
+fallback license for the jurisdictions where a public domain dedication is not
+recognized.
