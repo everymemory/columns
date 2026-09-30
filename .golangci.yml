@@ -17,14 +17,14 @@ linters:
     - unused
 
 # v2 splits the formatters out of the linters, so gofmt and goimports are asked
-# for here rather than in linters.enable.
+# for here rather than in linters.enable, and goimports keeps its settings here.
 formatters:
   enable:
     - gofmt
     - goimports
-
-formatters-settings:
-  goimports:
-    # The sources group stdlib and the module's own subpackage apart from the
-    # third-party block; goimports should not collapse them.
-    local-prefixes: github.com/everymemory/columns
+  settings:
+    goimports:
+      # The sources group stdlib and the module's own subpackage apart from the
+      # third-party block; goimports should not collapse them.
+      local-prefixes:
+        - github.com/everymemory/columns
