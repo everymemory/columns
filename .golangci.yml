@@ -1,6 +1,8 @@
-# golangci-lint runs the linters the tree already keeps to. The defaults are a
-# moving target, so the set is named here: a new release of the linter changes
-# what it checks, not whether the build passes.
+# golangci-lint runs the linters the tree already keeps to. A new release of the
+# linter changes what it checks, not whether the build passes: the schema version
+# is pinned below and the workflow pins the binary, so neither can move on its own.
+
+version: "2"
 
 run:
   timeout: 5m
@@ -8,15 +10,20 @@ run:
 linters:
   enable:
     - errcheck
-    - gofmt
-    - goimports
     - govet
     - ineffassign
     - misspell
     - staticcheck
     - unused
 
-linters-settings:
+# v2 splits the formatters out of the linters, so gofmt and goimports are asked
+# for here rather than in linters.enable.
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+formatters-settings:
   goimports:
     # The sources group stdlib and the module's own subpackage apart from the
     # third-party block; goimports should not collapse them.

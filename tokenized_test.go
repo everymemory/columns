@@ -409,13 +409,6 @@ func boundName(bound uint8) string {
 	return "unknown"
 }
 
-// boxedCorpus is the corpus as the boxed write API takes it, one interface per
-// value, which is the shape the layout pass measures.
-func boxedCorpus(t *testing.T) []any {
-	t.Helper()
-	return boxedStrings(tokenizedCorpus(t))
-}
-
 // boxedStrings is a slice of strings as the boxed API takes it: one interface
 // per value.
 func boxedStrings(vals []string) []any {

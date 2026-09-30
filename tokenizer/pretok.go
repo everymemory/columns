@@ -155,13 +155,14 @@ func byteLevelText(chars []lchar) string {
 //
 // The bytes that keep their own code point are 0x21-0x7e, 0xa1-0xac and
 // 0xae-0xff. Everything else, including 0x20 and 0x7f, moves above U+0100.
+// The last case needs no upper bound: b is a byte, so it never exceeds 0xff.
 func byteToChar(b byte) rune {
 	switch {
 	case b >= 0x21 && b <= 0x7e:
 		return rune(b)
 	case b >= 0xa1 && b <= 0xac:
 		return rune(b)
-	case b >= 0xae && b <= 0xff:
+	case b >= 0xae:
 		return rune(b)
 	}
 	// The remaining bytes are assigned in order from U+0100. The counter for one

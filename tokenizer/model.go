@@ -178,16 +178,6 @@ func (m *Model) buildSpecial(added []struct {
 	}
 }
 
-// stage is one pre-tokenizer in the Sequence, with the fields this
-// implementation reads.
-type stage struct {
-	typ      string
-	regex    string
-	behavior string
-	invert   bool
-	digits   bool
-}
-
 func checkPreTokenizer(j struct {
 	Type          string            `json:"type"`
 	PreTokenizers []json.RawMessage `json:"pretokenizers"`
@@ -198,7 +188,7 @@ func checkPreTokenizer(j struct {
 	if j.Type == "ByteLevel" {
 		return nil
 	}
-	var stages []stage
+	var stages int
 	for _, raw := range j.PreTokenizers {
 		var s struct {
 			Type string `json:"type"`
@@ -206,13 +196,13 @@ func checkPreTokenizer(j struct {
 		if err := json.Unmarshal(raw, &s); err != nil {
 			return err
 		}
-		stages = append(stages, stage{typ: s.Type})
+		stages++
 		if s.Type != "Punctuation" && s.Type != "ByteLevel" &&
 			s.Type != "Digits" && s.Type != "Split" {
 			return fmt.Errorf("tokenized: pre-tokenizer stage %q is not implemented", s.Type)
 		}
 	}
-	if len(stages) == 0 {
+	if stages == 0 {
 		return fmt.Errorf("tokenized: Sequence has no stages")
 	}
 	return nil

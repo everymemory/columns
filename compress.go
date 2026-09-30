@@ -111,8 +111,10 @@ func compressAt(data []byte, codec uint8, level int) ([]byte, error) {
 		return data, nil
 	case CompressFlate, CompressGzip, CompressZlib, CompressLzw:
 		var buf bytes.Buffer
-		// A bytes.Buffer never rejects a write.
-		compressStream(&buf, data, codec, level)
+		// compressStream reports a write failure or a codec's Close failure, and
+		// both land in this buffer, which never rejects a write. Nothing is left
+		// that could fail by the time it returns.
+		_ = compressStream(&buf, data, codec, level)
 		return buf.Bytes(), nil
 	case CompressZstd:
 		return nil, fmt.Errorf("columns: zstd compression is not available in this build")
@@ -240,18 +242,21 @@ func decompressInto(dst, data []byte, codec uint8) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		defer r.Close()
+		// Closing after the read has drained the codec reports nothing the read
+		// did not already report, including gzip's CRC, which Read surfaces at
+		// EOF, so the error is discarded rather than returned over the data.
+		defer func() { _ = r.Close() }()
 		return readAllInto(dst, r)
 	case CompressZlib:
 		r, err := zlib.NewReader(bytes.NewReader(data))
 		if err != nil {
 			return nil, err
 		}
-		defer r.Close()
+		defer func() { _ = r.Close() }()
 		return readAllInto(dst, r)
 	case CompressLzw:
 		r := lzw.NewReader(bytes.NewReader(data), lzwOrder, lzwWidth)
-		defer r.Close()
+		defer func() { _ = r.Close() }()
 		return readAllInto(dst, r)
 	case CompressZstd:
 		return nil, fmt.Errorf("columns: zstd compression is not available in this build")

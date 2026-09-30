@@ -36,6 +36,9 @@ jobs:
         with:
           go-version: '1.27.x'
           cache: true
+      # Pinned, not latest: the config names the schema version it is written
+      # against, and a major release the config does not expect rejects it
+      # outright. Bump both together.
       - uses: golangci/golangci-lint-action@v7
         with:
-          version: latest
+          version: v2.14.0

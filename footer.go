@@ -37,10 +37,12 @@ type ColMeta struct {
 }
 
 // encodeFooter serializes f with encoding/gob, which cannot fail on the fixed
-// shape of Footer.
+// shape of Footer: its only error sources are a value gob cannot represent and a
+// writer that rejects a byte, and Footer is this package's own struct encoding
+// into a buffer that never rejects one.
 func encodeFooter(f Footer) []byte {
 	var buf bytes.Buffer
-	gob.NewEncoder(&buf).Encode(f)
+	_ = gob.NewEncoder(&buf).Encode(f)
 	return buf.Bytes()
 }
 
