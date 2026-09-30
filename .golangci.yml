@@ -1,0 +1,23 @@
+# golangci-lint runs the linters the tree already keeps to. The defaults are a
+# moving target, so the set is named here: a new release of the linter changes
+# what it checks, not whether the build passes.
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - gofmt
+    - goimports
+    - govet
+    - ineffassign
+    - misspell
+    - staticcheck
+    - unused
+
+linters-settings:
+  goimports:
+    # The sources group stdlib and the module's own subpackage apart from the
+    # third-party block; goimports should not collapse them.
+    local-prefixes: github.com/everymemory/columns

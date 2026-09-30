@@ -1,0 +1,72 @@
+name: test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# A failure in one job should not hide a failure in another.
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: go ${{ matrix.go }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The module declares 1.22.2, so the floor stays in the matrix; the two
+        # newest releases catch a stdlib change the floor would forgive.
+        go: ['1.22.x', '1.26.x', '1.27.x']
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+
+      - name: go test
+        # Testdata is committed and no test reaches the network, so a clean
+        # runner needs nothing beyond the checkout.
+        run: go test ./...
+
+  race:
+    name: race detector
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.x'
+          cache: true
+      # The reader fans decompression out across goroutines, so the race
+      # detector is the test that the pool reuse and the buffer borrowing are
+      # as synchronized as they look.
+      - run: go test -race ./...
+
+  coverage:
+    name: coverage profile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.x'
+          cache: true
+      - run: go test -coverprofile=cover.out ./...
+      - name: report
+        run: go tool cover -func=cover.out
+      # The profile is an artifact rather than an upload to a coverage service:
+      # no third-party account is required, and a caller who wants the numbers
+      # fetches them from this run.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-profile
+          path: cover.out
+          if-no-files-found: error
+          retention-days: 30

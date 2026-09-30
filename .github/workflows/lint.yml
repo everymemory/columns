@@ -1,0 +1,41 @@
+name: lint
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  vet:
+    name: gofmt and vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.x'
+          cache: true
+      # gofmt is the format of record; a file it would rewrite is not the one
+      # the tree should keep.
+      - name: gofmt
+        run: |
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "::error::gofmt would reformat:"
+            gofmt -l .
+            exit 1
+          fi
+      - run: go vet ./...
+
+  golangci-lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.x'
+          cache: true
+      - uses: golangci/golangci-lint-action@v7
+        with:
+          version: latest
