@@ -11,8 +11,11 @@ import (
 	"github.com/everymemory/columns/tokenizer"
 )
 
-// magic is written at the start of a file and again after the footer length.
-const magic = "COLS"
+// magic is written at the start of a file and again after the footer length. It
+// is the file's identity: a reader that does not see it refuses the whole file,
+// so changing this constant refuses every file an earlier build wrote. The
+// layout past it is unaffected, and the version byte still names that.
+const magic = "ABCD"
 
 // The byte after the leading magic names the layout of everything that follows
 // it. A reader that sees another version refuses the file, so a change to the

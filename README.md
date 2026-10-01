@@ -13,7 +13,7 @@ to.
 ## File layout
 
 ```
-"COLS"
+"ABCD"
 format version     1 byte
 tokenizer count    uint32, little-endian, version 2 only
 tokenizer digests  32 bytes each, version 2 only
@@ -25,7 +25,7 @@ row group 1
     ...
 footer
 footer length      uint32, little-endian
-"COLS"
+"ABCD"
 ```
 
 Version 1 omits the count and the digests, which is what a file with no tokenized
@@ -326,10 +326,11 @@ another version refuses the file rather than misreading it, so a layout change i
 a clean break. Files written by v0.1.0 have no version byte and will be refused.
 This build reads versions 1 and 2, and writes 2 only when a column is tokenized.
 
-v0.3.0 retires the `KEIN` magic for `COLS`, so a reader from this version refuses
-every file an earlier one wrote. The layout beyond the magic is unchanged; the
-break is deliberate, since a file that cannot identify its writer is a file a
-reader cannot be careful about.
+A file begins with the magic `ABCD`. v0.3.0 and v0.3.1 wrote `COLS`, and v0.1.0
+wrote `KEIN`; a reader from this build refuses both, since a file that cannot
+identify its writer is a file a reader cannot be careful about. The layout beyond
+the magic is unchanged in either case, and the version byte still names it, so
+the break is the magic alone.
 
 ## Benchmarks
 

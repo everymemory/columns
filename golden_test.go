@@ -16,7 +16,7 @@ import (
 // carries the tokenizer index a column names, which is zero for every column
 // here, so a reader built before that field reads this file the same way.
 var goldenFile = []byte{
-	67, 79, 76, 83, 1, 2, 0, 1, 0, 0, 0, 1,
+	65, 66, 67, 68, 1, 2, 0, 1, 0, 0, 0, 1,
 	0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1,
 	0, 0, 0, 1, 0, 0, 0, 9, 96, 3, 0, 0,
 	0, 0, 0, 40, 0, 0, 0, 40, 0, 0, 0, 1,
@@ -321,7 +321,7 @@ var goldenFile = []byte{
 	204, 205, 206, 1, 3, 1, 3, 1, 1, 0, 1, 108,
 	1, 2, 1, 5, 118, 45, 50, 45, 48, 1, 5, 118,
 	45, 50, 45, 51, 1, 5, 1, 5, 1, 1, 0, 0,
-	0, 203, 5, 0, 0, 67, 79, 76, 83,
+	0, 203, 5, 0, 0, 65, 66, 67, 68,
 }
 
 // The writer must be byte stable, so the file it produces for a known set of
